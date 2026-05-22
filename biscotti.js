@@ -1,0 +1,10762 @@
+/**
+ * Biscotti Consent Management Platform
+ * Client-Side Engine v1.0
+ * 
+ * A lightweight, high-performance consent management script
+ * that blocks third-party scripts until user consent is granted.
+ * 
+ * Features:
+ * - Auto-blocking via MutationObserver (< 12kb gzipped)
+ * - Google Consent Mode v2 integration
+ * - TCF 2.3 support (mandatory disclosedVendors segment)
+ * - Zero CLS impact
+ * 
+ * @license MIT
+ * @copyright 2026 Biscotti
+ *
+ * ⚠️  BUILD REQUIRED — This file uses ES module imports resolved by esbuild.
+ *     Use `biscotti.min.js` as the client entry point.
+ *     Direct loading of this file as a <script> tag will fail.
+ */
+
+// Runtime guard: warn developers who load the unbundled source file directly via <script> tag.
+// Only fires if the file contains ES module imports (which would fail in a <script> tag anyway).
+// Removed from production bundle by esbuild's tree-shaking since this block is dead code in the bundle.
+if (typeof window !== 'undefined' && document.currentScript && document.currentScript.src.endsWith('/biscotti.js')) {
+  console.error('[Biscotti] This source file requires esbuild bundling. Direct loading of this file as a <script> tag will fail. Use biscotti.min.js instead.');
+}
+
+import { CmpApi } from '@iabtcf/cmpapi';
+import { TCModel, TCString, GVL } from '@iabtcf/core';
+import { FocusTrapManager, AriaManager, LiveRegionAnnouncer, ReducedMotionHandler } from './accessibility/index.js';
+
+// ==========================================================================
+// CONFIGURATION
+// ==========================================================================
+
+const VERSION = '1.0.0';
+const STORAGE_KEY = 'biscotti_consent';
+
+  const COOKIE_NAME = 'biscotti_consent';
+  const COOKIE_DAYS = 180; // 6 months default
+
+  // Default blocking patterns for known trackers
+  const DEFAULT_BLOCK_PATTERNS = [
+    // Analytics
+    'google-analytics.com',
+    'googletagmanager.com',
+    'analytics.google.com',
+    'googlesitekit-consent-mode',
+    'googlesitekit-events-provider',
+    'google-site-kit/dist/assets/js',
+    'matomo',
+    'piwik',
+    'hotjar.com',
+    'clarity.ms',
+    'mouseflow.com',
+    'fullstory.com',
+    'heap-analytics',
+    'mixpanel.com',
+    'amplitude.com',
+    'segment.com',
+
+    // Marketing
+    'facebook.net',
+    'fbevents.js',
+    'connect.facebook',
+    'doubleclick.net',
+    'googlesyndication.com',
+    'googleadservices.com',
+    'adservice.google',
+    'linkedin.com/insight',
+    'snap.licdn.com',
+    'ads.twitter.com',
+    'static.ads-twitter.com',
+    'tiktok.com/i18n',
+    'analytics.tiktok.com',
+    'pinterest.com/ct.js',
+    'pinimg.com/ct',
+    'taboola.com',
+    'outbrain.com',
+    'criteo.com',
+    'bing.com/bat',
+    'bat.bing.com',
+
+    // Functional (optional)
+    'intercom.io',
+    'crisp.chat',
+    'tawk.to',
+    'zendesk.com',
+    'drift.com',
+    'hubspot.com',
+    'hs-scripts.com',
+    'hscollectedforms',
+    'hs-analytics'
+  ];
+
+  // Category to pattern mapping
+  const CATEGORY_PATTERNS = {
+    analytics: [
+      'google-analytics', 'googletagmanager', 'analytics.google',
+      'matomo', 'piwik', 'hotjar', 'clarity.ms', 'mouseflow',
+      'fullstory', 'heap-analytics', 'mixpanel', 'amplitude', 'segment'
+    ],
+    marketing: [
+      'facebook', 'fbevents', 'doubleclick', 'googlesyndication',
+      'googleadservices', 'adservice.google', 'linkedin', 'licdn',
+      'twitter', 'ads-twitter', 'tiktok', 'pinterest', 'pinimg',
+      'taboola', 'outbrain', 'criteo', 'bing.com/bat', 'bat.bing'
+    ],
+    functional: [
+      'intercom', 'crisp', 'tawk', 'zendesk', 'drift', 'hubspot',
+      'hs-scripts', 'hscollectedforms', 'hs-analytics'
+    ]
+  };
+
+  // ==========================================================================
+  // EU/EEA COUNTRY CODES (for entity address resolution)
+  // ==========================================================================
+
+  const EU_EEA_COUNTRIES = new Set([
+    'AT', 'BE', 'BG', 'HR', 'CY', 'CZ', 'DK', 'EE', 'FI', 'FR', 'DE', 'GR', 'HU', 'IE', 'IT', 'LV', 'LT', 'LU', 'MT', 'NL', 'PL', 'PT', 'RO', 'SK', 'SI', 'ES', 'SE', // EU
+    'IS', 'LI', 'NO', // EEA
+    'CH', 'GB' // Adequacy decisions
+  ]);
+
+  // ==========================================================================
+  // LEGAL BASIS MAP (localized legal basis strings for all 42 languages)
+  // ==========================================================================
+
+  const LEGAL_BASIS_MAP = {
+    'Art. 6(1)(a) GDPR': {
+      de: 'Art. 6 Abs. 1 lit. a DSGVO (Einwilligung)', en: 'Art. 6(1)(a) GDPR (consent)', fr: 'Art. 6(1)(a) RGPD (consentement)', es: 'Art. 6(1)(a) RGPD (consentimiento)', it: 'Art. 6(1)(a) GDPR (consenso)', nl: 'Art. 6(1)(a) AVG (toestemming)', pl: 'Art. 6(1)(a) RODO (zgoda)', pt: 'Art. 6(1)(a) RGPD (consentimento)', da: 'Art. 6(1)(a) GDPR (samtykke)',
+      ar: 'Art. 6(1)(a) GDPR (consent)', bg: 'Art. 6(1)(a) GDPR (consent)', bs: 'Art. 6(1)(a) GDPR (consent)', ca: 'Art. 6(1)(a) GDPR (consent)', cs: 'Art. 6(1)(a) GDPR (consent)', el: 'Art. 6(1)(a) GDPR (consent)', eu: 'Art. 6(1)(a) GDPR (consent)', fi: 'Art. 6(1)(a) GDPR (consent)', gl: 'Art. 6(1)(a) GDPR (consent)', he: 'Art. 6(1)(a) GDPR (consent)', hi: 'Art. 6(1)(a) GDPR (consent)', hr: 'Art. 6(1)(a) GDPR (consent)', hu: 'Art. 6(1)(a) GDPR (consent)', id: 'Art. 6(1)(a) GDPR (consent)', ja: 'Art. 6(1)(a) GDPR (consent)', lt: 'Art. 6(1)(a) GDPR (consent)', mr: 'Art. 6(1)(a) GDPR (consent)', nb: 'Art. 6(1)(a) GDPR (consent)', ro: 'Art. 6(1)(a) GDPR (consent)', ru: 'Art. 6(1)(a) GDPR (consent)', sk: 'Art. 6(1)(a) GDPR (consent)', sl: 'Art. 6(1)(a) GDPR (consent)', sr: 'Art. 6(1)(a) GDPR (consent)', sv: 'Art. 6(1)(a) GDPR (consent)', th: 'Art. 6(1)(a) GDPR (consent)', tr: 'Art. 6(1)(a) GDPR (consent)', uk: 'Art. 6(1)(a) GDPR (consent)', vi: 'Art. 6(1)(a) GDPR (consent)', zh: 'Art. 6(1)(a) GDPR (consent)', 'zh-TW': 'Art. 6(1)(a) GDPR (consent)'
+    },
+    'Art. 6(1)(b) GDPR': {
+      de: 'Art. 6 Abs. 1 lit. b DSGVO (Vertragserfüllung)', en: 'Art. 6(1)(b) GDPR (contract performance)', fr: 'Art. 6(1)(b) RGPD (exécution du contrat)', es: 'Art. 6(1)(b) RGPD (ejecución del contrato)', it: 'Art. 6(1)(b) GDPR (esecuzione del contratto)', nl: 'Art. 6(1)(b) AVG (uitvoering overeenkomst)', pl: 'Art. 6(1)(b) RODO (wykonanie umowy)', pt: 'Art. 6(1)(b) RGPD (execução do contrato)', da: 'Art. 6(1)(b) GDPR (kontraktopfyldelse)',
+      ar: 'Art. 6(1)(b) GDPR (contract performance)', bg: 'Art. 6(1)(b) GDPR (contract performance)', bs: 'Art. 6(1)(b) GDPR (contract performance)', ca: 'Art. 6(1)(b) GDPR (contract performance)', cs: 'Art. 6(1)(b) GDPR (contract performance)', el: 'Art. 6(1)(b) GDPR (contract performance)', eu: 'Art. 6(1)(b) GDPR (contract performance)', fi: 'Art. 6(1)(b) GDPR (contract performance)', gl: 'Art. 6(1)(b) GDPR (contract performance)', he: 'Art. 6(1)(b) GDPR (contract performance)', hi: 'Art. 6(1)(b) GDPR (contract performance)', hr: 'Art. 6(1)(b) GDPR (contract performance)', hu: 'Art. 6(1)(b) GDPR (contract performance)', id: 'Art. 6(1)(b) GDPR (contract performance)', ja: 'Art. 6(1)(b) GDPR (contract performance)', lt: 'Art. 6(1)(b) GDPR (contract performance)', mr: 'Art. 6(1)(b) GDPR (contract performance)', nb: 'Art. 6(1)(b) GDPR (contract performance)', ro: 'Art. 6(1)(b) GDPR (contract performance)', ru: 'Art. 6(1)(b) GDPR (contract performance)', sk: 'Art. 6(1)(b) GDPR (contract performance)', sl: 'Art. 6(1)(b) GDPR (contract performance)', sr: 'Art. 6(1)(b) GDPR (contract performance)', sv: 'Art. 6(1)(b) GDPR (contract performance)', th: 'Art. 6(1)(b) GDPR (contract performance)', tr: 'Art. 6(1)(b) GDPR (contract performance)', uk: 'Art. 6(1)(b) GDPR (contract performance)', vi: 'Art. 6(1)(b) GDPR (contract performance)', zh: 'Art. 6(1)(b) GDPR (contract performance)', 'zh-TW': 'Art. 6(1)(b) GDPR (contract performance)'
+    },
+    'Art. 6(1)(c) GDPR': {
+      de: 'Art. 6 Abs. 1 lit. c DSGVO (rechtliche Verpflichtung)', en: 'Art. 6(1)(c) GDPR (legal obligation)', fr: 'Art. 6(1)(c) RGPD (obligation légale)', es: 'Art. 6(1)(c) RGPD (obligación legal)', it: 'Art. 6(1)(c) GDPR (obbligo legale)', nl: 'Art. 6(1)(c) AVG (wettelijke verplichting)', pl: 'Art. 6(1)(c) RODO (obowiązek prawny)', pt: 'Art. 6(1)(c) RGPD (obrigação legal)', da: 'Art. 6(1)(c) GDPR (retlig forpligtelse)',
+      ar: 'Art. 6(1)(c) GDPR (legal obligation)', bg: 'Art. 6(1)(c) GDPR (legal obligation)', bs: 'Art. 6(1)(c) GDPR (legal obligation)', ca: 'Art. 6(1)(c) GDPR (legal obligation)', cs: 'Art. 6(1)(c) GDPR (legal obligation)', el: 'Art. 6(1)(c) GDPR (legal obligation)', eu: 'Art. 6(1)(c) GDPR (legal obligation)', fi: 'Art. 6(1)(c) GDPR (legal obligation)', gl: 'Art. 6(1)(c) GDPR (legal obligation)', he: 'Art. 6(1)(c) GDPR (legal obligation)', hi: 'Art. 6(1)(c) GDPR (legal obligation)', hr: 'Art. 6(1)(c) GDPR (legal obligation)', hu: 'Art. 6(1)(c) GDPR (legal obligation)', id: 'Art. 6(1)(c) GDPR (legal obligation)', ja: 'Art. 6(1)(c) GDPR (legal obligation)', lt: 'Art. 6(1)(c) GDPR (legal obligation)', mr: 'Art. 6(1)(c) GDPR (legal obligation)', nb: 'Art. 6(1)(c) GDPR (legal obligation)', ro: 'Art. 6(1)(c) GDPR (legal obligation)', ru: 'Art. 6(1)(c) GDPR (legal obligation)', sk: 'Art. 6(1)(c) GDPR (legal obligation)', sl: 'Art. 6(1)(c) GDPR (legal obligation)', sr: 'Art. 6(1)(c) GDPR (legal obligation)', sv: 'Art. 6(1)(c) GDPR (legal obligation)', th: 'Art. 6(1)(c) GDPR (legal obligation)', tr: 'Art. 6(1)(c) GDPR (legal obligation)', uk: 'Art. 6(1)(c) GDPR (legal obligation)', vi: 'Art. 6(1)(c) GDPR (legal obligation)', zh: 'Art. 6(1)(c) GDPR (legal obligation)', 'zh-TW': 'Art. 6(1)(c) GDPR (legal obligation)'
+    },
+    'Art. 6(1)(f) GDPR': {
+      de: 'Art. 6 Abs. 1 lit. f DSGVO (berechtigtes Interesse)', en: 'Art. 6(1)(f) GDPR (legitimate interest)', fr: 'Art. 6(1)(f) RGPD (intérêt légitime)', es: 'Art. 6(1)(f) RGPD (interés legítimo)', it: 'Art. 6(1)(f) GDPR (interesse legittimo)', nl: 'Art. 6(1)(f) AVG (gerechtvaardigd belang)', pl: 'Art. 6(1)(f) RODO (uzasadniony interes)', pt: 'Art. 6(1)(f) RGPD (interesse legítimo)', da: 'Art. 6(1)(f) GDPR (legitim interesse)',
+      ar: 'Art. 6(1)(f) GDPR (legitimate interest)', bg: 'Art. 6(1)(f) GDPR (legitimate interest)', bs: 'Art. 6(1)(f) GDPR (legitimate interest)', ca: 'Art. 6(1)(f) GDPR (legitimate interest)', cs: 'Art. 6(1)(f) GDPR (legitimate interest)', el: 'Art. 6(1)(f) GDPR (legitimate interest)', eu: 'Art. 6(1)(f) GDPR (legitimate interest)', fi: 'Art. 6(1)(f) GDPR (legitimate interest)', gl: 'Art. 6(1)(f) GDPR (legitimate interest)', he: 'Art. 6(1)(f) GDPR (legitimate interest)', hi: 'Art. 6(1)(f) GDPR (legitimate interest)', hr: 'Art. 6(1)(f) GDPR (legitimate interest)', hu: 'Art. 6(1)(f) GDPR (legitimate interest)', id: 'Art. 6(1)(f) GDPR (legitimate interest)', ja: 'Art. 6(1)(f) GDPR (legitimate interest)', lt: 'Art. 6(1)(f) GDPR (legitimate interest)', mr: 'Art. 6(1)(f) GDPR (legitimate interest)', nb: 'Art. 6(1)(f) GDPR (legitimate interest)', ro: 'Art. 6(1)(f) GDPR (legitimate interest)', ru: 'Art. 6(1)(f) GDPR (legitimate interest)', sk: 'Art. 6(1)(f) GDPR (legitimate interest)', sl: 'Art. 6(1)(f) GDPR (legitimate interest)', sr: 'Art. 6(1)(f) GDPR (legitimate interest)', sv: 'Art. 6(1)(f) GDPR (legitimate interest)', th: 'Art. 6(1)(f) GDPR (legitimate interest)', tr: 'Art. 6(1)(f) GDPR (legitimate interest)', uk: 'Art. 6(1)(f) GDPR (legitimate interest)', vi: 'Art. 6(1)(f) GDPR (legitimate interest)', zh: 'Art. 6(1)(f) GDPR (legitimate interest)', 'zh-TW': 'Art. 6(1)(f) GDPR (legitimate interest)'
+    }
+  };
+
+  // ==========================================================================
+  // GVL STACKS (Official IAB TCF Stack names from vendor-list.json)
+  // ==========================================================================
+
+  const GVL_STACKS = {
+    1: { ar: 'بيانات الموقع الجغرافي الدقيقة وتحديد الهوية من خلال فحص الأجهزة', bg: 'Точни данни за географско позициониране и идентификация чрез сканиране на устройства', bs: 'Precise geolocation data, and identification through device scanning', ca: 'Dades de geolocalització precises i identificació mitjançant l’exploració de dispositius', cs: 'Přesné údaje o zeměpisné poloze a identifikace pomocí skenování zařízení', da: 'Præcise geografiske placeringsoplysninger og identifikation gennem enhedsscanning', de: 'Genaue Standortdaten und Identifikation durch Scannen von Endgeräten', el: 'Ακριβή δεδομένα γεωεντοπισμού και ταυτοποίηση μέσω σάρωσης συσκευής', en: 'Precise geolocation data, and identification through device scanning', es: 'Datos de localización geográfica precisa e identificación mediante análisis de dispositivos', et: 'Täpsed geolokatsiooniandmed ja tuvastamine seadme skannimise teel', eu: 'Precise geolocation data, and identification through device scanning', fi: 'Tarkat sijaintitiedot ja tunnistaminen laitetta skannaamalla', fr: 'Données de géolocalisation précises et identification par analyse de l’appareil', gl: 'Precise geolocation data, and identification through device scanning', he: 'נתוני מיקום גאוגרפי מדויקים וזיהוי באמצעות סריקה במכשירים', hi: 'Precise geolocation data, and identification through device scanning', hr: 'Precizni geolokacijski podaci i identifikacija putem skeniranja uređaja', hu: 'Pontos földrajzi helymeghatározási adatok és azonosítás az eszköz szkennelésével', id: 'Precise geolocation data, and identification through device scanning', it: 'Dati di geolocalizzazione precisi e identificazione attraverso la scansione del dispositivo', ja: '正確な位置情報データおよびデバイスのスキャニングによる識別', lt: 'Tikslūs geografinės vietos duomenys ir identifikavimas skenuojant įrenginį', lv: 'Precīzi atrašanās vietas dati un identifikācija ar ierīces skenēšanas starpniecību', mr: 'Precise geolocation data, and identification through device scanning', mt: 'Dejta ġeolokalizzata preċiża, u identifikazzjoni permezz tal-iskennjar tat-tagħmir', nb: 'Nøyaktige geolokasjonsdata og identifisering gjennom enhetsskanning', nl: 'Precieze geolocatiegegevens en identificatie via het scannen van apparaten', no: 'Nøyaktige geolokasjonsdata og identifisering gjennom enhetsskanning', pl: 'Precyzyjne dane geolokalizacyjne i identyfikacja poprzez skanowanie urządzeń', ro: 'Date precise de geolocație și identificarea prin scanarea dispozitivului', ru: 'Точные данные геолокации и идентификация посредством сканирования устройства', sk: 'Presné údaje o geografickej polohe a identifikácia skenovaním zariadenia', sl: 'Natančni geolokacijski podatki in identifikacija prek skeniranja naprave', sv: 'Exakta uppgifter om geografisk positionering och identifiering via skanning av enheten', th: 'Precise geolocation data, and identification through device scanning', tr: 'Kesin coğrafi konum verileri ve cihaz tarama vasıtası ile kimlik belirleme', uk: 'Точні геолокаційні дані та ідентифікація за допомогою сканування пристрою', vi: 'Precise geolocation data, and identification through device scanning', zh: '精确的地理位置数据和通过设备扫描进行识别', 'zh-TW': '精确的地理位置数据和通过设备扫描进行识别' },
+    2: { ar: 'الإعلانات بناءً على بيانات محدودة وقياس أداء الإعلانات', bg: 'Реклама на базата на ограничени данни и измерване на рекламата', bs: 'Advertising based on limited data and advertising measurement', ca: 'Publicitat basada en dades limitades i mesurament de la publicitat', cs: 'Reklama založená na omezených údajích a měření reklamy', da: 'Annoncering baseret på begrænsede oplysninger og annonceringsmåling', de: 'Werbung basierend auf einer reduzierten Menge von Daten und Messung von Werbeleistung', el: 'Διαφήμιση βασισμένη σε περιορισμένα δεδομένα και διαφημιστικές μετρήσεις', en: 'Advertising based on limited data and advertising measurement', es: 'Publicidad basada en datos limitados y medición publicitaria', et: 'Piiratud andmetel põhinev reklaam ja reklaami mõõtmine', eu: 'Advertising based on limited data and advertising measurement', fi: 'Rajoitettuihin tietoihin ja mainonnan mittaukseen perustuva mainonta', fr: 'Publicité basée sur des données limitées et mesure de performance des publicités', gl: 'Advertising based on limited data and advertising measurement', he: 'פרסום שמבוסס על נתונים מוגבלים ומדידת פרסום', hi: 'Advertising based on limited data and advertising measurement', hr: 'Oglašavanje na temelju ograničenih podataka i mjerenje oglašavanja', hu: 'Korlátozott körű adatokon alapuló hirdetés és hirdetésmérés', id: 'Advertising based on limited data and advertising measurement', it: 'Pubblicità basata su dati limitati e misurazione delle prestazioni degli annunci', ja: '制限付きデータに基づく広告、広告の測定', lt: 'Ribotais duomenimis ir reklamos vertinimu pagrįsta reklama', lv: 'Reklāma, kas balstīta uz ierobežotiem datiem un reklāmas novērtējumu', mr: 'Advertising based on limited data and advertising measurement', mt: 'Riklamar ibbażat fuq dejta limitata u kejl tar-riklamar', nb: 'Annonsering basert på begrenset data- og annonseringsmåling', nl: 'Advertenties op basis van metingen van beperkte gegevens en advertenties', no: 'Annonsering basert på begrenset data- og annonseringsmåling', pl: 'Reklamy oparte na ograniczonych danych i pomiarach reklam', ro: 'Publicitatea bazată pe date limitate și măsurători ale publicității', ru: 'Реклама на основе ограниченных данных и определение эффективности рекламы', sk: 'Reklama založená na obmedzených údajoch a meraní reklamy', sl: 'Oglaševanje na podlagi omejenih podatkov in merjenje oglaševanja', sv: 'Reklam baserad på begränsade data och annonsmätning', th: 'Advertising based on limited data and advertising measurement', tr: 'Sınırlı veriye ve reklam ölçümüne dayalı reklamlar', uk: 'Оголошення на основі обмежених даних і його визначення', vi: 'Advertising based on limited data and advertising measurement', zh: '基于有限数据的广告和广告衡量', 'zh-TW': '基于有限数据的广告和广告衡量' },
+    3: { ar: 'الإعلانات المخصصة', bg: 'Персонализирана реклама', bs: 'Personalised advertising', ca: 'Publicitat personalitzada', cs: 'Personalizovaná reklama', da: 'Tilpasset annoncering', de: 'Personalisierte Werbung', el: 'Εξατομικευμένη διαφήμιση', en: 'Personalised advertising', es: 'Publicidad personalizada', et: 'Isikupärastatud reklaamid', eu: 'Personalised advertising', fi: 'Kohdennettu mainonta', fr: 'Publicités personnalisées', gl: 'Personalised advertising', he: 'פרסום מותאם אישית', hi: 'Personalised advertising', hr: 'Personalizirano oglašavanje', hu: 'Személyre szabott hirdetés', id: 'Personalised advertising', it: 'Pubblicità personalizzata', ja: 'パーソナライズ広告', lt: 'Suasmeninta reklama', lv: 'Personalizēta reklāma', mr: 'Personalised advertising', mt: 'Riklamar personalizzat', nb: 'Personlig tilpasset annonsering', nl: 'Gepersonaliseerde advertenties', no: 'Personlig tilpasset annonsering', pl: 'Reklamy spersonalizowana', ro: 'Publicitate personalizată', ru: 'Персонализированная реклама', sk: 'Personalizovaná reklama', sl: 'Osebno prilagojeno oglaševanje', sv: 'Personanpassad reklam', th: 'Personalised advertising', tr: 'Kişiselleştirilmiş reklamlar', uk: 'Персоналізоване оголошення', vi: 'Personalised advertising', zh: '个性化广告', 'zh-TW': '个性化广告' },
+    4: { ar: 'الإعلانات بناءً على بيانات محدودة وقياس أداء الإعلانات وفهم الجمهور', bg: 'Реклама на базата на ограничени данни, измерване на рекламата и проучване на аудиторията', bs: 'Advertising based on limited data, advertising measurement, and understanding of the audiences', ca: 'Publicitat basada en dades limitades, mesurament de la publicitat i una comprensió del públic', cs: 'Reklama založená na omezených údajích, reklamním měření a výzkumu publika', da: 'Annoncering baseret på begrænsede oplysninger, annonceringsmåling og målgruppeundersøgelser', de: 'Werbung basierend auf einer reduzierten Menge von Daten, Messung von Werbeleistung und Zielgruppenforschung', el: 'Διαφήμιση βασισμένη σε περιορισμένα δεδομένα, διαφημιστικές μετρήσεις και έρευνες κοινού', en: 'Advertising based on limited data, advertising measurement, and understanding of the audiences', es: 'Publicidad basada en datos limitados, medición publicitaria e investigación de audiencias', et: 'Piiratud andmetel põhinev reklaam, reklaamide tulemuslikkus ja vaatajaskonna analüüsimine.', eu: 'Advertising based on limited data, advertising measurement, and understanding of the audiences', fi: 'Rajoitettuihin tietoihin, mainonnan mittaukseen ja yleisötutkimukseen perustuva mainonta', fr: 'Publicités basées sur des données limitées, mesure de performance des publicités et études d’audience', gl: 'Advertising based on limited data, advertising measurement, and understanding of the audiences', he: 'פרסום שמבוסס על נתונים מוגבלים, מדידת פרסום והבנה של הקהלים', hi: 'Advertising based on limited data, advertising measurement, and understanding of the audiences', hr: 'Oglašavanje na temelju ograničenih podataka, mjerenje oglašavanja i istraživanja publike', hu: 'Korlátozott körű adatokon alapuló hirdetés, hirdetésmérés és közönségkutatás', id: 'Advertising based on limited data, advertising measurement, and understanding of the audiences', it: 'Pubblicità basata su dati limitati, misurazione delle prestazioni degli annunci e comprensione del pubblico', ja: '制限付きデータに基づく広告、広告の測定、ユーザー層調査', lt: 'Reklama, pagrįsta ribotais duomenimis, reklamos matavimu ir auditorijos supratimu', lv: 'Reklāma, kas balstīta uz ierobežotiem datiem, reklāmas novērtējumiem un auditorijas izpratni', mr: 'Advertising based on limited data, advertising measurement, and understanding of the audiences', mt: 'Riklamar ibbażat fuq dejta limitata, kejl tar-riklamar, u l-fehim tal-udjenzi', nb: 'Annonsering basert på begrenset data- og annonseringsmåling, og forståelse av publikum', nl: 'Advertenties op basis van beperkte gegevens, advertentiemetingen en doelgroepenonderzoek', no: 'Annonsering basert på begrenset data- og annonseringsmåling, og forståelse av publikum', pl: 'Reklamy oparte na ograniczonych danych, pomiarach reklam i zrozumieniu odbiorców', ro: 'Publicitatea bazată pe date limitate, măsurători ale publicității și înțelegerea audienței', ru: 'Реклама на основе ограниченных данных, определение эффективности рекламы и понимание аудитории', sk: 'Reklama založená na obmedzených údajoch, meraní reklamy a prieskume cieľových skupín', sl: 'Oglaševanje na podlagi omejenih podatkov, merjenje oglaševanja in raziskovanje občinstva', sv: 'Reklam baserad på begränsade data, annonsmätning och förståelse för målgruppen', th: 'Advertising based on limited data, advertising measurement, and understanding of the audiences', tr: 'Sınırlı veriye, reklam ölçümüne ve hedef kitle araştırmasına dayalı reklamlar', uk: 'Оголошення на основі обмежених даних, його визначення та розуміння аудиторії', vi: 'Advertising based on limited data, advertising measurement, and understanding of the audiences', zh: '基于有限数据的广告、广告衡量和受众理解', 'zh-TW': '基于有限数据的广告、广告衡量和受众理解' },
+    5: { ar: 'الإعلانات بناءً على بيانات محدودة وملف الإعلانات المخصص وقياس أداء الإعلانات', bg: 'Реклама на базата на ограничени данни, персонализиран рекламен профил и измерване на рекламата', bs: 'Advertising based on limited data, personalised advertising profile, and advertising measurement', ca: 'Publicitat basada en dades limitades, perfils de publicitat personalitzada i mesurament de la publicitat', cs: 'Reklama založená na omezených údajích, personalizovaném reklamním profilu a reklamním měření', da: 'Annoncering baseret på begrænsede oplysninger, tilpasset annonceringsprofil og annonceringsmåling', de: 'Werbung basierend auf einer reduzierten Menge von Daten, einem personalisierten Werbeprofil und Messung von Werbeleistung', el: 'Διαφήμιση βασισμένη σε περιορισμένα δεδομένα, προφίλ εξατομικευμένων διαφημίσεων και διαφημιστικές μετρήσεις', en: 'Advertising based on limited data, personalised advertising profile, and advertising measurement', es: 'Publicidad basada en datos limitados, perfil publicitario personalizado y medición publicitaria', et: 'Piiratud andmetel põhinev reklaam, isikupärastatud reklaamiprofiil ja reklaami mõõtmine', eu: 'Advertising based on limited data, personalised advertising profile, and advertising measurement', fi: 'Rajoitettuihin tietoihin, personoituun mainontaprofiiliin ja mainonnan mittaukseen perustuva mainonta', fr: 'Publicités basées sur des données limitées, profil de publicités personnalisées et mesure de performance des publicités', gl: 'Advertising based on limited data, personalised advertising profile, and advertising measurement', he: 'פרסום שמבוסס על נתונים מוגבלים, פרופיל פרסום מותאם אישית ומדידת פרסום', hi: 'Advertising based on limited data, personalised advertising profile, and advertising measurement', hr: 'Oglašavanje na temelju ograničenih podataka, profil za personalizirano oglašavanje i mjerenje oglašavanja', hu: 'Korlátozott körű adatokon alapuló hirdetés, személyre szabott hirdetési profil és hirdetésmérés', id: 'Advertising based on limited data, personalised advertising profile, and advertising measurement', it: 'Pubblicità basata su dati limitati, profilo per la personalizzazione della pubblicità e misurazione delle prestazioni degli annunci', ja: '制限付きデータに基づく広告、パーソナライズ広告のプロファイル、広告の測定', lt: 'Reklama, pagrįsta ribotais duomenimis, suasmenintu reklamos profiliu ir reklamos matavimu', lv: 'Reklāma, kas balstīta uz ierobežotiem datiem, personalizētas reklāmas profilu un reklāmas novērtējumu', mr: 'Advertising based on limited data, personalised advertising profile, and advertising measurement', mt: 'Riklamar ibbażat fuq dejta limitata, profil ta’ riklamar personalizzat u kejl tar-riklamar', nb: 'Annonsering basert på begrenset data, personlig tilpasset annonseringsprofil, og annonsemåling', nl: 'Advertenties op basis van beperkte gegevens, gepersonaliseerd advertentieprofiel en advertentiemetingen', no: 'Annonsering basert på begrenset data, personlig tilpasset annonseringsprofil, og annonsemåling', pl: 'Reklamy oparte na ograniczonych danych, spersonalizowany profil reklamowy i pomiar reklam', ro: 'Publicitatea bazată pe date limitate, profil personalizat de publicitate și măsurători ale publicității', ru: 'Реклама на основе ограниченных данных, персонализированного рекламного профиля и определение эффективности рекламы', sk: 'Reklama založená na obmedzených údajoch, personalizovanom reklamnom profile a meraní reklamy', sl: 'Oglaševanje na podlagi omejenih podatkov, profila za osebno prilagojeno oglaševanje in merjenja oglaševanja', sv: 'Reklam baserad på begränsade data, personanpassad annonsprofil och annonsmätning', th: 'Advertising based on limited data, personalised advertising profile, and advertising measurement', tr: 'Sınırlı veriye, kişiselleştirilmiş reklam profiline ve reklam ölçümüne dayalı reklamlar', uk: 'Оголошення на основі обмежених даних, профіль персоналізованого оголошення та його визначення', vi: 'Advertising based on limited data, personalised advertising profile, and advertising measurement', zh: '基于有限数据的广告、个性化广告资料和广告衡量', 'zh-TW': '基于有限数据的广告、个性化广告资料和广告衡量' },
+    6: { ar: 'اختيار الإعلانات المخصصة وقياس أداء الإعلانات', bg: 'Избор на персонализирана реклама и измерване на рекламата', bs: 'Selection of personalised advertising and advertising measurement', ca: 'Selecció de publicitat personalitzada i mesurament de la publicitat', cs: 'Výběr personalizované reklamy a reklamního měření', da: 'Valg af tilpasset annoncering og annonceringsmåling', de: 'Auswahl personalisierter Werbung und Messung von Werbeleistung', el: 'Επιλογή εξατομικευμένης διαφήμισης και μέτρησης διαφήμισης', en: 'Selection of personalised advertising and advertising measurement', es: 'Selección de publicidad personalizada y medición publicitaria', et: 'Isikupärastatud reklaamide valimine ja reklaamide mõõtmine', eu: 'Selection of personalised advertising and advertising measurement', fi: 'Kohdennetun mainonnan valinta ja mainonnan mittaaminen', fr: 'Sélection de publicités personnalisées et mesure de performance des publicités', gl: 'Selection of personalised advertising and advertising measurement', he: 'בחירת פרסום מותאם אישית ומדידת פרסום', hi: 'Selection of personalised advertising and advertising measurement', hr: 'Odabir personaliziranog oglašavanja i mjerenje oglašavanja', hu: 'Személyre szabott hirdetés kiválasztása és hirdetésmérés', id: 'Selection of personalised advertising and advertising measurement', it: 'Selezione di pubblicità personalizzata e misurazione delle prestazioni degli annunci', ja: 'パーソナライズ広告の選択、広告の測定', lt: 'Suasmenintos reklamos ir reklamos matavimo pasirinkimas', lv: 'Personalizētas reklāmas un reklāmas novērtējumu izvēle', mr: 'Selection of personalised advertising and advertising measurement', mt: 'Għażla ta’ riklamar personalizzat u kejl ta’ riklamar', nb: 'Valg av personlig tilpasset annonsering og annonseringsmåling', nl: 'Selectie van gepersonaliseerde advertenties en advertentiemetingen', no: 'Valg av personlig tilpasset annonsering og annonseringsmåling', pl: 'Wybór spersonalizowanych reklam i pomiar reklam', ro: 'Selectarea publicității personalizate și măsurători ale publicității', ru: 'Выбор персонализированной рекламы и определение эффективности рекламы', sk: 'Výber personalizovanej reklamy a meranie reklamy', sl: 'Izbira osebno prilagojenega oglaševanja in merjenje oglaševanja', sv: 'Val av personanpassad reklam och reklammätning', th: 'Selection of personalised advertising and advertising measurement', tr: 'Kişiselleştirilmiş reklamların seçilmesi ve reklam ölçümü', uk: 'Вибір персоналізованого оголошення та його визначення', vi: 'Selection of personalised advertising and advertising measurement', zh: '个性化广告和广告衡量的选择', 'zh-TW': '个性化广告和广告衡量的选择' },
+    7: { ar: 'اختيار الإعلانات المخصصة وقياس أداء الإعلانات وأبحاث الجمهور', bg: 'Избор на персонализирана реклама, измерване на рекламата и проучване на аудиторията', bs: 'Selection of personalised advertising, advertising measurement, and audience research', ca: 'Selecció de publicitat personalitzada, mesurament de la publicitat i investigació sobre el públic', cs: 'Výběr personalizované reklamy, reklamního měření a výzkumu publika', da: 'Valg af tilpasset annoncering, annonceringsmåling og målgruppeundersøgelser', de: 'Auswahl personalisierter Werbung, Messung von Werbeleistung und Zielgruppenforschung', el: 'Επιλογή εξατομικευμένης διαφήμισης, μέτρησης διαφήμισης και έρευνας κοινού', en: 'Selection of personalised advertising, advertising measurement, and audience research', es: 'Selección de publicidad personalizada, medición publicitaria e investigación de audiencia', et: 'Isikupärastatud reklaamide valimine, reklaamide mõõtmine ja vaatajaskonna uuring', eu: 'Selection of personalised advertising, advertising measurement, and audience research', fi: 'Kohdennetun mainonnan valinta, mainonnan mittaaminen ja yleisötutkimus', fr: 'Sélection de publicités personnalisées, mesure de performance des publicités et études d’audience', gl: 'Selection of personalised advertising, advertising measurement, and audience research', he: 'בחירת פרסום מותאם אישית, מדידת פרסום וניתוח קהל', hi: 'Selection of personalised advertising, advertising measurement, and audience research', hr: 'Odabir personaliziranog oglašavanja, mjerenje oglašavanja i uvidi u publiku', hu: 'Személyre szabott hirdetés kiválasztása, hirdetésmérés és közönségkutatás', id: 'Selection of personalised advertising, advertising measurement, and audience research', it: 'Selezione di pubblicità personalizzata, valutazione dell’efficacia della pubblicità e ricerche sul pubblico', ja: 'パーソナライズ広告の選択、広告の測定、ユーザー層調査', lt: 'Suasmenintos reklamos, reklamos matavimo ir auditorijos tyrimų pasirinkimas', lv: 'Personalizētas reklāmas, reklāmas novērtējumu un auditorijas izpētes izvēle', mr: 'Selection of personalised advertising, advertising measurement, and audience research', mt: 'Għażla ta’ riklamar personalizzat, kejl tar-riklamar u riċerka tal-udjenza', nb: 'Valg av personlig tilpasset annonsering, annonseringsmåling og publikumsundersøkelser', nl: 'Selectie van gepersonaliseerde advertenties, advertentiemetingen en doelgroepenonderzoek', no: 'Valg av personlig tilpasset annonsering, annonseringsmåling og publikumsundersøkelser', pl: 'Wybór spersonalizowanych reklam, pomiar reklam i badanie odbiorców', ro: 'Selectarea publicității personalizate, măsurători ale publicității și cercetarea audienței', ru: 'Выбор персонализированной рекламы, определение эффективности рекламы и аналитические сведения об аудитории', sk: 'Výber personalizovanej reklamy, meranie reklamy a prieskum cieľových skupín', sl: 'Izbira osebno prilagojenega oglaševanja, merjenje oglaševanja in raziskovanje občinstva', sv: 'Val av personanpassad reklam, reklammätning och forskning angående målgrupp', th: 'Selection of personalised advertising, advertising measurement, and audience research', tr: 'Kişiselleştirilmiş reklamların seçilmesi, reklam ölçümü ve hedef kitle araştırması', uk: 'Вибір персоналізованого оголошення, його визначення та дослідження аудиторії', vi: 'Selection of personalised advertising, advertising measurement, and audience research', zh: '个性化广告的选择、广告衡量和受众研究', 'zh-TW': '个性化广告的选择、广告衡量和受众研究' },
+    8: { ar: 'الإعلانات المخصصة وقياس أداء الإعلانات', bg: 'Персонализирана реклама и измерване на рекламата', bs: 'Personalised advertising and advertising measurement', ca: 'Publicitat personalitzada i mesurament de la publicitat', cs: 'Personalizovaná reklama a reklamní měření', da: 'Tilpasset annoncering og annonceringsmåling', de: 'Personalisierte Werbung und Messung von Werbeleistung', el: 'Εξατομικευμένη διαφήμιση και μέτρηση διαφήμισης', en: 'Personalised advertising and advertising measurement', es: 'Publicidad personalizada y medición publicitaria', et: 'Isikupärastatud reklaamid ja reklaamide mõõtmine', eu: 'Personalised advertising and advertising measurement', fi: 'Kohdennettu mainonta ja mainonnan mittaaminen', fr: 'Publicités personnalisées et mesure de performance des publicités', gl: 'Personalised advertising and advertising measurement', he: 'מדידת פרסום ופרסום מותאם אישית', hi: 'Personalised advertising and advertising measurement', hr: 'Personalizirano oglašavanje i mjerenje oglašavanja', hu: 'Személyre szabott hirdetés és hirdetésmérés', id: 'Personalised advertising and advertising measurement', it: 'Pubblicità personalizzata e misurazione delle prestazioni degli annunci', ja: 'パーソナライズ広告、広告の測定', lt: 'Suasmenintos reklamos ir reklamos vertinimas', lv: 'Personalizēta reklāma un reklāmas novērtējums', mr: 'Personalised advertising and advertising measurement', mt: 'Riklamar personalizzat u kejl tar-riklamar', nb: 'Personlig tilpasset annonsering og annonseringsmåling', nl: 'Gepersonaliseerde advertenties en advertentiemetingen', no: 'Personlig tilpasset annonsering og annonseringsmåling', pl: 'Reklamy spersonalizowane i pomiar reklam', ro: 'Publicitate personalizată și măsurători ale publicității', ru: 'Персонализированная реклама и определение эффективности рекламы', sk: 'Personalizovaná reklama a meranie reklamy', sl: 'Osebno prilagojeno oglaševanje in merjenje oglaševanja', sv: 'Personanpassad reklam och reklammätning', th: 'Personalised advertising and advertising measurement', tr: 'Kişiselleştirilmiş reklam ve reklam ölçümü', uk: 'Персоналізоване оголошення та його визначення', vi: 'Personalised advertising and advertising measurement', zh: '个性化广告和广告衡量', 'zh-TW': '个性化广告和广告衡量' },
+    9: { ar: 'الإعلانات المخصصة وقياس أداء الإعلانات وأبحاث الجمهور', bg: 'Персонализирана реклама, измерване на рекламата и проучване на аудиторията', bs: 'Personalised advertising, advertising measurement, and audience research', ca: 'Publicitat personalitzada, mesurament de la publicitat i investigació sobre el públic', cs: 'Personalizovaná reklama, reklamní měření a průzkum publika', da: 'Tilpasset annoncering, annonceringsmåling og målgruppeundersøgelser', de: 'Personalisierte Werbung, Messung von Werbeleistung und Zielgruppenforschung', el: 'Εξατομικευμένη διαφήμιση, μέτρηση διαφήμισης και έρευνα κοινού', en: 'Personalised advertising, advertising measurement, and audience research', es: 'Publicidad personalizada, medición publicitaria e investigación de audiencia', et: 'Isikupärastatud reklaamid, reklaamide mõõtmine ja vaatajaskonna uuring', eu: 'Personalised advertising, advertising measurement, and audience research', fi: 'Kohdennettu mainonta, mainonnan mittaaminen ja yleisötutkimus', fr: 'Publicités personnalisées, mesure de performance des publicités et études d’audience', gl: 'Personalised advertising, advertising measurement, and audience research', he: 'פרסום מותאם אישית, מדידת פרסום וניתוח קהל', hi: 'Personalised advertising, advertising measurement, and audience research', hr: 'Personalizirano oglašavanje, mjerenje oglašavanja i uvidi u publiku', hu: 'Személyre szabott hirdetés, hirdetésmérés és közönségkutatás', id: 'Personalised advertising, advertising measurement, and audience research', it: 'Pubblicità personalizzata, misurazione delle prestazioni degli annunci e ricerche sul pubblico', ja: 'パーソナライズ広告、広告の測定、ユーザー層調査', lt: 'Suasmeninta reklama, reklamos matavimas ir auditorijos tyrimai', lv: 'Personalizēta reklāma, reklāmas novērtējums un auditorijas izpēte', mr: 'Personalised advertising, advertising measurement, and audience research', mt: 'Riklamar personalizzat, kejl tar-riklamar u riċerka tal-udjenza', nb: 'Personlig tilpasset annonsering og annonseringsmåling, og publikumsundersøkelser', nl: 'Gepersonaliseerde advertenties, advertentiemetingen en doelgroepenonderzoek', no: 'Personlig tilpasset annonsering og annonseringsmåling, og publikumsundersøkelser', pl: 'Reklamy spersonalizowane, pomiar reklam i badanie odbiorców', ro: 'Publicitate personalizată, măsurători ale publicității și cercetarea audienței', ru: 'Персонализированная реклама, определение эффективности рекламы и аналитические сведения об аудитории', sk: 'Personalizovaná reklama, meranie reklamy a prieskum cieľových skupín', sl: 'Osebno prilagojeno oglaševanje, merjenje oglaševanja in raziskovanje občinstva', sv: 'Personanpassad reklam, reklammätning och forskning angående målgrupp', th: 'Personalised advertising, advertising measurement, and audience research', tr: 'Kişiselleştirilmiş reklam, reklam ölçümü ve hedef kitle araştırması', uk: 'Персоналізоване оголошення, його визначення та дослідження аудиторії', vi: 'Personalised advertising, advertising measurement, and audience research', zh: '个性化广告、广告衡量和受众研究', 'zh-TW': '个性化广告、广告衡量和受众研究' },
+    10: { ar: 'الإعلانات المخصصة', bg: 'Персонализирана реклама', bs: 'Personalised advertising', ca: 'Publicitat personalitzada', cs: 'Personalizovaná reklama', da: 'Tilpasset annoncering', de: 'Personalisierte Werbung', el: 'Εξατομικευμένη διαφήμιση', en: 'Personalised advertising', es: 'Publicidad personalizada', et: 'Isikupärastatud reklaamid', eu: 'Personalised advertising', fi: 'Kohdennettu mainonta', fr: 'Publicités personnalisées', gl: 'Personalised advertising', he: 'פרסום מותאם אישית', hi: 'Personalised advertising', hr: 'Personalizirano oglašavanje', hu: 'Személyre szabott hirdetés', id: 'Personalised advertising', it: 'Pubblicità personalizzata', ja: 'パーソナライズ広告', lt: 'Suasmeninta reklama', lv: 'Personalizēta reklāma', mr: 'Personalised advertising', mt: 'Riklamar personalizzat', nb: 'Personlig tilpasset annonsering', nl: 'Gepersonaliseerde advertenties', no: 'Personlig tilpasset annonsering', pl: 'Reklamy spersonalizowane', ro: 'Publicitate personalizată', ru: 'Персонализированная реклама', sk: 'Personalizovaná reklama', sl: 'Osebno prilagojeno oglaševanje', sv: 'Personanpassad reklam', th: 'Personalised advertising', tr: 'Kişiselleştirilmiş reklamlar', uk: 'Персоналізоване оголошення', vi: 'Personalised advertising', zh: '个性化广告', 'zh-TW': '个性化广告' },
+    11: { ar: 'محتوى مخصص', bg: 'Персонализирано съдържание', bs: 'Personalised content', ca: 'Contingut personalitzat', cs: 'Personalizovaný obsah', da: 'Tilpasset indhold', de: 'Personalisierte Inhalte', el: 'Εξατομικευμένο περιεχόμενο', en: 'Personalised content', es: 'Contenido personalizado', et: 'Isikupärastatud sisu', eu: 'Personalised content', fi: 'Personoitu sisältö', fr: 'Contenu personnalisé', gl: 'Personalised content', he: 'תוכן מותאם אישית', hi: 'Personalised content', hr: 'Personalizirani sadržaj', hu: 'Személyre szabott tartalom', id: 'Personalised content', it: 'Contenuti personalizzati', ja: 'パーソナライズコンテンツ', lt: 'Suasmenintas turinys', lv: 'Personalizēts saturs', mr: 'Personalised content', mt: 'Kontenut personalizzat', nb: 'Personlig tilpasset innhold', nl: 'Gepersonaliseerde content', no: 'Personlig tilpasset innhold', pl: 'Spersonalizowane treści', ro: 'Conținut personalizat', ru: 'Персонализированный контент', sk: 'Personalizovaný obsah', sl: 'Osebno prilagojena vsebina', sv: 'Personanpassat innehåll', th: 'Personalised content', tr: 'Kişiselleştirilmiş içerik', uk: 'Персоналізований контент', vi: 'Personalised content', zh: '个性化内容', 'zh-TW': '个性化内容' },
+    12: { ar: 'اختيار المحتوى المخصص وقياس أداء المحتوى', bg: 'Избор на персонализирано съдържание и измерване на съдържанието', bs: 'Selection of personalised content and content measurement', ca: 'Selecció de contingut personalitzat i mesurament del contingut', cs: 'Výběr personalizovaného obsahu a měření obsahu', da: 'Valg af tilpasset indhold og indholdsmåling', de: 'Auswahl personalisierter Inhalte und Messung der Performance von Inhalten', el: 'Επιλογή εξατομικευμένου περιεχομένου και μέτρηση περιεχομένου', en: 'Selection of personalised content and content measurement', es: 'Selección de contenido personalizado y medición del contenido', et: 'Isikupärastatud sisu valik ning sisu mõõtmine', eu: 'Selection of personalised content and content measurement', fi: 'Personoidun sisällön valinta ja sisällön mittaaminen', fr: 'Sélection de contenu personnalisé et mesure de performance du contenu', gl: 'Selection of personalised content and content measurement', he: 'בחירת תוכן מותאם אישית ומדידת תוכן', hi: 'Selection of personalised content and content measurement', hr: 'Odabir personaliziranog sadržaja i mjerenje sadržaja', hu: 'Személyre szabott tartalom kiválasztása és tartalommérés', id: 'Selection of personalised content and content measurement', it: 'Selezione di contenuti personalizzati e misurazione delle prestazioni dei contenuti', ja: 'パーソナライズコンテンツの選択、コンテンツの測定', lt: 'Suasmenintas turinys ir turinio vertinimas', lv: 'Personalizēta satura un satura novērtēšanas izvēle', mr: 'Selection of personalised content and content measurement', mt: 'Għażla ta’ kontenut personalizzat u kejl tal-kontenut', nb: 'Personlig tilpasset innhold, og innholdsmåling', nl: 'Selectie van gepersonaliseerde content en contentmetingen', no: 'Personlig tilpasset innhold, og innholdsmåling', pl: 'Wybór spersonalizowanych treści i pomiar treści', ro: 'Selectarea conținutului personalizat și măsurători de conținut', ru: 'Выбор персонализированного контента и определение эффективности контента', sk: 'Výber personalizovaného obsahu a meranie obsahu', sl: 'Izbira osebno prilagojene vsebine in merjenje vsebine', sv: 'Val av personanpassat innehåll och innehållsmätning', th: 'Selection of personalised content and content measurement', tr: 'Kişiselleştirilmiş içeriğin seçilmesi ve içerik ölçümü', uk: 'Вибір персоналізованого контенту та визначення контенту', vi: 'Selection of personalised content and content measurement', zh: '个性化内容的选择和内容衡量', 'zh-TW': '个性化内容的选择和内容衡量' },
+    13: { ar: 'اختيار المحتوى المخصص وقياس أداء المحتوى وأبحاث الجمهور', bg: 'Избор на персонализирано съдържание, измерване на съдържанието и проучване на аудиторията', bs: 'Selection of personalised content, content measurement and audience research', ca: 'Selecció de contingut personalitzat, mesurament del contingut i investigació sobre el públic', cs: 'Výběr personalizovaného obsahu, měření obsahu a průzkum publika', da: 'Valg af tilpasset indhold, indholdsmåling og målgruppeundersøgelser', de: 'Auswahl personalisierter Inhalte, Messung von Inhalten und Zielgruppenforschung', el: 'Επιλογή εξατομικευμένου περιεχομένου, μέτρηση περιεχομένου και έρευνα κοινού', en: 'Selection of personalised content, content measurement and audience research', es: 'Selección del contenido personalizado, medición del contenido e información sobre la audiencia', et: 'Isikupärastatud sisu valimine, sisu mõõtmine ja vaatajaskonna uuring', eu: 'Selection of personalised content, content measurement and audience research', fi: 'Personoidun sisällön valinta, sisällön mittaaminen ja yleisötutkimus', fr: 'Sélection de contenu personnalisé, mesure de performance du contenu et études d’audience', gl: 'Selection of personalised content, content measurement and audience research', he: 'בחירת תוכן מותאם אישית, מדידת תוכן וניתוח קהל', hi: 'Selection of personalised content, content measurement and audience research', hr: 'Odabir personaliziranog sadržaja, mjerenje sadržaja i uvidi u publiku', hu: 'Személyre szabott tartalom kiválasztása, tartalommérés és közönségkutatás', id: 'Selection of personalised content, content measurement and audience research', it: 'Selezione di contenuti personalizzati, misurazione delle prestazioni dei contenuti e ricerche sul pubblico', ja: 'パーソナライズ広告の選択、コンテンツの測定、ユーザー層調査', lt: 'Suasmeninto turinio pasirinkimas, turinio vertinimas ir auditorijos tyrimas', lv: 'Personalizēta satura, satura novērtēšanas un auditorijas izpētes izvēle', mr: 'Selection of personalised content, content measurement and audience research', mt: 'Għażla ta’ kontenut personalizzat, kejl tal-kontenut u riċerka tal-udjenza', nb: 'Valg av personlig tilpasset innhold, innholdsmåling, og publikumsundersøkelser', nl: 'Selectie van gepersonaliseerde content, contentmetingen en doelgroepenonderzoek', no: 'Valg av personlig tilpasset innhold, innholdsmåling, og publikumsundersøkelser', pl: 'Wybór spersonalizowanych treści, pomiar treści i badanie odbiorców', ro: 'Selectarea conținutului personalizat, măsurători de conținut și cercetarea audienței', ru: 'Выбор персонализированного контента, определение эффективности контента и аналитические сведения об аудитории', sk: 'Výber personalizovaného obsahu, meranie obsahu a prieskum cieľových skupín', sl: 'Izbira osebno prilagojene vsebine, merjenje vsebine in raziskovanje občinstva', sv: 'Val av personanpassat innehåll, innehållsmätning och forskning angående målgrupp', th: 'Selection of personalised content, content measurement and audience research', tr: 'Kişiselleştirilmiş içeriğin seçilmesi, içerik ölçümü ve hedef kitle araştırması', uk: 'Вибір персоналізованого контенту, його визначення та дослідження аудиторії', vi: 'Selection of personalised content, content measurement and audience research', zh: '个性化内容的选择、内容衡量和受众研究', 'zh-TW': '个性化内容的选择、内容衡量和受众研究' },
+    14: { ar: 'المحتوى المخصص وقياس أداء المحتوى', bg: 'Персонализирано съдържание и измерване на съдържанието', bs: 'Personalised content and content measurement', ca: 'Contingut personalitzat i mesurament del contingut', cs: 'Personalizovaný obsah a měření obsahu', da: 'Tilpasset indhold og indholdsmåling', de: 'Personalisierte Inhalte und Messung von Inhalten', el: 'Εξατομικευμένο περιεχόμενο και μέτρηση περιεχομένου', en: 'Personalised content and content measurement', es: 'Contenido personalizado y medición del contenido', et: 'Isikupärastatud sisu ning sisu mõõtmine', eu: 'Personalised content and content measurement', fi: 'Personoitu sisältö ja sisällön mittaaminen', fr: 'Contenu personnalisé et mesure de performance du contenu', gl: 'Personalised content and content measurement', he: 'תוכן מותאם אישית ומדידת תוכן', hi: 'Personalised content and content measurement', hr: 'Personalizirani sadržaj i mjerenje sadržaja', hu: 'Személyre szabott tartalom és tartalommérés', id: 'Personalised content and content measurement', it: 'Contenuti personalizzati e misurazione delle prestazioni dei contenuti', ja: 'パーソナライズコンテンツ、コンテンツの測定', lt: 'Suasmenintas turinys ir turinio vertinimas', lv: 'Personalizētais saturs un satura novērtēšana', mr: 'Personalised content and content measurement', mt: 'Kontenut personalizzat u kejl tal-kontenut', nb: 'Personlig tilpasset innhold og innholdsmåling', nl: 'Gepersonaliseerde content en contentmetingen', no: 'Personlig tilpasset innhold og innholdsmåling', pl: 'Spersonalizowane treści i pomiar treści', ro: 'Conținut personalizat și măsurători de conținut', ru: 'Персонализированный контент и определение эффективности контента', sk: 'Personalizovaný obsah a meranie obsahu', sl: 'Osebno prilagojena vsebina in merjenje vsebine', sv: 'Personanpassat innehåll och innehållsmätning', th: 'Personalised content and content measurement', tr: 'Kişiselleştirilmiş içerik ve içerik ölçümü', uk: 'Персоналізований контент і його визначення', vi: 'Personalised content and content measurement', zh: '个性化内容和内容衡量', 'zh-TW': '个性化内容和内容衡量' },
+    15: { ar: 'عرض المحتوى وقياس أداء المحتوى وأبحاث الجمهور', bg: 'Персонализирано съдържание, измерване на съдържанието и проучване на аудиторията', bs: 'Personalised content, content measurement and audience research', ca: 'Contingut personalitzat, mesurament del contingut i investigació sobre el públic', cs: 'Personalizovaný obsah, měření obsahu a průzkum publika', da: 'Tilpasset indhold, indholdsmåling og målgruppeundersøgelser', de: 'Personalisierte Inhalte, Messung von Inhalten und Zielgruppenforschung', el: 'Εξατομικευμένο περιεχομένο, μέτρηση περιεχομένου και έρευνα κοινού', en: 'Personalised content, content measurement and audience research', es: 'Contenido personalizado, medición del contenido e información sobre la audiencia', et: 'Isikupärastatud sisu, sisu mõõtmine ja vaatajaskonna uuring', eu: 'Personalised content, content measurement and audience research', fi: 'Personoitu sisältö, sisällön mittaaminen ja yleisötutkimus', fr: 'Contenu personnalisé, mesure de performance du contenu et études d’audience', gl: 'Personalised content, content measurement and audience research', he: 'תוכן מותאם אישית, מדידת תוכן וניתוח קהל', hi: 'Personalised content, content measurement and audience research', hr: 'Personalizirani sadržaj, mjerenje sadržaja i uvidi u publiku', hu: 'Személyre szabott tartalom, tartalommérés és közönségkutatás', id: 'Personalised content, content measurement and audience research', it: 'Contenuti personalizzati, misurazione delle prestazioni dei contenuti e ricerche sul pubblico', ja: 'パーソナライズコンテンツ、コンテンツの測定、ユーザー層調査', lt: 'Suasmenintas turinys, turinio vertinimas ir auditorijos tyrimai', lv: 'Personalizētais saturs, satura novērtēšana un auditorijas izpēte', mr: 'Personalised content, content measurement and audience research', mt: 'Kontenut personalizzat, kejl tal-kontenut u riċerka tal-udjenza', nb: 'Personlig tilpasset innhold, innholdsmåling og publikumsundersøkelser', nl: 'Gepersonaliseerde content, contentmetingen en doelgroepenonderzoek', no: 'Personlig tilpasset innhold, innholdsmåling og publikumsundersøkelser', pl: 'Spersonalizowane treści, pomiar treści i badanie odbiorców', ro: 'Conținut personalizat, măsurători de conținut și cercetarea audienței', ru: 'Персонализированный контент, определение эффективности контента и аналитические сведения об аудитории', sk: 'Personalizovaný obsah, meranie obsahu a prieskum cieľových skupín', sl: 'Osebno prilagojena vsebina, merjenje vsebine in raziskovanje občinstva', sv: 'Personanpassat innehåll, innehållsmätning och forskning angående målgrupp', th: 'Personalised content, content measurement and audience research', tr: 'Kişiselleştirilmiş içerik, içerik ölçümü ve hedef kitle araştırması', uk: 'Персоналізований контент, його визначення та дослідження аудиторії', vi: 'Personalised content, content measurement and audience research', zh: '个性化内容、内容衡量和受众研究', 'zh-TW': '个性化内容、内容衡量和受众研究' },
+    16: { ar: 'المحتوى المخصص وقياس أداء المحتوى وأبحاث الجمهور وتطوير الخدمات', bg: 'Персонализирано съдържание, измерване на съдържанието, проучване на аудиторията и разработване на услуги', bs: 'Personalised content, content measurement, audience research, and services development', ca: 'Contingut personalitzat, mesurament del contingut, investigació sobre el públic i desenvolupament de serveis', cs: 'Personalizovaný obsah, měření obsahu, průzkum publika a vývoj služeb', da: 'Tilpasset indhold, indholdsmåling, målgruppeundersøgelser og udvikling af tjenester', de: 'Personalisierte Inhalte, Messung von Inhalten, Zielgruppenforschung und Entwicklung von Angeboten', el: 'Εξατομικευμένο περιεχομένο, μέτρηση περιεχομένου, έρευνα κοινού και ανάπτυξη υπηρεσιών', en: 'Personalised content, content measurement, audience research, and services development', es: 'Contenido personalizado, medición del contenido, información sobre la audiencia y desarrollo de servicios', et: 'Isikupärastatud sisu, sisu mõõtmine, vaatajaskonna uuring ja teenuste arendamine', eu: 'Personalised content, content measurement, audience research, and services development', fi: 'Personoitu sisältö, sisällön mittaaminen, yleisötutkimus ja palvelujen kehittäminen', fr: 'Contenu personnalisé, mesure de performance du contenu, études d’audience et développement de services', gl: 'Personalised content, content measurement, audience research, and services development', he: 'תוכן מותאם אישית, מדידת תוכן, ניתוח קהל ופיתוח שירותים', hi: 'Personalised content, content measurement, audience research, and services development', hr: 'Personalizirani sadržaj, mjerenje sadržaja, uvidi u publiku i razvoj usluga', hu: 'Személyre szabott tartalom, tartalommérés, közönségkutatás és szolgáltatásfejlesztés', id: 'Personalised content, content measurement, audience research, and services development', it: 'Contenuti personalizzati, misurazione delle prestazioni dei contenuti, ricerche sul pubblico e sviluppo di servizi', ja: 'パーソナライズコンテンツ、コンテンツの測定、ユーザー層調査、サービス開発', lt: 'Suasmenintas turinys, turinio vertinimas, auditorijos įžvalgos ir paslaugų kūrimas.', lv: 'Personalizētais saturs, satura novērtēšana, auditorijas izpēte un produktu izstrāde', mr: 'Personalised content, content measurement, audience research, and services development', mt: 'Kontenut personalizzat, kejl tal-kontenut, riċerka tal-udjenza, u żvilupp tas-servizzi', nb: 'Personlig tilpasset innhold, innholdsmåling, publikumsundersøkelser og tjenesteutvikling', nl: 'Gepersonaliseerde content, contentmetingen, doelgroepenonderzoek en ontwikkeling van diensten', no: 'Personlig tilpasset innhold, innholdsmåling, publikumsundersøkelser og tjenesteutvikling', pl: 'Spersonalizowane treści, pomiar treści, badanie odbiorców i ulepszanie usług', ro: 'Conținut personalizat, măsurători de conținut, cercetarea audienței și dezvoltarea serviciilor', ru: 'Персонализированный контент, определение эффективности контента, аналитические сведения об аудитории и разработка сервисов', sk: 'Personalizovaný obsah, meranie obsahu, prieskum cieľových skupín a vývoj služieb', sl: 'Osebno prilagojena vsebina, merjenje vsebine, raziskovanje občinstva in razvoj storitev', sv: 'Personanpassat innehåll, innehållsmätning, forskning angående målgrupp och tjänsteutveckling', th: 'Personalised content, content measurement, audience research, and services development', tr: 'Kişiselleştirilmiş içerik, içerik ölçümü, hedef kitle araştırması ve hizmetlerin geliştirilmesi', uk: 'Персоналізований контент, його визначення, дослідження аудиторії та розвиток послуг', vi: 'Personalised content, content measurement, audience research, and services development', zh: '个性化内容、内容衡量、受众研究和服务开发', 'zh-TW': '个性化内容、内容衡量、受众研究和服务开发' },
+    17: { ar: 'قياس أداء الإعلانات والمحتوى وأبحاث الجمهور', bg: 'Измерване на рекламата и съдържанието и проучване на аудиторията', bs: 'Advertising and content measurement, and audience research', ca: 'Mesurament de la publicitat i del contingut, i investigació sobre el públic', cs: 'Měření reklamy a obsahu a průzkum publika', da: 'Annoncerings- og indholdsmåling og målgruppeundersøgelser', de: 'Messung von Werbeleistung und Inhalten sowie Zielgruppenforschung', el: 'Μέτρηση διαφημίσεων και περιεχομένου, και έρευνα κοινού', en: 'Advertising and content measurement, and audience research', es: 'Medición de publicidad y contenido e investigación de audiencia', et: 'Reklaami ja sisu mõõtmine ning vaatajaskonna uuringud', eu: 'Advertising and content measurement, and audience research', fi: 'Mainonnan ja sisällön mittaaminen ja yleisötutkimus', fr: 'Mesure de performance des publicités et du contenu et études d’audience', gl: 'Advertising and content measurement, and audience research', he: 'מדידת פרסום ותוכן וניתוח קהל', hi: 'Advertising and content measurement, and audience research', hr: 'Mjerenje oglašavanja i sadržaja te uvidi u publiku', hu: 'Hirdetés- és tartalommérés és közönségkutatás', id: 'Advertising and content measurement, and audience research', it: 'Misurazione delle prestazioni dei contenuti e dell’efficacia della pubblicità, ricerche sul pubblico', ja: '広告およびコンテンツの測定、ユーザー層調査', lt: 'Reklamos ir turinio vertinimas bei auditorijos tyrimai', lv: 'Reklāmas un satura novērtējumi, auditorijas izpēte', mr: 'Advertising and content measurement, and audience research', mt: 'Kejl tar-riklamar u tal-kontenut, u riċerka tal-udjenza', nb: 'Reklame- og innholdsmåling, og publikumsundersøkelser', nl: 'Advertentie- en contentmetingen en doelgroepenonderzoek', no: 'Reklame- og innholdsmåling, og publikumsundersøkelser', pl: 'Pomiar reklam i treści oraz badanie odbiorców', ro: 'Măsurători ale publicității și de conținut și cercetarea audienței', ru: 'Определение эффективности рекламы и контента, а также аналитические сведения об аудитории', sk: 'Meranie reklamy a obsahu a prieskum cieľových skupín', sl: 'Merjenje oglaševanja in vsebine ter raziskovanje občinstva', sv: 'Reklam och innehållsmätning samt forskning angående målgrupp', th: 'Advertising and content measurement, and audience research', tr: 'Reklam ve içerik ölçümü ve hedef kitle araştırması', uk: 'Визначення оголошення й контенту, дослідження аудиторії', vi: 'Advertising and content measurement, and audience research', zh: '广告和内容衡量，以及受众研究', 'zh-TW': '广告和内容衡量，以及受众研究' },
+    18: { ar: 'قياس أداء الإعلانات والمحتوى', bg: 'Измерване на реклами и съдържание', bs: 'Advertising and content measurement', ca: 'Mesurament de la publicitat i del contingut', cs: 'Měření reklamy a obsahu', da: 'Annoncerings- og indholdsmåling', de: 'Messung von Werbeleistung und Inhalten', el: 'Μέτρηση διαφημίσεων και περιεχομένου', en: 'Advertising and content measurement', es: 'Medición de la publicidad y del contenido', et: 'Reklaamide ja sisu mõõtmine', eu: 'Advertising and content measurement', fi: 'Mainonnan ja sisällön mittaaminen', fr: 'Mesure de performance des publicités et du contenu', gl: 'Advertising and content measurement', he: 'מדידת פרסום ותוכן', hi: 'Advertising and content measurement', hr: 'Mjerenje oglašavanja i sadržaja', hu: 'Hirdetés- és tartalommérés', id: 'Advertising and content measurement', it: 'Misurazione delle prestazioni dei contenuti e dell’efficacia della pubblicità', ja: '広告およびコンテンツの測定', lt: 'Reklamos ir turinio vertinimas', lv: 'Reklāmas un satura novērtēšana', mr: 'Advertising and content measurement', mt: 'Kejl tar-riklamar u tal-kontenut', nb: 'Annonse- og innholdsmåling', nl: 'Advertentie- en contentmetingen', no: 'Annonse- og innholdsmåling', pl: 'Pomiar reklam i treści', ro: 'Măsurători ale publicității și de conținut', ru: 'Определение эффективности рекламы и контента', sk: 'Meranie reklamy a obsahu', sl: 'Merjenje oglaševanja in vsebine', sv: 'Reklam och innehållsmätning', th: 'Advertising and content measurement', tr: 'Reklam ve içerik ölçümü', uk: 'Визначення оголошення й контенту', vi: 'Advertising and content measurement', zh: '广告和内容衡量', 'zh-TW': '广告和内容衡量' },
+    19: { ar: 'قياس أداء الإعلانات وأبحاث الجمهور', bg: 'Измерване на рекламата и проучване на аудиторията', bs: 'Advertising measurement and audience research', ca: 'Mesurament de la publicitat i investigació sobre el públic', cs: 'Měření reklamy a průzkum publika', da: 'Annonceringsmåling og målgruppeundersøgelser', de: 'Messung von Werbeleistung und Zielgruppenforschung', el: 'Μέτρηση διαφημίσεων και έρευνα κοινού', en: 'Advertising measurement and audience research', es: 'Medición publicitaria e investigación de audiencia', et: 'Reklaami mõõtmine ning vaatajaskonna uuringud', eu: 'Advertising measurement and audience research', fi: 'Mainonnan mittaaminen ja yleisötutkimus', fr: 'Mesure de performance des publicités et études d’audience', gl: 'Advertising measurement and audience research', he: 'מדידת פרסום וניתוח קהל', hi: 'Advertising measurement and audience research', hr: 'Mjerenje oglašavanja i uvidi u publiku', hu: 'Hirdetésmérés és közönségkutatás', id: 'Advertising measurement and audience research', it: 'Misurazione delle prestazioni degli annunci e ricerche sul pubblico', ja: '広告の測定、ユーザー層調査', lt: 'Reklamos vertinimas ir auditorijos tyrimai', lv: 'Reklāmas novērtēšana un auditorijas izpēte', mr: 'Advertising measurement and audience research', mt: 'Kejl tar-riklamar u riċerka tal-udjenza', nb: 'Reklamemåling og publikumsundersøkelser', nl: 'Advertentiemetingen en doelgroepenonderzoek', no: 'Reklamemåling og publikumsundersøkelser', pl: 'Pomiar reklam i badanie odbiorców', ro: 'Măsurători ale publicității și cercetarea audienței', ru: 'Определение эффективности рекламы и аналитические сведения об аудитории', sk: 'Meranie reklamy a prieskum cieľových skupín', sl: 'Merjenje oglaševanja in raziskovanje občinstva', sv: 'Reklammätning och forskning angående målgrupp', th: 'Advertising measurement and audience research', tr: 'Reklam ölçümü ve hedef kitle araştırması', uk: 'Визначення оголошення та дослідження аудиторії', vi: 'Advertising measurement and audience research', zh: '广告衡量和受众研究', 'zh-TW': '广告衡量和受众研究' },
+    20: { ar: 'قياس أداء الإعلانات والمحتوى وأبحاث الجمهور وتطوير الخدمات', bg: 'Измерване на рекламата и съдържанието, проучване на аудиторията и разработване на услуги', bs: 'Advertising and content measurement, audience research, and services development', ca: 'Mesurament de la publicitat i del contingut, investigació sobre el públic i desenvolupament de serveis', cs: 'Měření reklamy a obsahu, průzkum publika a rozvoj služeb', da: 'Annoncerings- og indholdsmåling, målgruppeundersøgelser og udvikling af tjenester', de: 'Messung von Werbeleistung und der Performance von Inhalten, Zielgruppenforschung sowie Entwicklung und Verbesserung der Angebote', el: 'Μέτρηση διαφημίσεων και περιεχομένου, έρευνα κοινού και ανάπτυξη υπηρεσιών', en: 'Advertising and content measurement, audience research, and services development', es: 'Medición de la publicidad y del contenido, investigación de audiencia y desarrollo de servicios', et: 'Reklaami ja sisu mõõtmine, vaatajaskonna uuringud ja teenuste arendamine', eu: 'Advertising and content measurement, audience research, and services development', fi: 'Mainonnan ja sisällön mittaaminen, yleisötutkimus ja palvelujen kehittäminen', fr: 'Mesure de performance des publicités et du contenu, études d’audience et développement de services', gl: 'Advertising and content measurement, audience research, and services development', he: 'מדידת פרסום ותוכן, ניתוח קהל ופיתוח שירותים', hi: 'Advertising and content measurement, audience research, and services development', hr: 'Mjerenje oglašavanja i sadržaja, uvidi u publiku i razvoj usluga', hu: 'Hirdetés- és tartalommérés, közönségkutatás és szolgáltatásfejlesztés', id: 'Advertising and content measurement, audience research, and services development', it: 'Misurazione delle prestazioni dei contenuti e degli annunci, ricerche sul pubblico e sviluppo di servizi', ja: '広告およびコンテンツの測定、ユーザー層調査、サービス開発', lt: 'Reklamos ir turinio vertinimas, auditorijos tyrimai ir paslaugų plėtra', lv: 'Reklāmu un satura novērtēšana, auditorijas izpēte un pakalpojumu izstrāde', mr: 'Advertising and content measurement, audience research, and services development', mt: 'Kejl tar-riklamar u tal-kontenut, riċerka tal-udjenza u żvilupp ta’ servizzi', nb: 'Reklame- og innholdsmåling, publikumsundersøkelser og tjenesteutvikling', nl: 'Advertentie- en contentmetingen, doelgroepenonderzoek en ontwikkeling van diensten', no: 'Reklame- og innholdsmåling, publikumsundersøkelser og tjenesteutvikling', pl: 'Pomiar reklam i treści, badanie odbiorców, ulepszanie usług', ro: 'Măsurători ale publicității și de conținut, cercetarea audienței și dezvoltarea serviciilor', ru: 'Определение эффективности рекламы и контента, аналитические сведения об аудитории и разработка сервисов', sk: 'Meranie reklamy a obsahu, prieskum cieľových skupín a vývoj služieb', sl: 'Merjenje oglaševanja in vsebine, raziskovanje občinstva ter razvoj storitev', sv: 'Reklam och innehållsmätning, forskning angående målgrupp och tjänsteutveckling', th: 'Advertising and content measurement, audience research, and services development', tr: 'Reklam ve içerik ölçümü, hedef kitle araştırması ve hizmetlerin geliştirilmesi', uk: 'Визначення оголошення й контенту, дослідження аудиторії та розвиток послуг', vi: 'Advertising and content measurement, audience research, and services development', zh: '广告和内容衡量、受众研究和服务开发', 'zh-TW': '广告和内容衡量、受众研究和服务开发' },
+    21: { ar: 'قياس أداء المحتوى وأبحاث الجمهور وتطوير الخدمات.', bg: 'Измерване на съдържанието, проучване на аудиторията и разработване на услуги.', bs: 'Content measurement, audience research and services development.', ca: 'Mesurament del contingut, investigació sobre el públic i desenvolupament de serveis.', cs: 'Měření obsahu, průzkum publika a vývoj služeb.', da: 'Indholdsmåling, målgruppeundersøgelser og udvikling af tjenester', de: 'Messung der Performance von Inhalten, Zielgruppenforschung sowie Entwicklung und Verbesserung der Angebote', el: 'Μέτρηση περιεχομένου, έρευνα κοινού και ανάπτυξη υπηρεσιών.', en: 'Content measurement, audience research and services development.', es: 'Medición del contenido, investigación de audiencia y desarrollo de servicios.', et: 'Sisu mõõtmine, vaatajaskonna uuringud ja teenuste arendamine', eu: 'Content measurement, audience research and services development.', fi: 'Sisällön mittaaminen, yleisötutkimus ja palvelujen kehittäminen', fr: 'Mesure de performance du contenu, études d’audience et développement de services.', gl: 'Content measurement, audience research and services development.', he: 'מדידת תוכן, ניתוח קהל ופיתוח שירותים.', hi: 'Content measurement, audience research and services development.', hr: 'Mjerenje sadržaja, uvidi u publiku i razvoj usluga.', hu: 'Tartalommérés, közönségkutatás és szolgáltatásfejlesztés.', id: 'Content measurement, audience research and services development.', it: 'Misurazione delle prestazioni dei contenuti, ricerche sul pubblico e sviluppo di servizi', ja: 'コンテンツの測定、ユーザー層調査、サービス開発', lt: 'Turinio vertinimas, auditorijos tyrimai ir paslaugų plėtra.', lv: 'Satura novērtēšana, auditorijas izpēte un pakalpojumu izstrāde.', mr: 'Content measurement, audience research and services development.', mt: 'Kejl tal-kontenut, riċerka tal-udjenza u żvilupp ta’ servizzi.', nb: 'Innholdsmåling, publikumsundersøkelser og tjenesteutvikling.', nl: 'Contentmetingen, doelgroepenonderzoek en ontwikkeling van diensten.', no: 'Innholdsmåling, publikumsundersøkelser og tjenesteutvikling.', pl: 'Pomiar treści, badanie odbiorców i ulepszanie usług', ro: 'Măsurători de conținut, cercetarea audienței și dezvoltarea serviciilor.', ru: 'Определение эффективности контента, аналитические сведения об аудитории и разработка сервисов.', sk: 'Meranie obsahu, prieskum cieľových skupín a vývoj služieb.', sl: 'Merjenje vsebine, raziskovanje občinstva in razvoj storitev.', sv: 'Innehållsmätning, forskning angående målgrupp och tjänsteutveckling', th: 'Content measurement, audience research and services development.', tr: 'İçerik ölçümü, hedef kitle araştırması ve hizmetlerin geliştirilmesi.', uk: 'Визначення контенту, дослідження аудиторії та розвиток послуг', vi: 'Content measurement, audience research and services development.', zh: '内容衡量、受众研究和服务开发', 'zh-TW': '内容衡量、受众研究和服务开发' },
+    22: { ar: 'قياس أداء المحتوى وتطوير الخدمات', bg: 'Измерване на съдържанието и разработване на услуги', bs: 'Content measurement and services development', ca: 'Mesurament del contingut i desenvolupament de serveis', cs: 'Měření obsahu a vývoj služeb', da: 'Indholdsmåling og udvikling af tjenester', de: 'Messung der Performance von Inhalten sowie Entwicklung und Verbesserung der Angebote', el: 'Μέτρηση περιεχομένου και ανάπτυξη υπηρεσιών', en: 'Content measurement and services development', es: 'Medición del contenido y desarrollo de servicios', et: 'Sisu mõõtmine ja teenuste arendamine', eu: 'Content measurement and services development', fi: 'Sisällön mittaaminen ja palveluiden kehittäminen', fr: 'Mesure de performance du contenu et développement de services', gl: 'Content measurement and services development', he: 'מדידת תוכן ופיתוח שירותים', hi: 'Content measurement and services development', hr: 'Mjerenje sadržaja i razvoj proizvoda', hu: 'Tartalommérés és szolgáltatásfejlesztés', id: 'Content measurement and services development', it: 'Misurazione delle prestazioni dei contenuti e sviluppo di servizi', ja: 'コンテンツの測定、サービス開発', lt: 'Turinio vertinimas ir paslaugų plėtra', lv: 'Satura novērtēšana un produktu izstrāde', mr: 'Content measurement and services development', mt: 'Kejl tal-kontenut u żvilupp ta’ servizzi', nb: 'Innholdsmåling og produktutvikling', nl: 'Contentmetingen en productontwikkeling', no: 'Innholdsmåling og produktutvikling', pl: 'Pomiar treści i ulepszanie usług', ro: 'Măsurători de conținut și dezvoltarea serviciilor', ru: 'Определение эффективности контента и разработка сервисов', sk: 'Meranie obsahu a vývoj služieb', sl: 'Merjenje vsebine in razvoj storitev', sv: 'Innehållsmätning och tjänsteutveckling', th: 'Content measurement and services development', tr: 'İçerik ölçümü ve hizmetlerin geliştirilmesi', uk: 'Визначення контенту та розробка послуг', vi: 'Content measurement and services development', zh: '内容衡量和服务开发', 'zh-TW': '内容衡量和服务开发' },
+    23: { ar: 'اختيار الإعلانات والمحتوى المخصصين وقياس أداء الإعلانات والمحتوى', bg: 'Избор на персонализирана реклама и съдържание, измерване на рекламата и съдържанието', bs: 'Selection of personalised advertising and content, advertising and content measurement', ca: 'Selecció de publicitat i contingut personalitzats, mesurament de la publicitat i del contingut', cs: 'Výběr personalizované reklamy a obsahu, měření reklamy a obsahu', da: 'Valg af tilpasset annoncering og indhold, annoncerings- og indholdsmåling', de: 'Auswahl personalisierter Werbung und Inhalte, Messung von Werbeleistung und der Performance von Inhalten', el: 'Επιλογή εξατομικευμένης διαφήμισης και περιεχομένου, μέτρησης διαφήμισης και περιεχομένου', en: 'Selection of personalised advertising and content, advertising and content measurement', es: 'Selección de la publicidad y del contenido personalizados, medición de la publicidad y del contenido', et: 'Isikupärastatud reklaamide ja sisu valimine, reklaamide ning sisu mõõtmine', eu: 'Selection of personalised advertising and content, advertising and content measurement', fi: 'Kohdennetun mainonnan ja personoidun sisällön valinta, mainonnan ja sisällön mittaaminen', fr: 'Sélection de publicités et de contenu personnalisés et mesure de performance des publicités et du contenu', gl: 'Selection of personalised advertising and content, advertising and content measurement', he: 'בחירת פרסום ותוכן מותאמים אישית ומדידת פרסום תוכן', hi: 'Selection of personalised advertising and content, advertising and content measurement', hr: 'Odabir personaliziranog oglašavanja i sadržaja, mjerenje oglašavanja i sadržaja', hu: 'Személyre szabott hirdetés és tartalom kiválasztása, hirdetés- és tartalommérés', id: 'Selection of personalised advertising and content, advertising and content measurement', it: 'Selezione di pubblicità e contenuti personalizzati, misurazione delle prestazioni dei contenuti e dell’efficacia della pubblicità', ja: 'パーソナライズ広告およびコンテンツの選択、広告およびコンテンツの測定', lt: 'Suasmenintos reklamos ir turinio pasirinkimas, reklamos ir turinio vertinimas', lv: 'Personalizētas reklāmas un satura, reklāmas un satura novērtēšanas izvēle', mr: 'Selection of personalised advertising and content, advertising and content measurement', mt: 'Għażla ta’ riklamar u kontenut personalizzat, kejl tar-riklamar u tal-kontenut', nb: 'Valg av personlig tilpasset annonsering og innhold, samt måling av annonsering og innhold', nl: 'Selectie van gepersonaliseerde advertenties en content, advertenties en contentmetingen', no: 'Valg av personlig tilpasset annonsering og innhold, samt måling av annonsering og innhold', pl: 'Wybór spersonalizowanych reklam i treści oraz pomiar reklam i treści', ro: 'Selectarea publicității și conținutului personalizat, măsurători ale publicității și de conținut', ru: 'Выбор персонализированной рекламы и контента, определение эффективности рекламы и контента', sk: 'Výber personalizovanej reklamy a obsahu, meranie reklamy a obsahu', sl: 'Izbira osebno prilagojenega oglaševanja in vsebine, merjenje oglaševanja in vsebine', sv: 'Val av personanpassad reklam och innehåll, reklam och innehållsmätning', th: 'Selection of personalised advertising and content, advertising and content measurement', tr: 'Kişiselleştirilmiş reklam ve içerik seçilmesi, reklam ve içerik ölçümü', uk: 'Вибір персоналізованого оголошення та контенту, визначення оголошення й контенту', vi: 'Selection of personalised advertising and content, advertising and content measurement', zh: '个性化广告和内容的选择、广告和内容衡量', 'zh-TW': '个性化广告和内容的选择、广告和内容衡量' },
+    24: { ar: 'اختيار الإعلانات والمحتوى المخصصين وقياس أداء الإعلانات والمحتوى وأبحاث الجمهور', bg: 'Избор на персонализирана реклама и съдържание, измерване на рекламата и съдържанието и проучване на аудиторията', bs: 'Selection of personalised advertising and content, advertising and content measurement, and audience research', ca: 'Selecció de publicitat i contingut personalitzats, mesurament de la publicitat i del contingut, i investigació sobre el públic', cs: 'Výběr personalizované reklamy a obsahu,měření reklamy a obsahu a průzkum publika', da: 'Valg af tilpasset annoncering og indhold, annoncerings- og indholdsmåling og målgruppeundersøgelser', de: 'Auswahl personalisierter Werbung und Inhalte, Messung von Werbeleistung und der Performance von Inhalten sowie Zielgruppenforschung', el: 'Επιλογή εξατομικευμένης διαφήμισης και περιεχομένου, μέτρησης διαφήμισης και περιεχομένου, και έρευνας κοινού', en: 'Selection of personalised advertising and content, advertising and content measurement, and audience research', es: 'Selección de la publicidad y del contenido personalizados, medición de la publicidad y del contenido, e investigación de audiencia', et: 'Isikupärastatud reklaamide ja sisu valimine, reklaamide ning sisu mõõtmine ja vaatajaskonna uuring', eu: 'Selection of personalised advertising and content, advertising and content measurement, and audience research', fi: 'Kohdennetun mainonnan ja personoidun sisällön valinta, mainonnan ja sisällön mittaaminen sekä yleisötutkimus', fr: 'Sélection de publicités et de contenu personnalisé, mesure de performance des publicités et du contenu et études d’audience', gl: 'Selection of personalised advertising and content, advertising and content measurement, and audience research', he: 'בחירת פרסום ותוכן מותאמים אישית, מדידת פרסום ותוכן וניתוח קהל', hi: 'Selection of personalised advertising and content, advertising and content measurement, and audience research', hr: 'Odabir personaliziranog oglašavanja i sadržaja, mjerenje oglašavanja i sadržaja te uvidi u publiku', hu: 'Személyre szabott hirdetés és tartalom kiválasztása, hirdetés- és tartalommérés és közönségkutatás', id: 'Selection of personalised advertising and content, advertising and content measurement, and audience research', it: 'Selezione di pubblicità e contenuti personalizzati, misurazione delle prestazioni dei contenuti e degli annunci, ricerche sul pubblico', ja: 'パーソナライズ広告およびコンテンツの選択、広告およびコンテンツの測定、ユーザー層調査', lt: 'Suasmenintos reklamos ir turinio pasirinkimas, reklamos ir turinio vertinimas bei auditorijos tyrimai', lv: 'Personalizētas reklāmas un satura, reklāmas un satura novērtējumu, auditorijas izpētes izvēle', mr: 'Selection of personalised advertising and content, advertising and content measurement, and audience research', mt: 'Għażla ta’ riklamar u kontenut personalizzat, kejl tar-riklamar u tal-kontenut u riċerka tal-udjenza', nb: 'Valg av personlig tilpasset annonsering og innhold, samt måling av annonsering og innhold, og publikumsundersøkelser', nl: 'Selectie van gepersonaliseerde advertenties en content, advertentie- en contentmetingen en doelgroepenonderzoek', no: 'Valg av personlig tilpasset annonsering og innhold, samt måling av annonsering og innhold, og publikumsundersøkelser', pl: 'Wybór spersonalizowanych reklam i treści, pomiar reklam i treści oraz badanie odbiorców', ro: 'Selectarea publicității și conținutului personalizat, măsurători ale publicității și de conținut și cercetarea audienței', ru: 'Выбор персонализированной рекламы и контента, определение эффективности рекламы и контента, а также аналитические сведения об аудитории', sk: 'Výber personalizovanej reklamy a obsahu, meranie reklamy a obsahu a prieskum cieľových skupín', sl: 'Izbira osebno prilagojenega oglaševanja in vsebine, merjenje oglaševanja in vsebine ter raziskovanje občinstva', sv: 'Val av personanpassad reklam och innehåll, reklam och innehållsmätning samt forskning angående målgrupp', th: 'Selection of personalised advertising and content, advertising and content measurement, and audience research', tr: 'Kişiselleştirilmiş reklam ve içerik seçilmesi, reklam ve içerik ölçümü ve hedef kitle araştırması', uk: 'Вибір персоналізованого оголошення та контенту, визначення оголошення й контенту, а також дослідження аудиторії', vi: 'Selection of personalised advertising and content, advertising and content measurement, and audience research', zh: '个性化广告和内容的选择、广告和内容衡量以及受众研究', 'zh-TW': '个性化广告和内容的选择、广告和内容衡量以及受众研究' },
+    25: { ar: 'الإعلانات والمحتوى المخصصان وقياس أداء الإعلانات والمحتوى', bg: 'Персонализирана реклама и съдържание, измерване на рекламата и съдържанието', bs: 'Personalised advertising and content, advertising and content measurement', ca: 'Publicitat i contingut personalitzats, mesurament de la publicitat i del contingut', cs: 'Personalizovaná reklama a obsah, měření reklamy a obsahu', da: 'Tilpasset annoncering og indhold, annoncerings- og indholdsmåling', de: 'Personalisierte Werbung und Inhalte, Messung von Werbeleistung und der Performance von Inhalten', el: 'Εξατομικευμένη διαφήμιση και περιεχόμενο, μέτρηση διαφήμισης και περιεχομένου', en: 'Personalised advertising and content, advertising and content measurement', es: 'Publicidad y contenido personalizados, medición de anuncios y del contenido', et: 'Isikupärastatud reklaamid ja sisu, reklaamide ning sisu mõõtmine', eu: 'Personalised advertising and content, advertising and content measurement', fi: 'Kohdennettu mainonta ja personoitu sisältö, mainonnan ja sisällön mittaamine', fr: 'Publicités et contenu personnalisés et mesure de performance des publicités et du contenu', gl: 'Personalised advertising and content, advertising and content measurement', he: 'פרסום ותוכן מותאמים אישית ומדידת פרסום ותוכן', hi: 'Personalised advertising and content, advertising and content measurement', hr: 'Personalizirano oglašavanje i sadržaj, mjerenje oglašavanja i sadržaja', hu: 'Személyre szabott hirdetés és tartalom, hirdetés- és tartalommérés', id: 'Personalised advertising and content, advertising and content measurement', it: 'Pubblicità e contenuti personalizzati, misurazione delle prestazioni dei contenuti e degli annunci', ja: 'パーソナライズ広告およびコンテンツ、広告およびコンテンツの測定', lt: 'Suasmenintos reklamos ir turinio pateikimas, reklamos ir turinio vertinimas', lv: 'Personalizētas reklāmas un saturs, reklāmu un satura novērtēšana', mr: 'Personalised advertising and content, advertising and content measurement', mt: 'Riklami u kontenut personalizzati, kejl tar-riklamar u tal-kontenut', nb: 'Personlig tilpasset annonsering og innhold, samt måling av annonsering og innhold', nl: 'Gepersonaliseerde advertenties en content, advertentie- en contentmetingen', no: 'Personlig tilpasset annonsering og innhold, samt måling av annonsering og innhold', pl: 'Spersonalizowane reklamy i treści oraz pomiar reklam i treści', ro: 'Publicitate și conținut personalizat, măsurători ale publicității și de conținut', ru: 'Персонализированные рекламные объявления и контент, определение эффективности рекламы и контента', sk: 'Personalizovaná reklama a obsah, meranie reklamy a obsahu', sl: 'Osebno prilagojeno oglaševanje in vsebina, merjenje oglaševanja in vsebine', sv: 'Personanpassad reklam och innehåll, reklam- och innehållsmätning', th: 'Personalised advertising and content, advertising and content measurement', tr: 'Kişiselleştirilmiş reklamlar ve içerik, reklam ve içerik ölçümü', uk: 'Персоналізоване оголошення й контент, визначення оголошення й контенту', vi: 'Personalised advertising and content, advertising and content measurement', zh: '个性化广告和内容、广告和内容衡量', 'zh-TW': '个性化广告和内容、广告和内容衡量' },
+    26: { ar: 'الإعلانات والمحتوى المخصصان وقياس أداء الإعلانات والمحتوى وأبحاث الجمهور', bg: 'Персонализирана реклама и съдържание, измерване на рекламата и съдържанието и проучване на аудиторията', bs: 'Personalised advertising and content, advertising and content measurement, and audience research', ca: 'Publicitat i contingut personalitzats, mesurament de la publicitat i del contingut, i investigació sobre el públic', cs: 'Personalizovaná reklama a obsah, měření reklamy a obsahu a průzkum publika', da: 'Tilpasset annoncering og indhold, annoncerings- og indholdsmåling og målgruppeundersøgelser', de: 'Personalisierte Werbung und Inhalte, Messung von Werbeleistung und der Performance von Inhalten sowie Zielgruppenforschung', el: 'Εξατομικευμένη διαφήμιση και περιεχόμενο, μέτρηση διαφήμισης και περιεχομένου, και έρευνα κοινού', en: 'Personalised advertising and content, advertising and content measurement, and audience research', es: 'Publicidad y contenido personalizados, medición de anuncios y del contenido, e investigación de audiencia', et: 'Isikupärastatud reklaamid ja sisu, reklaamide ning sisu mõõtmine ja vaatajaskonna uuring', eu: 'Personalised advertising and content, advertising and content measurement, and audience research', fi: 'Kohdennettu mainonta ja personoitu sisältö, mainonnan ja sisällön mittaaminen sekä yleisötutkimus', fr: 'Publicités et contenu personnalisés, mesure de performance des publicités et du contenu et études d’audience', gl: 'Personalised advertising and content, advertising and content measurement, and audience research', he: 'פרסום ותוכן מותאמים אישית, מדידת פרסום ותוכן וניתוח קהל', hi: 'Personalised advertising and content, advertising and content measurement, and audience research', hr: 'Odabir personaliziranog oglašavanja i sadržaja, mjerenje oglašavanja i sadržaja te uvidi u publiku', hu: 'Személyre szabott hirdetés és tartalom, hirdetés- és tartalommérés és közönségkutatás', id: 'Personalised advertising and content, advertising and content measurement, and audience research', it: 'Pubblicità e contenuti personalizzati, misurazione delle prestazioni dei contenuti e degli annunci, ricerche sul pubblico', ja: 'パーソナライズ広告およびコンテンツ、広告およびコンテンツの測定、ユーザー層調査', lt: 'Suasmeninta reklama ir turinys, reklamos ir turinio vertinimas bei auditorijos tyrimai', lv: 'Personalizēta reklāma un saturs, reklāmas un satura novērtējumi, auditorijas izpēte', mr: 'Personalised advertising and content, advertising and content measurement, and audience research', mt: 'Riklamar u kontenut personalizzat, kejl tar-riklamar u tal-kontenut u riċerka tal-udjenza', nb: 'Personlig tilpasset annonsering og innhold, samt måling av annonsering og innhold, og publikumsundersøkelser', nl: 'Gepersonaliseerde advertenties en content, advertentie- en contentmetingen en doelgroepenonderzoek', no: 'Personlig tilpasset annonsering og innhold, samt måling av annonsering og innhold, og publikumsundersøkelser', pl: 'Spersonalizowane reklamy i treści, pomiar reklam i treści oraz badanie odbiorców', ro: 'Publicitate și conținut personalizat, măsurători ale publicității și de conținut și cercetarea audienței', ru: 'Персонализированная реклама и контент, определение эффективности рекламы и контента, а также аналитические сведения об аудитории', sk: 'Personalizovaná reklama a obsah, meranie reklamy a obsahu a prieskum cieľových skupín', sl: 'Osebno prilagojeno oglaševanje in vsebina, merjenje oglaševanja in vsebine ter raziskovanje občinstva', sv: 'Personanpassad reklam och innehåll, reklam- och innehållsmätning samt forskning angående målgrupp', th: 'Personalised advertising and content, advertising and content measurement, and audience research', tr: 'Kişiselleştirilmiş reklam ve içerik, reklam ve içerik ölçümü ve hedef kitle araştırması', uk: 'Персоналізоване оголошення й контент, визначення оголошення й контенту, дослідження аудиторії', vi: 'Personalised advertising and content, advertising and content measurement, and audience research', zh: '个性化广告和内容、广告和内容衡量以及受众研究', 'zh-TW': '个性化广告和内容、广告和内容衡量以及受众研究' },
+    27: { ar: 'ملف الإعلانات والمحتوى المخصصين', bg: 'Профил с персонализирана реклама и съдържание', bs: 'Personalised advertising and content profile', ca: 'Publicitat personalitzada i perfil del contingut', cs: 'Personalizovaná reklama a profilový obsah', da: 'Tilpasset annoncering og indholdsprofil', de: 'Erstellung von Profilen für personalisierte Werbung und Inhalte', el: 'Προφίλ εξατομικευμένης διαφήμισης και περιεχομένου', en: 'Personalised advertising and content profile', es: 'Publicidad personalizada y perfil de contenido', et: 'Isikupärastatud reklaami- ja sisuprofiil', eu: 'Personalised advertising and content profile', fi: 'Personoitu mainonta- ja sisältöprofiili', fr: 'Publicités personnalisées et profil de contenu', gl: 'Personalised advertising and content profile', he: 'פרופיל פרסום ותוכן מותאמים אישית', hi: 'Personalised advertising and content profile', hr: 'Profil za personalizirano oglašavanje i sadržaj', hu: 'Személyre szabott hirdetési és tartalomprofil', id: 'Personalised advertising and content profile', it: 'Pubblicità personalizzata e profilo per la personalizzazione dei contenuti', ja: 'パーソナライズ広告およびコンテンツプロファイル', lt: 'Suasmeninta reklama ir turinio profilis', lv: 'Personalizētās reklāmas un satura profils', mr: 'Personalised advertising and content profile', mt: 'Profil tar-riklami u tal-kontenut personalizzat', nb: 'Personlig tilpasset annonsering og innholdsprofil', nl: 'Gepersonaliseerde advertenties en contentprofiel', no: 'Personlig tilpasset annonsering og innholdsprofil', pl: 'Profil bazujący na spersonalizowanych reklamach i treściach', ro: 'Publicitate personalizată și profil de conținut', ru: 'Персонализированная реклама и профиль контента', sk: 'Profil personalizovanej reklamy a obsahu', sl: 'Profil osebno prilagojenega oglaševanja in vsebine', sv: 'Personanpassad reklam- och innehållsprofil', th: 'Personalised advertising and content profile', tr: 'Kişiselleştirilmiş reklam ve içerik profili', uk: 'Профіль персоналізованого оголошення й контенту', vi: 'Personalised advertising and content profile', zh: '个性化广告和内容资料', 'zh-TW': '个性化广告和内容资料' },
+    28: { ar: 'اختيار الإعلانات والمحتوى المخصصين', bg: 'Избор на профил с персонализирана реклама и съдържание', bs: 'Selection of personalised advertising and content', ca: 'Selecció de publicitat i contingut personalitzats', cs: 'Výběr personalizované reklamy a obsahu', da: 'Valg af tilpasset annoncering og indhold', de: 'Erstellung von Profilen für personalisierte Werbung und Inhalte', el: 'Επιλογή εξατομικευμένης διαφήμισης και περιεχομένου', en: 'Selection of personalised advertising and content', es: 'Selección de publicidad y contenido personalizados', et: 'Isikupärastatud reklaamide ja sisu valimine', eu: 'Selection of personalised advertising and content', fi: 'Personoidun mainonta- ja sisältöprofiilin valinta', fr: 'Sélection de publicités et de contenu personnalisés', gl: 'Selection of personalised advertising and content', he: 'בחירת פרסום ותוכן מותאמים אישית', hi: 'Selection of personalised advertising and content', hr: 'Odabir personaliziranog oglašavanja i sadržaja', hu: 'Személyre szabott hirdetés és tartalom kiválasztása', id: 'Selection of personalised advertising and content', it: 'Selezione di pubblicità e contenuti personalizzati', ja: 'パーソナライズ広告およびコンテンツの選択', lt: 'Suasmenintos reklamos ir turinio pasirinkimas', lv: 'Personalizētas reklāmas un satura atlase', mr: 'Selection of personalised advertising and content', mt: 'Għażla ta’ riklamar u kontenut personalizzat', nb: 'Valg av personlig tilpasset annonsering og innhold', nl: 'Selectie van gepersonaliseerde advertenties en content', no: 'Valg av personlig tilpasset annonsering og innhold', pl: 'Wybór spersonalizowanych reklam i treści', ro: 'Selectarea publicității și conținutului personalizat', ru: 'Выбор персонализированной рекламы и контента', sk: 'Výber personalizovanej reklamy a obsahu', sl: 'Izbira osebno prilagojenega oglaševanja in vsebine', sv: 'Val av personanpassad reklam och innehåll', th: 'Selection of personalised advertising and content', tr: 'Kişiselleştirilmiş reklam ve içerik seçilmesi', uk: 'Вибір персоналізованого оголошення й контенту', vi: 'Selection of personalised advertising and content', zh: '个性化广告和内容的选择', 'zh-TW': '个性化广告和内容的选择' },
+    29: { ar: 'الإعلانات بناءً على بيانات محدودة وقياس أداء الإعلانات والمحتوى وأبحاث الجمهور', bg: 'Реклама на базата на ограничени данни, измерване на рекламата и съдържанието и проучване на аудиторията', bs: 'Advertising based on limited data, advertising and content measurement, and audience research', ca: 'Publicitat basada en dades limitades, mesurament de la publicitat i del contingut, i investigació sobre el públic', cs: 'Reklama založená na omezených údajích, měření reklam a obsahu a průzkum publika', da: 'Annoncering baseret på begrænsede oplysninger, annoncerings- og indholdsmåling og målgruppeundersøgelser', de: 'Werbung basierend auf einer reduzierten Menge von Daten, Messung von Werbeleistung und der Performance von Inhalten sowie Zielgruppenforschung', el: 'Διαφήμιση βασισμένη σε περιορισμένα δεδομένα, μέτρηση διαφήμισης και περιεχομένου, και έρευνα κοινού', en: 'Advertising based on limited data, advertising and content measurement, and audience research', es: 'Publicidad basada en datos limitados, medición de los anuncios y del contenido, e investigación de audiencia', et: 'Piiratud andmetel põhinev reklaam, reklaami ja sisu mõõtmine ning vaatajaskonna uuring', eu: 'Advertising based on limited data, advertising and content measurement, and audience research', fi: 'Rajoitettuihin tietoihin, mainonnan ja sisällön mittaukseen sekä yleisötutkimukseen perustuva mainonta', fr: 'Publicité basée sur des données limitées, mesure de performance des publicités et du contenu et études d’audience', gl: 'Advertising based on limited data, advertising and content measurement, and audience research', he: 'פרסום שמבוסס על נתונים מוגבלים, מדידת פרסום ותוכן וניתוח קהל', hi: 'Advertising based on limited data, advertising and content measurement, and audience research', hr: 'Oglašavanje na temelju ograničenih podataka, mjerenje oglašavanja i sadržaja te uvidi u publiku', hu: 'Korlátozott körű adatokon alapuló hirdetés, hirdetés- és tartalommérés és közönségkutatás', id: 'Advertising based on limited data, advertising and content measurement, and audience research', it: 'Pubblicità basata su dati limitati, misurazione delle prestazioni dei contenuti e degli annunci, ricerche sul pubblico', ja: '制限付きデータに基づく広告、広告およびコンテンツの測定、ユーザー層調査', lt: 'Reklama, pagrįsta ribotais duomenimis, reklamos ir turinio vertinimas bei auditorijos tyrimais', lv: 'Reklāma, kas balstīta uz ierobežotiem datiem, reklāmas un satura novērtējumiem un auditorijas izpēti', mr: 'Advertising based on limited data, advertising and content measurement, and audience research', mt: 'Riklamar ibbażat fuq dejta limitata, kejl tar-riklamar u tal-kontenut, u riċerka tal-udjenza', nb: 'Annonsering basert på begrenset data- og annonseringsmåling, og publikumsundersøkelser', nl: 'Advertenties op basis van metingen van beperkte gegevens, advertenties en content en doelgroepenonderzoek', no: 'Annonsering basert på begrenset data- og annonseringsmåling, og publikumsundersøkelser', pl: 'Reklama oparta na ograniczonych danych, pomiar reklam i treści,  badanie odbiorców', ro: 'Publicitate bazată pe date limitate, măsurători ale publicității și de conținut și cercetarea audienței', ru: 'Реклама на основе ограниченных данных, определение эффективности рекламы и контента, а также аналитические сведения об аудитории', sk: 'Reklama založená na obmedzených údajoch, meraní reklamy a obsahu a prieskume cieľových skupín', sl: 'Oglaševanje na podlagi omejenih podatkov, merjenje oglaševanja in vsebine ter raziskovanje občinstva', sv: 'Reklam baserad på begränsade data, reklam- och innehållsmätning samt forskning angående målgrupp', th: 'Advertising based on limited data, advertising and content measurement, and audience research', tr: 'Sınırlı veriye, reklam ve içerik ölçümüne ve hedef kitle araştırmasına dayalı reklamlar', uk: 'Оголошення на основі обмежених даних, визначення оголошення й контенту, дослідження аудиторії', vi: 'Advertising based on limited data, advertising and content measurement, and audience research', zh: '基于有限数据、广告和内容衡量以及受众研究的广告', 'zh-TW': '基于有限数据、广告和内容衡量以及受众研究的广告' },
+    30: { ar: 'اختيار الإعلانات المخصصة والمحتوى المخصص وقياس أداء الإعلانات والمحتوى وأبحاث الجمهور', bg: 'Избор на персонализирана реклама, персонализирано съдържание, измерване на рекламата и съдържанието и проучване на аудиторията', bs: 'Selection of personalised advertising, personalised content, advertising and content measurement, and audience research', ca: 'Selecció de publicitat personalitzada, contingut personalitzat, mesurament de la publicitat i del contingut, i investigació sobre el públic', cs: 'Výběr personalizované reklamy a obsahu, měření reklamy a obsahu a průzkum publika', da: 'Valg af tilpasset annoncering, tilpasset indhold, annoncerings- og indholdsmåling og målgruppeundersøgelser', de: 'Auswahl personalisierter Inhalte, personalisierte Inhalte, Messung von Werbeleistung und der Performance Inhalten sowie Zielgruppenforschung', el: 'Επιλογή εξατομικευμένης διαφήμισης και περιεχομένου, μέτρηση διαφήμισης και περιεχομένου, και έρευνα κοινού', en: 'Selection of personalised advertising, personalised content, advertising and content measurement, and audience research', es: 'Selección de la publicidad y del contenido personalizados, medición de la publicidad y del contenido, e investigación de audiencia', et: 'Isikupärastatud reklaamide valimine, isikupärastatud sisu, reklaamide ning sisu mõõtmine ja vaatajaskonna uuring', eu: 'Selection of personalised advertising, personalised content, advertising and content measurement, and audience research', fi: 'Kohdennetun mainonnan valinta, personoitu sisältö, mainonnan ja sisällön mittaaminen sekä yleisötutkimus', fr: 'Sélection de publicités et de contenu personnalisés, mesure de performance des publicités et du contenu et études d’audience', gl: 'Selection of personalised advertising, personalised content, advertising and content measurement, and audience research', he: 'בחירת פרסום מותאם אישית, תוכן מותאם אישית, מדידת פרסום ותוכן וניתוח קהל', hi: 'Selection of personalised advertising, personalised content, advertising and content measurement, and audience research', hr: 'Odabir personaliziranog oglašavanja, personalizirani sadržaj, mjerenje oglašavanja i sadržaja te uvidi u publiku', hu: 'Személyre szabott hirdetés kiválasztása, személyre szabott tartalom, hirdetés- és tartalommérés és közönségkutatás', id: 'Selection of personalised advertising, personalised content, advertising and content measurement, and audience research', it: 'Selezione di pubblicità personalizzata, contenuti personalizzati, misurazione delle prestazioni dei contenuti e degli annunci, ricerche sul pubblico', ja: 'パーソナライズ広告の選択、パーソナライズコンテンツ、広告およびコンテンツの測定、ユーザー層調査', lt: 'Suasmenintos reklamos, suasmeninto turinio pasirinkimas, reklamos ir turinio vertinimas bei auditorijos tyrimai', lv: 'Personalizētas reklāmas un satura izvēle, reklāmas un satura novērtējumi un auditorijas izpēte', mr: 'Selection of personalised advertising, personalised content, advertising and content measurement, and audience research', mt: 'Għażla ta’ riklamar personalizzat, kontenut personalizzat, kejl tar-riklamar u tal-kontenut, u riċerka tal-udjenza', nb: 'Valg av personlig tilpasset annonsering og innhold, samt måling av annonsering og innhold, og publikumsundersøkelser', nl: 'Selectie van gepersonaliseerde advertenties, gepersonaliseerde content, advertentie- en contentmetingen en doelgroepenonderzoek', no: 'Valg av personlig tilpasset annonsering og innhold, samt måling av annonsering og innhold, og publikumsundersøkelser', pl: 'Wybór spersonalizowanych reklam, spersonalizowane treści, pomiar reklam i treści oraz  badanie odbiorców', ro: 'Selectarea publicității personalizate, a conținutului personalizat, a măsurătorilor de publicitate și de conținut și a cercetării audienței', ru: 'Выбор персонализированной рекламы, персонализированного контента, определение эффективности рекламы и контента, а также аналитические сведения об аудитории', sk: 'Výber personalizovanej reklamy, personalizovaného obsahu, merania reklamy a obsahu a prieskumu cieľových skupín', sl: 'Izbira osebno prilagojenega oglaševanja, osebno prilagojena vsebina, merjenje oglaševanja in vsebine ter raziskovanje občinstva', sv: 'Val av personanpassad reklam, personanpassat innehåll, reklam och innehållsmätning samt forskning angående målgrupp', th: 'Selection of personalised advertising, personalised content, advertising and content measurement, and audience research', tr: 'Kişiselleştirilmiş reklam, kişiselleştirilmiş içerik seçilmesi, reklam ve içerik ölçümü ve hedef kitle araştırması', uk: 'Вибір персоналізованого оголошення, персоналізованого контенту, визначення оголошення й контенту, дослідження аудиторії', vi: 'Selection of personalised advertising, personalised content, advertising and content measurement, and audience research', zh: '个性化广告的选择、个性化内容、广告和内容衡量以及受众研究', 'zh-TW': '个性化广告的选择、个性化内容、广告和内容衡量以及受众研究' },
+    31: { ar: 'اختيار الإعلانات المخصصة والمحتوى المخصص وقياس أداء الإعلانات والمحتوى وأبحاث الجمهور وتطوير الخدمات', bg: 'Избор на персонализирана реклама, персонализирано съдържание, измерване на рекламата и съдържанието, проучване на аудиторията и разработване на услуги', bs: 'Selection of personalised advertising, personalised content, advertising and content measurement, audience research, and services development', ca: 'Selecció de publicitat personalitzada, contingut personalitzat, mesurament de la publicitat i del contingut, investigació sobre el públic i desenvolupament de serveis', cs: 'Výběr personalizované reklamy, personalizovaného obsahu, měření reklamy a obsahu, průzkum publika a rozvoj služeb', da: 'Valg af tilpasset annoncering, tilpasset indhold, annoncerings- og indholdsmåling, målgruppeundersøgelser og udvikling af tjenester', de: 'Auswahl personalisierter Werbung und Inhalte, Messung von Werbeleistung und der Performance von Inhalten, Zielgruppenforschung sowie Entwicklung und Verbesserung der Angebote', el: 'Επιλογή εξατομικευμένης διαφήμισης και περιεχομένου, μέτρησης διαφήμισης και περιεχομένου, έρευνας κοινού και ανάπτυξης υπηρεσιών', en: 'Selection of personalised advertising, personalised content, advertising and content measurement, audience research, and services development', es: 'Selección de la publicidad y del contenido personalizados, medición de la publicidad y del contenido, investigación de audiencia y desarrollo de servicios', et: 'Isikupärastatud reklaamide valimine, isikupärastatud sisu, reklaamide ning sisu mõõtmine, vaatajaskonna uuring ja teenuste arendamine', eu: 'Selection of personalised advertising, personalised content, advertising and content measurement, audience research, and services development', fi: 'Kohdennetun mainonnan valinta, personoitu sisältö, mainonnan ja sisällön mittaaminen, yleisötutkimus ja palvelujen kehittäminen', fr: 'Sélection de publicités et de contenu personnalisés, mesure de performance des publicités et du contenu, études d’audience et développement de services', gl: 'Selection of personalised advertising, personalised content, advertising and content measurement, audience research, and services development', he: 'בחירת פרסום מותאם אישית, תוכן מותאם אישית, מדידת פרסום ותוכן, ניתוח קהל ופיתוח שירותים', hi: 'Selection of personalised advertising, personalised content, advertising and content measurement, audience research, and services development', hr: 'Odabir personaliziranog oglašavanja, personalizirani sadržaj, mjerenje oglašavanja i sadržaja, uvidi u publiku i razvoj usluga', hu: 'Személyre szabott hirdetés kiválasztása, személyre szabott tartalom, hirdetés- és tartalommérés, közönségkutatás és szolgáltatásfejlesztés', id: 'Selection of personalised advertising, personalised content, advertising and content measurement, audience research, and services development', it: 'Selezione di pubblicità personalizzata, contenuti personalizzati, misurazione delle prestazioni dei contenuti e degli annunci, ricerche sul pubblico, sviluppo di servizi', ja: 'パーソナライズ広告の選択、パーソナライズコンテンツ、広告およびコンテンツの測定、ユーザー層調査、サービス開発', lt: 'Suasmenintos reklamos, suasmeninto turinio pasirinkimas, reklamos ir turinio vertinimas, auditorijos tyrimas ir paslaugų kūrimas', lv: 'Personalizētas reklāmas un satura atlase, reklāmas un satura novērtējumi, auditorijas izpēte un pakalpojumu izstrāde', mr: 'Selection of personalised advertising, personalised content, advertising and content measurement, audience research, and services development', mt: 'Għażla ta’ riklamar personalizzat, kontenut personalizzat, kejl tar-riklamar u tal-kontenut, riċerka tal-udjenza, u żvilupp ta’ servizzi', nb: 'Valg av personlig tilpasset annonsering og innhold, samt måling av annonsering og innhold, og publikumsundersøkelser og tjenesteutvikling', nl: 'Selectie van gepersonaliseerde advertenties, gepersonaliseerde content, advertentie- en contentmetingen, doelgroepenonderzoek en ontwikkeling van diensten', no: 'Valg av personlig tilpasset annonsering og innhold, samt måling av annonsering og innhold, og publikumsundersøkelser og tjenesteutvikling', pl: 'Wybór spersonalizowanych reklam, spersonalizowane treści, pomiar reklam i treści,  badanie odbiorców oraz ulepszanie usług', ro: 'Selectarea publicității personalizate, a conținutului personalizat, a măsurătorilor de publicitate și de conținut, a cercetării audienței și a dezvoltării serviciilor', ru: 'Выбор персонализированной рекламы, персонализированного контента, определение эффективности рекламы и контента, аналитические сведения об аудитории и разработка сервисов', sk: 'Výber personalizovanej reklamy, personalizovaného obsahu, merania reklamy a obsahu, prieskumu cieľových skupín a vývoja služieb', sl: 'Izbira osebno prilagojenega oglaševanja, osebno prilagojena vsebina, merjenje oglaševanja in vsebine, raziskovanje občinstva ter razvoj storitev', sv: 'Val av personanpassad reklam, personanpassat innehåll, reklam och innehållsmätning, forskning angående målgrupp och tjänsteutveckling', th: 'Selection of personalised advertising, personalised content, advertising and content measurement, audience research, and services development', tr: 'Kişiselleştirilmiş reklam, kişiselleştirilmiş içerik seçme, reklam ve içerik ölçümü, hedef kitle araştırması ve hizmetlerin geliştirilmesi', uk: 'Вибір персоналізованого оголошення, персоналізованого контенту, визначення оголошення й контенту, дослідження аудиторії та розвиток послуг', vi: 'Selection of personalised advertising, personalised content, advertising and content measurement, audience research, and services development', zh: '个性化广告的选择、个性化内容、广告和内容衡量、受众研究和服务开发', 'zh-TW': '个性化广告的选择、个性化内容、广告和内容衡量、受众研究和服务开发' },
+    32: { ar: 'الإعلانات بناءً على بيانات محدودة والمحتوى المخصص وقياس أداء الإعلانات والمحتوى وأبحاث الجمهور', bg: 'Реклама на базата на ограничени данни, персонализирано съдържание, измерване на рекламата и съдържанието и проучване на аудиторията', bs: 'Advertising based on limited data, personalised content, advertising and content measurement, and audience research', ca: 'Publicitat basada en dades limitades, contingut personalitzat, mesurament de la publicitat i del contingut i investigació sobre el públic', cs: 'Reklama založená na omezených údajích, měření reklam a obsahu a průzkumu publika', da: 'Annoncering baseret på begrænsede oplysninger, tilpasset indhold, annoncerings- og indholdsmåling og målgruppeundersøgelser', de: 'Werbung basierend auf einer reduzierten Menge von Daten, personalisierte Inhalte, Messung von Werbeleistung und der Performance von Inhalten sowie Zielgruppenforschung', el: 'Διαφήμιση βασισμένη σε περιορισμένα δεδομένα, εξατομικευμένο περιεχόμενο, μέτρηση διαφήμισης και περιεχομένου, και έρευνα κοινού', en: 'Advertising based on limited data, personalised content, advertising and content measurement, and audience research', es: 'Publicidad basada en datos limitados, contenido personalizado, medición de la publicidad y del contenido, e investigación de audiencia', et: 'Piiratud andmetel põhinev reklaam, isikupärastatud sisu, reklaami ja sisu mõõtmine ning vaatajaskonna uuring', eu: 'Advertising based on limited data, personalised content, advertising and content measurement, and audience research', fi: 'Rajoitettujen tietojen, personoidun sisällön, mainonnan ja sisällön mittauksen sekä yleisötutkimuksen perusteella tehty mainonta', fr: 'Publicité basée sur des données limitées, contenu personnalisé, mesure de performance des publicités et du contenu et études d’audience', gl: 'Advertising based on limited data, personalised content, advertising and content measurement, and audience research', he: 'פרסום שמבוסס על נתונים מוגבלים, תוכן מותאם אישית, מדידת פרסום ותוכן וניתוח קהל', hi: 'Advertising based on limited data, personalised content, advertising and content measurement, and audience research', hr: 'Oglašavanje na temelju ograničenih podataka, personalizirani sadržaj, mjerenje oglašavanja i sadržaja te uvidi u publiku', hu: 'Korlátozott körű adatokon alapuló hirdetés, személyre szabott tartalom, hirdetés- és tartalommérés és közönségkutatás', id: 'Advertising based on limited data, personalised content, advertising and content measurement, and audience research', it: 'Pubblicità basata su dati limitati, contenuti personalizzati, misurazione delle prestazioni dei contenuti e degli annunci, ricerche sul pubblico', ja: '制限付きデータに基づく広告、パーソナライズコンテンツ、広告およびコンテンツの測定、ユーザー層調査', lt: 'Ribotais duomenimis pagrįsta reklama, suasmenintas turinys, reklamos ir turinio vertinimas bei auditorijos tyrimais', lv: 'Reklāma, kas balstīta uz ierobežotiem datiem, personalizētu saturu, reklāmas un satura novērtējumiem un auditorijas izpēti', mr: 'Advertising based on limited data, personalised content, advertising and content measurement, and audience research', mt: 'Riklamar ibbażat fuq dejta limitata, kontenut personalizzat, kejl tar-riklamar u tal-kontenut, u riċerka tal-udjenza', nb: 'Annonsering basert på begrensede data, personlig tilpasset innhold, annonserings- og innholdsmåling, og publikumsundersøkelser', nl: 'Advertenties op basis van beperkte gegevens, gepersonaliseerde content, advertentie- en contentmetingen en doelgroepenonderzoek', no: 'Annonsering basert på begrensede data, personlig tilpasset innhold, annonserings- og innholdsmåling, og publikumsundersøkelser', pl: 'Reklama oparta na ograniczonych danych, spersonalizowane treści, pomiar reklam i treści oraz  badanie odbiorców', ro: 'Publicitate bazată pe date limitate, conținut personalizat, măsurători ale publicității și de conținut și cercetări ale audienței', ru: 'Реклама на основе ограниченных данных, персонализированный контент, определение эффективности рекламы и контента, а также аналитические сведения об аудитории', sk: 'Reklama založená na obmedzených údajoch, personalizovanom obsahu, meraní reklamy a obsahu a prieskume cieľových skupín', sl: 'Oglaševanje na podlagi omejenih podatkov, osebno prilagojena vsebina, merjenje oglaševanja in vsebine ter raziskovanje občinstva', sv: 'Reklam baserad på begränsade data, personanpassat innehåll, reklam och innehållsmätning samt forskning angående målgrupp', th: 'Advertising based on limited data, personalised content, advertising and content measurement, and audience research', tr: 'Sınırlı veriye, kişiselleştirilmiş içeriğe, reklam ve içerik ölçümüne ve hedef kitle araştırmasına dayalı reklamlar', uk: 'Оголошення на основі обмежених даних, персоналізований контент, визначення оголошення й контенту, дослідження аудиторії', vi: 'Advertising based on limited data, personalised content, advertising and content measurement, and audience research', zh: '基于有限数据、个性化内容、广告和内容衡量以及受众研究的广告', 'zh-TW': '基于有限数据、个性化内容、广告和内容衡量以及受众研究的广告' },
+    33: { ar: 'الإعلانات بناءً على بيانات محدودة والمحتوى المخصص وقياس أداء الإعلانات والمحتوى وأبحاث الجمهور وتطوير الخدمات', bg: 'Реклама на базата на ограничени данни, персонализирано съдържание, измерване на рекламата и съдържанието, проучване на аудиторията и разработване на услуги', bs: 'Advertising based on limited data, personalised content, advertising and content measurement, audience research, and services development', ca: 'Publicitat basada en dades limitades, contingut personalitzat, mesurament de la publicitat i del contingut, investigació sobre el públic i desenvolupament de serveis', cs: 'Reklama založená na omezených údajích, měření personalizovaného obsahu a reklam, průzkumu publika a rozvoji služeb', da: 'Annoncering baseret på begrænsede oplysninger, tilpasset indhold, annoncerings- og indholdsmåling, målgruppeundersøgelser og udvikling af tjenester', de: 'Werbung basierend auf einer reduzierten Menge von Daten, personalisierte Inhalte, Messung von Werbeleistung und der Performance von Inhalten, Zielgruppenforschung sowie Entwicklung und Verbesserung von Angeboten', el: 'Διαφήμιση βασισμένη σε περιορισμένα δεδομένα, εξατομικευμένο περιεχόμενο, μέτρηση διαφήμισης και περιεχομένου, έρευνα κοινού και ανάπτυξη υπηρεσιών', en: 'Advertising based on limited data, personalised content, advertising and content measurement, audience research, and services development', es: 'Publicidad basada en datos limitados, contenido personalizado, medición de la publicidad y del contenido, investigación de audiencia y desarrollo de servicios', et: 'Piiratud andmetel põhinev reklaam, isikupärastatud sisu, reklaami ja sisu mõõtmine, vaatajaskonna uuring ning teenuste arendamine', eu: 'Advertising based on limited data, personalised content, advertising and content measurement, audience research, and services development', fi: 'Rajoitettujen tietojen, personoidun sisällön, mainonnan ja sisällön mittauksen, yleisötutkimuksen ja palvelujen kehittämisen perusteella tehty mainonta', fr: 'Publicité basée sur des données limitées, contenu personnalisé, mesure de performance des publicités et du contenu, études d’audience et développement de services', gl: 'Advertising based on limited data, personalised content, advertising and content measurement, audience research, and services development', he: 'פרסום שמבוסס על נתונים מוגבלים, תוכן מותאם אישית, מדידת פרסום ותוכן, ניתוח קהל ופיתוח שירותים', hi: 'Advertising based on limited data, personalised content, advertising and content measurement, audience research, and services development', hr: 'Oglašavanje na temelju ograničenih podataka, personalizirani sadržaj, mjerenje oglašavanja i sadržaja, uvidi u publiku i razvoj usluga', hu: 'Korlátozott körű adatokon alapuló hirdetés, személyre szabott tartalom, hirdetés- és tartalommérés, közönségkutatás és szolgáltatásfejlesztés', id: 'Advertising based on limited data, personalised content, advertising and content measurement, audience research, and services development', it: 'Pubblicità basata su dati limitati, contenuti personalizzati, misurazione delle prestazioni dei contenuti e degli annunci, ricerche sul pubblico e sviluppo di servizi', ja: '制限付きデータに基づく広告、パーソナライズコンテンツ、広告およびコンテンツの測定、ユーザー層調査、サービス開発', lt: 'Ribotais duomenimis pagrįsta reklama, suasmenintas turinys, reklamos ir turinio vertinimas, auditorijos tyrimas ir paslaugų kūrimas', lv: 'Reklāma, kas balstīta uz ierobežotiem datiem, personalizētu saturu, reklāmas un satura novērtējumiem, auditorijas izpēti un pakalpojumu izstrādi', mr: 'Advertising based on limited data, personalised content, advertising and content measurement, audience research, and services development', mt: 'Riklamar ibbażat fuq dejta limitata, kontenut personalizzat, kejl tar-riklamar u tal-kontenut, riċerka tal-udjenza u żvilupp ta’ servizzi', nb: 'Annonsering basert på begrensede data, personlig tilpasset innhold, annonserings- og innholdsmåling, publikumsundersøkelser og tjenesteutvikling', nl: 'Advertenties op basis van beperkte gegevens, gepersonaliseerde content, advertentie- en contentmetingen, doelgroepenonderzoek en ontwikkeling van diensten', no: 'Annonsering basert på begrensede data, personlig tilpasset innhold, annonserings- og innholdsmåling, publikumsundersøkelser og tjenesteutvikling', pl: 'Reklama oparta na ograniczonych danych, spersonalizowane treści, pomiar reklam i treści,  badanie odbiorców oraz ulepszanie usług', ro: 'Publicitate bazată pe date limitate, conținut personalizat, măsurători de publicitate și de conținut, cercetarea audienței și dezvoltarea serviciilor', ru: 'Реклама на основе ограниченных данных, персонализированный контент, определение эффективности рекламы и контента, аналитические сведения об аудитории и разработка сервисов', sk: 'Reklama založená na obmedzených údajoch, personalizovanom obsahu, meraní reklamy a obsahu, prieskume cieľových skupín a vývoji služieb', sl: 'Oglaševanje na podlagi omejenih podatkov, osebno prilagojena vsebina, merjenje oglaševanja in vsebine, raziskovanje občinstva in razvoj storitev', sv: 'Reklam baserad på begränsade data, personanpassat innehåll, reklam och innehållsmätning, forskning angående målgrupp och tjänsteutveckling', th: 'Advertising based on limited data, personalised content, advertising and content measurement, audience research, and services development', tr: 'Sınırlı veriye, kişiselleştirilmiş içeriğe, reklam ve içerik ölçümüne, hedef kitle araştırmasına ve hizmetlerin geliştirilmesine dayalı reklamlar', uk: 'Оголошення на основі обмежених даних, персоналізований контент, визначення оголошення й контенту, дослідження аудиторії та розвиток послуг', vi: 'Advertising based on limited data, personalised content, advertising and content measurement, audience research, and services development', zh: '基于有限数据、个性化内容、广告和内容衡量、受众研究和服务开发的广告', 'zh-TW': '基于有限数据、个性化内容、广告和内容衡量、受众研究和服务开发的广告' },
+    34: { ar: 'الإعلانات بناءً على بيانات محدودة والمحتوى المخصص وقياس أداء المحتوى وأبحاث الجمهور', bg: 'Реклама на базата на ограничени данни, персонализирано съдържание, измерване на съдържанието и проучване на аудиторията', bs: 'Advertising based on limited data, personalised content, content measurement, and audience research', ca: 'Publicitat basada en dades limitades, contingut personalitzat, mesurament del contingut i investigació sobre el públic', cs: 'Reklama založená na omezených údajích, personlaizovaném obsahu, měření obsahu a průzkumu publika', da: 'Annoncering baseret på begrænsede oplysninger, tilpasset indhold, indholdsmåling og målgruppeundersøgelser', de: 'Werbung basierend auf einer reduzierten Menge von Daten, personalisierte Inhalte, Messung der Performance von Inhalten und Zielgruppenforschung', el: 'Διαφήμιση βασισμένη σε περιορισμένα δεδομένα, εξατομικευμένο περιεχόμενο, μέτρηση περιεχομένου και έρευνα κοινού', en: 'Advertising based on limited data, personalised content, content measurement, and audience research', es: 'Publicidad basada en datos limitados, contenido personalizado, medición de contenido e investigación de audiencia', et: 'Piiratud andmetel põhinev reklaam, isikupärastatud sisu, sisu mõõtmine ning vaatajaskonna uuring', eu: 'Advertising based on limited data, personalised content, content measurement, and audience research', fi: 'Rajoitettujen tietojen, personoidun sisällön, sisällön mittauksen sekä yleisötutkimuksen perusteella tehty mainonta', fr: 'Publicité basée sur des données limitées, contenu personnalisé, mesure de performance du contenu et études d’audience', gl: 'Advertising based on limited data, personalised content, content measurement, and audience research', he: 'פרסום שמבוסס על נתונים מוגבלים, תוכן מותאם אישית, מדידת תוכן וניתוח קהל', hi: 'Advertising based on limited data, personalised content, content measurement, and audience research', hr: 'Oglašavanje na temelju ograničenih podataka, personalizirani sadržaj, mjerenje sadržaja i uvidi u publiku', hu: 'Korlátozott körű adatokon alapuló hirdetés, személyre szabott tartalom, tartalommérés és közönségkutatás', id: 'Advertising based on limited data, personalised content, content measurement, and audience research', it: 'Pubblicità basata su dati limitati, contenuti personalizzati, misurazione delle prestazioni dei contenuti e ricerche sul pubblico', ja: '制限付きデータに基づく広告、パーソナライズコンテンツ、コンテンツの測定、ユーザー層調査', lt: 'Ribotais duomenimis pagrįsta reklama, suasmenintas turinys, turinio vertinimas ir auditorijos tyrimas', lv: 'Reklāma, kas balstīta uz ierobežotiem datiem, personalizētu saturu, kā arī satura novērtējumiem un auditorijas izpēti', mr: 'Advertising based on limited data, personalised content, content measurement, and audience research', mt: 'Riklamar ibbażat fuq dejta limitata, kontenut personalizzat, kejl tal-kontenut, u riċerka tal-udjenza', nb: 'Annonsering basert på begrensede data, personlig tilpasset innhold, annonseringsmåling, og publikumsundersøkelser', nl: 'Advertenties op basis van beperkte gegevens, gepersonaliseerde content, contentmetingen en doelgroepenonderzoek', no: 'Annonsering basert på begrensede data, personlig tilpasset innhold, annonseringsmåling, og publikumsundersøkelser', pl: 'Reklama oparta na ograniczonych danych, spersonalizowane treści, pomiar treści oraz  badanie odbiorców', ro: 'Publicitatea bazată pe date limitate, conținut personalizat, măsurători de conținut și cercetarea audienței', ru: 'Реклама на основе ограниченных данных, персонализированный контент, определение эффективности контента и аналитические сведения об аудитории', sk: 'Reklama založená na obmedzených údajoch, personalizovanom obsahu, meraní obsahu a prieskume cieľových skupín', sl: 'Oglaševanje na podlagi omejenih podatkov, osebno prilagojena vsebina, merjenje vsebine in raziskovanje občinstva', sv: 'Reklam baserad på begränsade data, personanpassat innehåll, innehållsmätning och forskning angående målgrupp', th: 'Advertising based on limited data, personalised content, content measurement, and audience research', tr: 'Sınırlı verilere, kişiselleştirilmiş içeriğe, içerik ölçümüne ve hedef kitle araştırmasına dayalı reklamlar', uk: 'Оголошення на основі обмежених даних, персоналізований контент, визначення контенту та дослідження аудиторії', vi: 'Advertising based on limited data, personalised content, content measurement, and audience research', zh: '基于有限数据、个性化内容、内容衡量和受众研究的广告', 'zh-TW': '基于有限数据、个性化内容、内容衡量和受众研究的广告' },
+    35: { ar: 'الإعلانات بناءً على بيانات محدودة والمحتوى المخصص وقياس أداء المحتوى وأبحاث الجمهور وتطوير الخدمات', bg: 'Реклама на базата на ограничени данни, персонализирано съдържание, измерване на съдържанието, проучване на аудиторията и разработване на услуги', bs: 'Advertising based on limited data, personalised content, content measurement, audience research and services development', ca: 'Publicitat basada en dades limitades, contingut personalitzat, mesurament del contingut, investigació sobre el públic i desenvolupament de serveis', cs: 'Reklama založená na omezených údajích, personalizovaném obsahu, měření obsahu, průzkumu publika a rozvoji služeb', da: 'Annoncering baseret på begrænsede oplysninger, tilpasset indhold, indholdsmåling, målgruppeundersøgelser og udvikling af tjenester', de: 'Werbung basierend auf einer reduzierten Menge von Daten, personalisierte Inhalte, Messung der Performance von Inhalten, Zielgruppenforschung sowie die Entwicklung und Verbesserung von Angeboten', el: 'Διαφήμιση βασισμένη σε περιορισμένα δεδομένα, εξατομικευμένο περιεχόμενο, μέτρηση περιεχομένου, έρευνα κοινού και ανάπτυξη υπηρεσιών', en: 'Advertising based on limited data, personalised content, content measurement, audience research and services development', es: 'Publicidad basada en datos limitados, contenido personalizado, medición de contenido, investigación de audiencia y desarrollo de servicios', et: 'Piiratud andmetel põhinev reklaam, isikupärastatud sisu, sisu mõõtmine, vaatajaskonna uuring ning teenuste arendamine', eu: 'Advertising based on limited data, personalised content, content measurement, audience research and services development', fi: 'Rajoitettujen tietojen, personoidun sisällön, sisällön mittauksen, yleisötutkimuksen ja palvelujen kehittämisen perusteella tehty mainonta', fr: 'Publicité basée sur des données limitées, contenu personnalisé, mesure de performance du contenu, études d’audience et développement de services', gl: 'Advertising based on limited data, personalised content, content measurement, audience research and services development', he: 'פרסום שמבוסס על נתונים מוגבלים, תוכן מותאם אישית, מדידת תוכן, ניתוח קהל ופיתוח שירותים', hi: 'Advertising based on limited data, personalised content, content measurement, audience research and services development', hr: 'Oglašavanje na temelju ograničenih podataka, personalizirani sadržaj, mjerenje sadržaja, uvidi u publiku i razvoj usluga', hu: 'Korlátozott körű adatokon alapuló hirdetés, személyre szabott tartalom, tartalommérés, közönségkutatás és szolgáltatásfejlesztés', id: 'Advertising based on limited data, personalised content, content measurement, audience research and services development', it: 'Pubblicità basata su dati limitati, contenuti personalizzati, misurazione delle prestazioni dei contenuti, ricerche sul pubblico e sviluppo di servizi', ja: '制限付きデータに基づく広告、パーソナライズコンテンツ、コンテンツの測定、ユーザー層調査、サービス開発', lt: 'Ribotais duomenimis pagrįsta reklama, suasmenintas turinys, turinio vertinimas, auditorijos tyrimas ir paslaugų kūrimas', lv: 'Reklāma, kas balstīta uz ierobežotiem datiem, personalizētu saturu, kā arī satura novērtējumiem, auditorijas izpēti un pakalpojumu izstrādi', mr: 'Advertising based on limited data, personalised content, content measurement, audience research and services development', mt: 'Riklamar ibbażat fuq dejta limitata, kontenut personalizzat, kejl tal-kontenut, riċerka tal-udjenza u żvilupp tas-servizzi', nb: 'Annonsering basert på begrensede data, personlig tilpasset innhold, innholdsmåling, publikumsundersøkelser og tjenesteutvikling', nl: 'Advertenties op basis van beperkte gegevens, gepersonaliseerde content, contentmetingen, doelgroepenonderzoek en ontwikkeling van diensten', no: 'Annonsering basert på begrensede data, personlig tilpasset innhold, innholdsmåling, publikumsundersøkelser og tjenesteutvikling', pl: 'Reklama oparta na ograniczonych danych, spersonalizowane treści, pomiar treści,  badanie odbiorców oraz ulepszanie usług', ro: 'Publicitate bazată pe date limitate, conținut personalizat, măsurători de conținut, cercetarea audienței și dezvoltarea serviciilor', ru: 'Реклама на основе ограниченных данных, персонализированный контент, определение эффективности контента, аналитические сведения об аудитории и разработка сервисов', sk: 'Reklama založená na obmedzených údajoch, personalizovanom obsahu, meraní obsahu, prieskume cieľových skupín a vývoji služieb', sl: 'Oglaševanje na podlagi omejenih podatkov, osebno prilagojena vsebina, merjenje vsebine, raziskovanje občinstva in razvoj storitev', sv: 'Reklam baserad på begränsade data, personanpassat innehåll, innehållsmätning, forskning angående målgrupp och tjänsteutveckling', th: 'Advertising based on limited data, personalised content, content measurement, audience research and services development', tr: 'Sınırlı verilere, kişiselleştirilmiş içeriğe, içerik ölçümüne, hedef kitle araştırmasına ve hizmetlerin geliştirilmesine dayalı reklamlar', uk: 'Оголошення на основі обмежених даних, персоналізований контент, його визначення, дослідження аудиторії та розвиток послуг', vi: 'Advertising based on limited data, personalised content, content measurement, audience research and services development', zh: '基于有限数据、个性化内容、内容衡量、受众研究和服务开发的广告', 'zh-TW': '基于有限数据、个性化内容、内容衡量、受众研究和服务开发的广告' },
+    36: { ar: 'الإعلانات بناءً على بيانات محدودة والمحتوى المخصص وقياس أداء الإعلانات', bg: 'Реклама на базата на ограничени данни, персонализирано съдържание и измерване на рекламата', bs: 'Advertising based on limited data, personalised content, and advertising measurement', ca: 'Publicitat basada en dades limitades, contingut personalitzat i mesurament de la publicitat', cs: 'Reklama založená na omezených údajích, personalizovaném obsahu a reklamním měření', da: 'Annoncering baseret på begrænsede oplysninger, tilpasset indhold og annonceringsmåling', de: 'Werbung basierend auf einer reduzierten Menge von Daten, personalisierte Inhalte und Messung von Werbeleistung', el: 'Διαφήμιση βασισμένη σε περιορισμένα δεδομένα, εξατομικευμένο περιεχόμενο και μέτρηση διαφήμισης', en: 'Advertising based on limited data, personalised content, and advertising measurement', es: 'Publicidad basada en datos limitados, contenido personalizado y medición publicitaria', et: 'Piiratud andmetel põhinev reklaam, isikupärastatud sisu ning reklaami mõõtmine', eu: 'Advertising based on limited data, personalised content, and advertising measurement', fi: 'Rajoitettujen tietojen, personoidun sisällön ja mainonnan mittauksen perusteella tehty mainonta', fr: 'Publicité basée sur des données limitées, contenu personnalisé et mesure de performance des publicités', gl: 'Advertising based on limited data, personalised content, and advertising measurement', he: 'פרסום שמבוסס על נתונים מוגבלים, תוכן מותאם אישית ומדידת פרסום', hi: 'Advertising based on limited data, personalised content, and advertising measurement', hr: 'Oglašavanje na temelju ograničenih podataka, personalizirani sadržaj i mjerenje oglašavanja', hu: 'Korlátozott körű adatokon alapuló hirdetés, személyre szabott tartalom és hirdetésmérés', id: 'Advertising based on limited data, personalised content, and advertising measurement', it: 'Pubblicità basata su dati limitati, contenuti personalizzati e misurazione delle prestazioni degli annunci', ja: '制限付きデータに基づく広告、パーソナライズコンテンツ、広告の測定', lt: 'Ribotais duomenimis pagrįsta reklama, suasmenintas turinys ir reklamos vertinimas', lv: 'Reklāma, kas balstīta uz ierobežotiem datiem, personalizētu saturu un reklāmas novērtējumu', mr: 'Advertising based on limited data, personalised content, and advertising measurement', mt: 'Riklamar ibbażat fuq dejta limitata, kontenut personalizzat, u kejl tal-kontenut', nb: 'Annonsering basert på begrensede data, personlig tilpasset innhold, og annonseringsmåling', nl: 'Advertenties op basis van beperkte gegevens, gepersonaliseerde content en advertentiemetingen', no: 'Annonsering basert på begrensede data, personlig tilpasset innhold, og annonseringsmåling', pl: 'Reklama oparta na ograniczonych danych, spersonalizowane treści i pomiar reklam', ro: 'Publicitate bazată pe date limitate, conținut personalizat și măsurători ale publicității', ru: 'Реклама на основе ограниченных данных, персонализированный контент и определение эффективности рекламы', sk: 'Reklama založená na obmedzených údajoch, personalizovanom obsahu a meraní reklamy', sl: 'Oglaševanje na podlagi omejenih podatkov, osebno prilagojena vsebina in merjenje oglaševanja', sv: 'Reklam baserad på begränsade data, personanpassat innehåll och reklammätning', th: 'Advertising based on limited data, personalised content, and advertising measurement', tr: 'Sınırlı veriye, kişiselleştirilmiş içeriğe ve reklam ölçümüne dayalı reklamlar', uk: 'Оголошення на основі обмежених даних, персоналізований контент, визначення оголошення', vi: 'Advertising based on limited data, personalised content, and advertising measurement', zh: '基于有限数据、个性化内容和广告衡量的广告', 'zh-TW': '基于有限数据、个性化内容和广告衡量的广告' },
+    37: { ar: 'الإعلانات بناءً على بيانات محدودة والمحتوى المخصص وقياس أداء الإعلانات وتطوير الخدمات', bg: 'Реклама на базата на ограничени данни, персонализирано съдържание, измерване на рекламата и разработване на услуги', bs: 'Advertising based on limited data, personalised content, advertising measurement, and services development', ca: 'Publicitat basada en dades limitades, contingut personalitzat, mesurament de la publicitat i desenvolupament de serveis', cs: 'Reklama založená na omezených údajích, personalizovaném obsahu, reklamním měření a rozvoji služeb', da: 'Annoncering baseret på begrænsede oplysninger, tilpasset indhold, annonceringsmåling og udvikling af tjenester', de: 'Werbung basierend auf einer reduzierten Menge von Daten, personalisierte Inhalte, Messung von Werbeleistung sowie Entwicklung und Verbesserung von Angeboten', el: 'Διαφήμιση βασισμένη σε περιορισμένα δεδομένα, εξατομικευμένο περιεχόμενο, μέτρηση διαφήμισης και ανάπτυξη υπηρεσιών', en: 'Advertising based on limited data, personalised content, advertising measurement, and services development', es: 'Publicidad basada en datos limitados, contenido personalizado, medición de la publicidad y desarrollo de servicios', et: 'Piiratud andmetel põhinev reklaam, isikupärastatud sisu, reklaami mõõtmine ja teenuste arendamine', eu: 'Advertising based on limited data, personalised content, advertising measurement, and services development', fi: 'Rajoitettujen tietojen, personoidun sisällön, mainonnan mittauksen ja palvelujen kehittämisen perusteella tehty mainonta', fr: 'Publicité basée sur des données limitées, contenu personnalisé, mesure de performance des publicités et développement de services', gl: 'Advertising based on limited data, personalised content, advertising measurement, and services development', he: 'פרסום שמבוסס על נתונים מוגבלים, תוכן מותאם אישית, מדידת פרסום ופיתוח שירותים', hi: 'Advertising based on limited data, personalised content, advertising measurement, and services development', hr: 'Oglašavanje na temelju ograničenih podataka, personalizirani sadržaj, mjerenje oglašavanja i razvoj usluga', hu: 'Korlátozott körű adatokon alapuló hirdetés, személyre szabott tartalom, hirdetésmérés és szolgáltatásfejlesztés', id: 'Advertising based on limited data, personalised content, advertising measurement, and services development', it: 'Pubblicità basata su dati limitati, contenuti personalizzati, misurazione delle prestazioni degli annunci e sviluppo di servizi', ja: '制限付きデータに基づく広告、パーソナライズコンテンツ、広告の測定、サービス開発', lt: 'Ribotais duomenimis pagrįsta reklama, suasmenintas turinys, reklamos vertinimas ir paslaugų kūrimas', lv: 'Reklāma, kas balstīta uz ierobežotiem datiem, personalizētu saturu, reklāmas novērtējumiem un pakalpojumu izstrādi', mr: 'Advertising based on limited data, personalised content, advertising measurement, and services development', mt: 'Riklamar ibbażat fuq dejta limitata, kontenut personalizzat, kejl tal-kontenut, u żvilupp tas-servizzi', nb: 'Annonsering basert på begrensede data, personlig tilpasset innhold, annonseringsmåling og tjenesteutvikling', nl: 'Advertenties op basis van beperkte gegevens, gepersonaliseerde content, advertentiemetingen en ontwikkeling van diensten', no: 'Annonsering basert på begrensede data, personlig tilpasset innhold, annonseringsmåling og tjenesteutvikling', pl: 'Reklama oparta na ograniczonych danych, spersonalizowane treści, pomiar reklam i ulepszanie usług', ro: 'Publicitate bazată pe date limitate, conținut personalizat, măsurători ale publicității și dezvoltarea serviciilor', ru: 'Реклама на основе ограниченных данных, персонализированный контент, определение эффективности рекламы и разработка сервисов', sk: 'Reklama založená na obmedzených údajoch, personalizovanom obsahu, meraní reklamy a vývoji služieb', sl: 'Oglaševanje na podlagi omejenih podatkov, osebno prilagojena vsebina, merjenje oglaševanja in razvoj storitev', sv: 'Reklam baserad på begränsade data, personanpassat innehåll, reklammätning och tjänsteutveckling', th: 'Advertising based on limited data, personalised content, advertising measurement, and services development', tr: 'Sınırlı veriye, kişiselleştirilmiş içeriğe, reklam ölçümüne ve hizmetlerin geliştirilmesine dayalı reklamlar', uk: 'Оголошення на основі обмежених даних, персоналізований контент, визначення оголошення та розвиток послуг', vi: 'Advertising based on limited data, personalised content, advertising measurement, and services development', zh: '基于有限数据、个性化内容、广告衡量和服务开发的广告', 'zh-TW': '基于有限数据、个性化内容、广告衡量和服务开发的广告' },
+    38: { ar: 'الإعلانات المخصصة وقياس أداء الإعلانات وتطوير الخدمات', bg: 'Персонализирана реклама, измерване на рекламата и разработване на услуги', bs: 'Personalised advertising, advertising measurement, and services development', ca: 'Publicitat personalitzada, mesurament de la publicitat i desenvolupament de serveis', cs: 'Personalizovaná reklama, reklamní měření a rozvoj služeb', da: 'Tilpasset annoncering, annonceringsmåling og udvikling af tjenester', de: 'Personalisierte Werbung, Messung von Werbeleistung sowie Entwicklung und Verbesserung von Angeboten', el: 'Εξατομικευμένη διαφήμιση, μέτρηση διαφήμισης και ανάπτυξη υπηρεσιών', en: 'Personalised advertising, advertising measurement, and services development', es: 'Publicidad personalizada, medición de la publicidad y desarrollo de servicios', et: 'Isikupärastatud sisu, reklaami mõõtmine ja teenuste arendamine', eu: 'Personalised advertising, advertising measurement, and services development', fi: 'Kohdennettu mainonta, mainonnan mittaaminen ja palvelujen kehittäminen', fr: 'Publicités personnalisées, mesure de performance des publicités et développement de services', gl: 'Personalised advertising, advertising measurement, and services development', he: 'פרסום מותאם אישית, מדידת פרסום ופיתוח שירותים', hi: 'Personalised advertising, advertising measurement, and services development', hr: 'Personalizirano oglašavanje, mjerenje oglašavanja i razvoj usluga', hu: 'Személyre szabott hirdetés, hirdetésmérés és szolgáltatásfejlesztés', id: 'Personalised advertising, advertising measurement, and services development', it: 'Pubblicità personalizzata, misurazione delle prestazioni degli annunci e sviluppo di servizi', ja: 'パーソナライズ広告、広告の測定、サービス開発', lt: 'Suasmeninta reklama, reklamos vertinimas ir paslaugų kūrimas', lv: 'Personalizēta reklāma, reklāmas novērtējumi un pakalpojumu izstrāde', mr: 'Personalised advertising, advertising measurement, and services development', mt: 'Riklamar personalizzat, kejl tar-riklamar, u żvilupp tas-servizzi', nb: 'Personlig tilpasset annonsering, annonseringsmåling og tjenesteutvikling', nl: 'Gepersonaliseerde advertenties, advertentiemetingen en ontwikkeling van diensten', no: 'Personlig tilpasset annonsering, annonseringsmåling og tjenesteutvikling', pl: 'Spersonalizowane reklamy, pomiar reklam i ulepszanie usług', ro: 'Publicitate personalizată, măsurători ale publicității și dezvoltarea serviciilor', ru: 'Персонализированная реклама, определение эффективности рекламы и разработка сервисов', sk: 'Personalizovaná reklama, meranie reklamy a vývoj služieb', sl: 'Osebno prilagojeno oglaševanje, merjenje oglaševanja in razvoj storitev', sv: 'Personanpassad reklam, reklammätning och tjänsteutveckling', th: 'Personalised advertising, advertising measurement, and services development', tr: 'Kişiselleştirilmiş reklam, reklam ölçümü ve hizmetlerin geliştirilmesi', uk: 'Персоналізоване оголошення, визначення оголошення та розвиток послуг', vi: 'Personalised advertising, advertising measurement, and services development', zh: '个性化广告、广告衡量和服务开发', 'zh-TW': '个性化广告、广告衡量和服务开发' },
+    39: { ar: 'الإعلانات المخصصة وقياس أداء الإعلانات وأبحاث الجمهور وتطوير الخدمات', bg: 'Персонализирана реклама, измерване на рекламата, проучване на аудиторията и разработване на услуги', bs: 'Personalised advertising, advertising measurement, audience research and services development', ca: 'Publicitat personalitzada, mesurament de la publicitat, investigació sobre el públic i desenvolupament de serveis', cs: 'Personalizovaná reklama, reklamní měření, průzkum publika a rozvoj služeb', da: 'Tilpasset annoncering, annonceringsmåling, målgruppeundersøgelser og udvikling af tjenester', de: 'Personalisierte Werbung, Messung von Werbeleistung, Zielgruppenforschung sowie Entwicklung und Verbesserung von Angeboten', el: 'Εξατομικευμένη διαφήμιση, μέτρηση διαφήμισης, έρευνα κοινού και ανάπτυξη υπηρεσιών', en: 'Personalised advertising, advertising measurement, audience research and services development', es: 'Publicidad personalizada, medición de publicidad, investigación de audiencia y desarrollo de servicios', et: 'Isikupärastatud sisu, reklaami mõõtmine, vaatajaskonna uuring ja teenuste arendamine', eu: 'Personalised advertising, advertising measurement, audience research and services development', fi: 'Kohdennettu mainonta, mainonnan mittaaminen, yleisötutkimus ja palvelujen kehittäminen', fr: 'Publicités personnalisées, mesure de performance des publicités, études d’audience et développement de services', gl: 'Personalised advertising, advertising measurement, audience research and services development', he: 'פרסום מותאם אישית, מדידת פרסום, ניתוח קהל ופיתוח שירותים', hi: 'Personalised advertising, advertising measurement, audience research and services development', hr: 'Personalizirano oglašavanje, mjerenje oglašavanja, uvidi u publiku i razvoj usluga', hu: 'Személyre szabott hirdetés, hirdetésmérés, közönségkutatás és szolgáltatásfejlesztés', id: 'Personalised advertising, advertising measurement, audience research and services development', it: 'Pubblicità personalizzata, misurazione delle prestazioni degli annunci, ricerche sul pubblico e sviluppo di servizi', ja: 'パーソナライズ広告、広告の測定、ユーザー層調査、サービス開発', lt: 'Suasmeninta reklama, reklamos vertinimas, auditorijos tyrimas ir paslaugų kūrimas', lv: 'Personalizēta reklāma, reklāmas novērtējumi, auditorijas izpēte un pakalpojumu izstrāde', mr: 'Personalised advertising, advertising measurement, audience research and services development', mt: 'Riklamar personalizzat, kejl tar-riklamar, riċerka tal-udjenza u żvilupp tas-servizzi', nb: 'Personlig tilpasset annonsering, annonseringsmåling, publikumsundersøkelser og tjenesteutvikling', nl: 'Gepersonaliseerde advertenties, advertentiemetingen, doelgroepenonderzoek en ontwikkeling van diensten', no: 'Personlig tilpasset annonsering, annonseringsmåling, publikumsundersøkelser og tjenesteutvikling', pl: 'Spersonalizowane reklamy, pomiar reklam,  badanie odbiorców i ulepszanie usług', ro: 'Publicitate personalizată, măsurători ale publicității, cercetarea audienței și dezvoltarea serviciilor', ru: 'Персонализированная реклама, определение эффективности рекламы, аналитические сведения об аудитории и разработка сервисов', sk: 'Personalizovaná reklama, meranie reklamy, prieskum cieľových skupín a vývoj služieb', sl: 'Osebno prilagojeno oglaševanje, merjenje oglaševanja, raziskovanje občinstva in razvoj storitev', sv: 'Personanpassad reklam, reklammätning, forskning angående målgrupp och tjänsteutveckling', th: 'Personalised advertising, advertising measurement, audience research and services development', tr: 'Kişiselleştirilmiş reklam, reklam ölçümü, hedef kitle araştırması ve hizmetlerin geliştirilmesi', uk: 'Персоналізоване оголошення, його визначення, дослідження аудиторії та розвиток послуг', vi: 'Personalised advertising, advertising measurement, audience research and services development', zh: '个性化广告、广告衡量、受众研究和服务开发', 'zh-TW': '个性化广告、广告衡量、受众研究和服务开发' },
+    40: { ar: 'الإعلانات المخصصة وقياس أداء الإعلانات والمحتوى وأبحاث الجمهور وتطوير الخدمات', bg: 'Персонализирана реклама, измерване на рекламата и съдържанието, проучване на аудиторията и разработване на услуги', bs: 'Personalised advertising, advertising and content measurement, audience research and services development', ca: 'Publicitat personalitzada, mesurament de la publicitat i del contingut, investigació sobre el públic i desenvolupament de serveis', cs: 'Personalizovaná reklama, měření reklam a obsahu, průzkum publika a rozvoj služeb', da: 'Tilpasset annoncering, annoncerings- og indholdsmåling, målgruppeundersøgelser og udvikling af tjenester', de: 'Personalisierte Werbung, Messung von Werbeleistung und der Performance von Inhalten, Zielgruppenforschung sowie Entwicklung und Verbesserung von Angeboten', el: 'Εξατομικευμένη διαφήμιση, μέτρηση διαφήμισης και περιεχομένου, έρευνα κοινού και ανάπτυξη υπηρεσιών', en: 'Personalised advertising, advertising and content measurement, audience research and services development', es: 'Publicidad personalizada, medición de contenido y publicidad, investigación de audiencia y desarrollo de servicios', et: 'Isikupärastatud sisu, reklaami ja sisu mõõtmine, vaatajaskonna uuring ja teenuste arendamine', eu: 'Personalised advertising, advertising and content measurement, audience research and services development', fi: 'Kohdennettu mainonta, mainonnan ja sisällön mittaaminen, yleisötutkimus ja palvelujen kehittäminen', fr: 'Publicités personnalisées, mesure de performance des publicités et du contenu, études d’audience et développement de services', gl: 'Personalised advertising, advertising and content measurement, audience research and services development', he: 'פרסום מותאם אישית, מדידת פרסום ותוכן, ניתוח קהל ופיתוח שירותים', hi: 'Personalised advertising, advertising and content measurement, audience research and services development', hr: 'Personalizirano oglašavanje, mjerenje oglašavanja i sadržaja, uvidi u publiku i razvoj usluga', hu: 'Személyre szabott hirdetés, hirdetés- és tartalommérés, közönségkutatás és szolgáltatásfejlesztés', id: 'Personalised advertising, advertising and content measurement, audience research and services development', it: 'Pubblicità personalizzata, misurazione delle prestazioni dei contenuti e degli annunci, ricerche sul pubblico, sviluppo di servizi', ja: 'パーソナライズ広告、広告およびコンテンツの測定、ユーザー層調査、サービス開発', lt: 'Suasmeninta reklama, reklamos ir turinio vertinimas, auditorijos tyrimas ir paslaugų kūrimas', lv: 'Personalizēta reklāma, reklāmas un satura novērtēšana, auditorijas izpēte un pakalpojumu izstrāde.', mr: 'Personalised advertising, advertising and content measurement, audience research and services development', mt: 'Riklamar personalizzat, kejl tar-riklamar, riċerka tal-udjenza u żvilupp tas-servizzi', nb: 'Personlig tilpasset annonsering, annonserings- og innholdsmåling og tjenesteutvikling', nl: 'Gepersonaliseerde advertenties, advertentie- en contentmetingen, doelgroepenonderzoek en ontwikkeling van diensten', no: 'Personlig tilpasset annonsering, annonserings- og innholdsmåling og tjenesteutvikling', pl: 'Spersonalizowane reklamy, pomiar reklam i treści, badanie odbiorców i ulepszanie usług', ro: 'Publicitate personalizată, măsurători ale publicității și de conținut, cercetarea audienței și dezvoltarea serviciilor', ru: 'Персонализированная реклама, определение эффективности рекламы и контента, аналитические сведения об аудитории и разработка сервисов', sk: 'Personalizovaná reklama, meranie reklamy a obsahu, prieskum cieľových skupín a vývoj služieb', sl: 'Osebno prilagojeno oglaševanje, merjenje oglaševanja in vsebine, raziskovanje občinstva in razvoj storitev', sv: 'Personanpassad reklam, reklam- och innehållsmätning, forskning angående målgrupp och tjänsteutveckling', th: 'Personalised advertising, advertising and content measurement, audience research and services development', tr: 'Kişiselleştirilmiş reklam, reklam ve içerik ölçümü, hedef kitle araştırması ve hizmetlerin geliştirilmesi', uk: 'Персоналізоване оголошення, визначення оголошення й контенту, дослідження аудиторії та розвиток послуг', vi: 'Personalised advertising, advertising and content measurement, audience research and services development', zh: '个性化广告、广告和内容衡量、受众研究和服务开发', 'zh-TW': '个性化广告、广告和内容衡量、受众研究和服务开发' },
+    41: { ar: 'الإعلانات المخصصة واختيار المحتوى المخصص وقياس أداء الإعلانات والمحتوى وأبحاث الجمهور وتطوير الخدمات', bg: 'Персонализирана реклама, избор на персонализирано съдържание, измерване на рекламата и съдържанието, проучване на аудиторията и разработване на услуги', bs: 'Personalised advertising, selection of personalised content, advertising and content measurement, audience research and services development', ca: 'Publicitat personalitzada, selecció de contingut personalitzat, mesurament de la publicitat i del contingut, investigació sobre el públic i desenvolupament de serveis', cs: 'Personalizovaná reklama, výběr personalizovaného obsahu, měření reklamy a obsahu, průzkum publika a rozvoj služeb', da: 'Tilpasset annoncering, valg af tilpasset indhold, annoncerings- og indholdsmåling, målgruppeundersøgelser og udvikling af tjenester', de: 'Personalisierte Werbung, Auswahl personalisierter Inhalte, Messung von Werbeleistung und der Performance von Inhalten, Zielgruppenforschung sowie Entwicklung und Verbesserung von Angeboten', el: 'Εξατομικευμένη διαφήμιση, επιλογή εξατομικευμένου περιεχομένου, μέτρηση διαφήμισης και περιεχομένου, έρευνα κοινού και ανάπτυξη υπηρεσιών', en: 'Personalised advertising, selection of personalised content, advertising and content measurement, audience research and services development', es: 'Publicidad personalizada, selección de contenido personalizado, medición de la publicidad y del contenido, investigación de audiencia y desarrollo de servicios', et: 'Isikupärastatud reklaamid, isikupärastatud sisu valimine, reklaamide ning sisu mõõtmine, vaatajaskonna uuring ja teenuste arendamine', eu: 'Personalised advertising, selection of personalised content, advertising and content measurement, audience research and services development', fi: 'Kohdennettu mainonta, personoidun sisällön valinta, mainonnan ja sisällön mittaaminen, yleisötutkimus ja palvelujen kehittäminen', fr: 'Publicités personnalisées, sélection de contenu personnalisé, mesure de performance des publicités et du contenu, études d’audience et développement de services', gl: 'Personalised advertising, selection of personalised content, advertising and content measurement, audience research and services development', he: 'פרסום מותאם אישית, בחירת תוכן מותאם אישית, מדידת פרסום ותוכן, ניתוח קהל ופיתוח שירותים', hi: 'Personalised advertising, selection of personalised content, advertising and content measurement, audience research and services development', hr: 'Personalizirano oglašavanje, odabir personaliziranog oglašavanja, mjerenje oglašavanja i sadržaja, uvidi u publiku i razvoj usluga', hu: 'Személyre szabott hirdetés, személyre szabott tartalom kiválasztása, hirdetés- és tartalommérés, közönségkutatás és szolgáltatásfejlesztés', id: 'Personalised advertising, selection of personalised content, advertising and content measurement, audience research and services development', it: 'Pubblicità personalizzata, selezione di contenuti personalizzati, misurazione delle prestazioni dei contenuti e degli annunci, ricerche sul pubblico e sviluppo di servizi', ja: 'パーソナライズ広告、パーソナライズ広告の選択、広告およびコンテンツの測定、ユーザー層調査、サービス開発', lt: 'Suasmeninta reklama, suasmeninto turinio pasirinkimas, reklamos ir turinio vertinimas, auditorijos tyrimas ir paslaugų kūrimas', lv: 'Personalizēta reklāma, personalizēta satura atlase, reklāmas un satura novērtēšana, auditorijas izpēte un pakalpojumu izstrāde', mr: 'Personalised advertising, selection of personalised content, advertising and content measurement, audience research and services development', mt: 'Riklamar personalizzat, għażla ta’ kontenut personalizzat, kejl tar-riklamar u tal-kontenut, riċerka tal-udjenza u żvilupp tas-servizzi', nb: 'Valg av personlig annonsering og innhold, samt måling av annonsering og innhold, og publikumsundersøkelser og tjenesteutvikling', nl: 'Gepersonaliseerde advertenties, selectie van gepersonaliseerde content, advertentie- en contentmetingen, doelgroepenonderzoek en ontwikkeling van diensten', no: 'Valg av personlig annonsering og innhold, samt måling av annonsering og innhold, og publikumsundersøkelser og tjenesteutvikling', pl: 'Spersonalizowane reklamy, wybór spersonalizowanych treści, pomiar reklam i treści,  badanie odbiorców oraz ulepszanie usług', ro: 'Publicitate personalizată, selectarea conținutului personalizat, măsurători ale publicității și de conținut, cercetarea audienței și dezvoltarea serviciilor', ru: 'Персонализированная реклама, выбор персонализированного контента, определение эффективности рекламы и контента, аналитические сведения об аудитории и разработка сервисов', sk: 'Personalizovaná reklama, výber personalizovaného obsahu, meranie reklamy a obsahu, prieskum cieľových skupín a vývoj služieb', sl: 'Osebno prilagojeno oglaševanje, izbira osebno prilagojenih vsebina, merjenje oglaševanja in vsebine, raziskovanje občinstva ter razvoj storitev', sv: 'Personanpassad reklam, val av personanpassat innehåll, reklam- och innehållsmätning, forskning angående målgrupp och tjänsteutveckling', th: 'Personalised advertising, selection of personalised content, advertising and content measurement, audience research and services development', tr: 'Kişiselleştirilmiş reklam, kişiselleştirilmiş içerik seçilmesi, reklam ve içerik ölçümü, hedef kitle araştırması ve hizmetlerin geliştirilmesi', uk: 'Персоналізоване оголошення, вибір персоналізованого контенту, визначення оголошення й контенту, дослідження аудиторії та розвиток послуг', vi: 'Personalised advertising, selection of personalised content, advertising and content measurement, audience research and services development', zh: '个性化广告、个性化内容的选择、广告和内容衡量、受众研究和服务开发', 'zh-TW': '个性化广告、个性化内容的选择、广告和内容衡量、受众研究和服务开发' },
+    42: { ar: 'الإعلانات والمحتوى المخصصان وقياس أداء الإعلانات والمحتوى وأبحاث الجمهور وتطوير الخدمات', bg: 'Персонализирана реклама и съдържание, измерване на рекламата и съдържанието, проучване на аудиторията и разработване на услуги', bs: 'Personalised advertising and content, advertising and content measurement, audience research and services development', ca: 'Publicitat i continguts personalitzats, mesurament de la publicitat i del contingut, investigació sobre el públic i desenvolupament de serveis', cs: 'Personalizovaná reklama a obsah, měření reklam a obsahu, průzkum publika a rozvoj služeb', da: 'Tilpasset annoncering og indhold, annoncerings- og indholdsmåling, målgruppeundersøgelser og udvikling af tjenester', de: 'Personalisierte Werbung und Inhalte, Messung von Werbeleistung und der Performance von Inhalten, Zielgruppenforschung sowie Entwicklung und Verbesserung von Angeboten', el: 'Εξατομικευμένη διαφήμιση και περιεχόμενο, μέτρηση διαφήμισης και περιεχομένου, έρευνα κοινού και ανάπτυξη υπηρεσιών', en: 'Personalised advertising and content, advertising and content measurement, audience research and services development', es: 'Publicidad y contenido personalizados, medición de publicidad y contenido, investigación de audiencia y desarrollo de servicios', et: 'Isikupärastatud reklaamid ja sisu, reklaami ja sisu mõõtmine, vaatajaskonna uuring ja teenuste arendamine', eu: 'Personalised advertising and content, advertising and content measurement, audience research and services development', fi: 'Kohdennettu mainonta ja personoitu sisältö, mainonnan ja sisällön mittaus, yleisötutkimus ja palvelujen kehittäminen', fr: 'Publicités et contenu personnalisés, mesure de performance des publicités et du contenu, études d’audience et développement de services', gl: 'Personalised advertising and content, advertising and content measurement, audience research and services development', he: 'פרסום ותוכן מותאמים אישית, מדידת פרסום ותוכן, ניתוח קהל ופיתוח שירותים', hi: 'Personalised advertising and content, advertising and content measurement, audience research and services development', hr: 'Personalizirano oglašavanje i sadržaj, mjerenje oglašavanja i sadržaja, uvidi u publiku i razvoj usluga', hu: 'Személyre szabott hirdetés és tartalom, hirdetés- és tartalommérés, közönségkutatás és szolgáltatásfejlesztés', id: 'Personalised advertising and content, advertising and content measurement, audience research and services development', it: 'Pubblicità e contenuti personalizzati, misurazione delle prestazioni dei contenuti e degli annunci, ricerche sul pubblico, sviluppo di servizi', ja: 'パーソナライズ広告およびコンテンツ、広告およびコンテンツの測定、ユーザー層調査、サービス開発', lt: 'Suasmeninta reklama ir turinys, reklamos ir turinio vertinimas, auditorijos tyrimas ir paslaugų kūrimas', lv: 'Personalizēta reklāma un saturs, reklāmas un satura novērtēšana, auditorijas izpēte un pakalpojumu izstrāde', mr: 'Personalised advertising and content, advertising and content measurement, audience research and services development', mt: 'Riklamar u kontenut personalizzat, kejl tar-riklamar u tal-kontenut, riċerka tal-udjenza u żvilupp ta’ servizzi', nb: 'Personlig tilpasset annonsering og innhold, annonsering- og innholdsmåling, publikumsundersøkelser og tjenesteutvikling', nl: 'Gepersonaliseerde advertenties en content, advertentie- en contentmetingen, doelgroepenonderzoek en ontwikkeling van diensten', no: 'Personlig tilpasset annonsering og innhold, annonsering- og innholdsmåling, publikumsundersøkelser og tjenesteutvikling', pl: 'Spersonalizowane reklamy i treści, pomiar reklam i treści,  badanie odbiorców i ulepszanie usług', ro: 'Publicitate și conținut personalizat, măsurători ale publicității și de conținut, cercetarea audienței și dezvoltarea serviciilor', ru: 'Персонализированная реклама и контент, определение эффективности рекламы и контента, аналитические сведения об аудитории и разработка сервисов', sk: 'Personalizovaná reklama a obsah, meranie reklamy a obsahu, prieskum cieľových skupín a vývoj služieb', sl: 'Osebno prilagojeno oglaševanje in vsebina, merjenje oglaševanja in vsebine, raziskovanje občinstva in razvoj storitev', sv: 'Personanpassad reklam och innehåll, reklam- och innehållsmätning, forskning angående målgrupp och tjänsteutveckling', th: 'Personalised advertising and content, advertising and content measurement, audience research and services development', tr: 'Kişiselleştirilmiş reklam ve içerik, reklam ve içerik ölçümü, hedef kitle araştırması ve hizmetlerin geliştirilmesi', uk: 'Персоналізоване оголошення й контент, визначення оголошення й контенту, дослідження аудиторії та розвиток послуг', vi: 'Personalised advertising and content, advertising and content measurement, audience research and services development', zh: '个性化广告和内容、广告和内容衡量、受众研究和服务开发', 'zh-TW': '个性化广告和内容、广告和内容衡量、受众研究和服务开发' },
+    43: { ar: 'المحتوى بناءً على بيانات محدودة وقياس أداء المحتوى', bg: 'Съдържание на базата на ограничени данни и измерване на съдържанието', bs: 'Content based on limited data and content measurement', ca: 'Contingut basat en dades limitades i mesurament del contingut', cs: 'Obsah založený na omezených údajích a měření obsahu', da: 'Indhold baseret på begrænsede oplysninger og indholdsmåling', de: 'Inhalte basierend auf einer reduzierten Menge von Daten und Messung der Performance von Inhalten', el: 'Περιεχόμενο που βασίζεται σε περιορισμένα δεδομένα και μέτρηση περιεχομένου', en: 'Content based on limited data and content measurement', es: 'Contenido basado en datos limitados y medición del contenido', et: 'Piiratud andmetel põhinev sisu ja sisu mõõtmine', eu: 'Content based on limited data and content measurement', fi: 'Rajoitettuihin tietoihin ja sisällön mittaukseen perustuva sisältö', fr: 'Contenu basé sur des données limitées et mesure de performance du contenu', gl: 'Content based on limited data and content measurement', he: 'תוכן שמבוסס על נתונים מוגבלים ומדידת תוכן', hi: 'Content based on limited data and content measurement', hr: 'Sadržaj na temelju ograničenih podataka i mjerenje sadržaja', hu: 'Korlátozott körű adatokon alapuló tartalom és tartalommérés', id: 'Content based on limited data and content measurement', it: 'Contenuti basati su dati limitati e misurazione delle prestazioni dei contenuti', ja: '制限付きデータに基づくコンテンツ、コンテンツの測定', lt: 'Ribotais duomenimis pagrįstas turinys ir turinio vertinimas', lv: 'Saturs, kas balstīts uz ierobežotiem datiem un satura novērtējumiem', mr: 'Content based on limited data and content measurement', mt: 'Kontenut abbażi ta’ dejta limitata u tal-kejl tal-kontenut', nb: 'Innhold basert på begrenset data- og innholdsmåling', nl: 'Content gebaseerd op beperkte gegevens en contentmetingen', no: 'Innhold basert på begrenset data- og innholdsmåling', pl: 'Treści oparte na ograniczonych danych i pomiar treści', ro: 'Conținut bazat pe date limitate și măsurători de conținut', ru: 'Контент, основанный на ограниченных данных, и определение эффективности контента', sk: 'Obsah založený na obmedzenom meraní údajov a obsahu', sl: 'Vsebina na podlagi omejenih podatkov in merjenje vsebine', sv: 'Innehåll baserat på begränsade data och innehållsmätning', th: 'Content based on limited data and content measurement', tr: 'Sınırlı veriye ve içerik ölçümüne dayalı içerik', uk: 'Контент на основі обмежених даних і визначення контенту', vi: 'Content based on limited data and content measurement', zh: '基于有限数据的内容以及内容衡量', 'zh-TW': '基于有限数据的内容以及内容衡量' },
+    44: { ar: 'محتوى مخصص', bg: 'Персонализирано съдържание', bs: 'Personalised content', ca: 'Contingut personalitzat', cs: 'Personalizovaný obsah', da: 'Tilpasset indhold', de: 'Personalisierte Inhalte', el: 'Εξατομικευμένο περιεχόμενο', en: 'Personalised content', es: 'Contenido personalizado', et: 'Isikupärastatud sisu', eu: 'Personalised content', fi: 'Yksilöity sisältö', fr: 'Contenu personnalisé', gl: 'Personalised content', he: 'תוכן מותאם אישית', hi: 'Personalised content', hr: 'Personalizirani sadržaj', hu: 'Személyre szabott tartalom', id: 'Personalised content', it: 'Contenuti personalizzati', ja: 'パーソナライズされたコンテンツ', lt: 'Suasmenintas turinys', lv: 'Personalizēts saturs', mr: 'Personalised content', mt: 'Kontenut personalizzat', nb: 'Personlig tilpasset innhold', nl: 'Gepersonaliseerde content', no: 'Personlig tilpasset innhold', pl: 'Spersonalizowane treści', ro: 'Conținut personalizat', ru: 'Персонализированный контент', sk: 'Personalizovaný obsah', sl: 'Osebno prilagojena vsebina', sv: 'Personanpassat innehåll', th: 'Personalised content', tr: 'Kişiselleştirilmiş içerik', uk: 'Персоналізований контент', vi: 'Personalised content', zh: '个性化内容', 'zh-TW': '个性化内容' },
+    45: { ar: 'الإعلانات بناءً على بيانات محدودة وقياس أداء الإعلانات والمحتوى وأبحاث الجمهور وتطوير الخدمات', bg: 'Реклама въз основа на ограничени данни, измерване на рекламата, проучване на аудиторията и разработване на услуги', bs: 'Advertising based on limited data, advertising measurement, audience research and services development', ca: 'Publicitat basada en dades limitades, mesurament de la publicitat, investigació sobre el públic i desenvolupament de serveis', cs: 'Reklama založená na omezených údajích, měření reklam, výzkumu publika a rozvoji služeb', da: 'Annoncering baseret på begrænsede oplysninger, annonceringsmåling, målgruppeundersøgelser og udvikling af tjenester', de: 'Werbung auf der Grundlage begrenzter Daten, Messung der Werbeleistung, Zielgruppenforschung und Entwicklung von Dienstleistungen', el: 'Διαφήμιση βασισμένη σε περιορισμένα δεδομένα, μέτρηση διαφήμισης, έρευνα κοινού και ανάπτυξη υπηρεσιών', en: 'Advertising based on limited data, advertising measurement, audience research and services development', es: 'Publicidad basada en datos limitados, medición de la publicidad, investigación de audiencia y desarrollo de servicios', et: 'Piiratud andmetel põhinev reklaam, reklaami mõõtmine, vaatajaskonna uuringud ning teenuste arendamine', eu: 'Advertising based on limited data, advertising measurement, audience research and services development', fi: 'Rajoitettujen tietojen, mainonnan mittauksen, yleisötutkimuksen ja palvelujen kehittämisen perusteella tehty mainonta', fr: 'Publicité basée sur des données limitées, des mesures de performances des publicités, des études d’audience et le développement de services', gl: 'Advertising based on limited data, advertising measurement, audience research and services development', he: 'פרסום שמבוסס על נתונים מוגבלים, מדידת פרסום, ניתוח קהל ופיתוח שירותים', hi: 'Advertising based on limited data, advertising measurement, audience research and services development', hr: 'Oglašavanje na temelju ograničenih podataka, mjerenje oglašavanja, istraživanje publike i razvoj usluga', hu: 'Korlátozott körű adatokon alapuló hirdetés, hirdetésmérés, közönségkutatás és szolgáltatásfejlesztés', id: 'Advertising based on limited data, advertising measurement, audience research and services development', it: 'Pubblicità basata su dati limitati, misurazione degli annunci, ricerche sul pubblico e sviluppo di servizi', ja: '限られたデータに基づいた広告、広告測定、視聴者調査、サービス開発', lt: 'Ribotais duomenimis pagrįsta reklama, reklamos matavimas, auditorijos tyrimai ir paslaugų kūrimas', lv: 'Reklāma, kas balstīta uz ierobežotiem datiem, reklāmas novērtējumiem, auditorijas izpēti un pakalpojumu izstrādi', mr: 'Advertising based on limited data, advertising measurement, audience research and services development', mt: 'Riklamar ibbażat fuq dejta limitata, kejl tar-riklamar, riċerka dwar l-udjenza u żvilupp ta’ servizzi', nb: 'Annonsering basert på begrensede data, annonseringsmåling, publikumsundersøkelser og tjenesteutvikling', nl: 'Advertenties op basis van beperkte gegevens, advertentiemetingen, doelgroepenonderzoek en ontwikkeling van diensten', no: 'Annonsering basert på begrensede data, annonseringsmåling, publikumsundersøkelser og tjenesteutvikling', pl: 'Reklama oparta na ograniczonych danych, mierzenie efektywności reklam, analiza grona odbiorców oraz ulepszanie usług', ro: 'Publicitate bazată pe date limitate, măsurători de publicitate, cercetarea audienței și dezvoltarea serviciilor', ru: 'Реклама на основе ограниченных данных, определение эффективности рекламы, аналитические сведения об аудитории и разработка сервисов', sk: 'Reklama založená na obmedzených údajoch, meraní reklamy, prieskume cieľových skupín a vývoji služieb', sl: 'Oglaševanje na podlagi omejenih podatkov, merjenje oglaševanja, raziskovanje občinstva in razvoj storitev', sv: 'Reklam baserad på begränsade data, reklammätning, forskning angående målgrupp och tjänsteutveckling', th: 'Advertising based on limited data, advertising measurement, audience research and services development', tr: 'Sınırlı veriye, reklam ölçümüne, hedef kitle araştırmasına ve hizmetlerin geliştirilmesine dayalı reklamlar', uk: 'Оголошення на основі обмежених даних, визначення оголошення, дослідження аудиторії та розвиток послуг', vi: 'Advertising based on limited data, advertising measurement, audience research and services development', zh: '基于有限数据、广告衡量、受众研究和服务开发的广告', 'zh-TW': '基于有限数据、广告衡量、受众研究和服务开发的广告' },
+  };
+
+  // ==========================================================================
+  // GVL SPECIAL FEATURES (Official IAB TCF Special Feature names)
+  // ==========================================================================
+
+  const GVL_SPECIAL_FEATURES = {
+    1: { en: 'Use precise geolocation data', de: 'Verwendung genauer Standortdaten', fr: 'Utiliser des données de géolocalisation précises', es: 'Utilizar datos de localización geográfica precisa', it: 'Utilizzare dati di geolocalizzazione precisi', nl: 'Precieze geolocatiegegevens gebruiken', pl: 'Użycie dokładnych danych geolokalizacyjnych', da: 'Bruge præcise geografiske placeringsoplysninger', bg: 'Използване на точни данни за географско позициониране', hr: 'Korištenje preciznih geolokacijskih podataka', cs: 'Používání přesných údajů o zeměpisné poloze', el: 'Χρήση επακριβών δεδομένων γεωεντοπισμού', fi: 'Tarkkojen sijaintitietojen käyttäminen', hu: 'Pontos földrajzi helymeghatározási adatok felhasználása', ro: 'Utilizarea unor date precise de geolocație', sk: 'Používanie presných údajov o geografickej polohe', sl: 'Uporaba natančnih geolokacijskih podatkov', sv: 'Använda exakta uppgifter om geografisk positionering', ca: 'Utilitzar dades de geolocalització precises', et: 'Täpsete geolokatsiooniandmete kasutamine', lv: 'Precīzas atrašanās vietas datu izmantošana', lt: 'Naudoti tikslius geolokacinius duomenis', mt: 'L-użu ta\' dejta ta\' ġeolokazzjoni preċiża', no: 'Bruke nøyaktige geolokasjonsdata', tr: 'Kesin coğrafi konum verilerini kullanmak', uk: 'Використовувати точні дані геолокації', ru: 'Использование точных данных геолокации', ar: 'استخدام بيانات الموقع الجغرافي الدقيقة', he: 'שימוש בנתוני מיקום גאוגרפי מדויקים', ja: '正確な位置情報データを利用する', zh: '使用精确的地理位置数据', pt: 'Utilizar dados de geolocalização precisos' },
+    2: { en: 'Actively scan device characteristics for identification', de: 'Endgeräteeigenschaften zur Identifikation aktiv abfragen', fr: 'Analyser activement les caractéristiques de l\'appareil pour l\'identification', es: 'Analizar activamente las características del dispositivo para su identificación', it: 'Scansione attiva delle caratteristiche del dispositivo ai fini dell\'identificazione', nl: 'De apparaatkenmerken actief scannen ter identificatie', pl: 'Aktywne skanowanie charakterystyki urządzenia do celów identyfikacji', da: 'Aktivt scanne enhedskarakteristika til identifikation', bg: 'Активно сканиране на характеристиките на устройството за идентификация', hr: 'Aktivno skeniranje karakteristika uređaja za identifikaciju', cs: 'Aktivní vyhledávání identifikačních údajů v rámci specifických vlastností zařízení', el: 'Ακριβής σάρωση χαρακτηριστικών συσκευής για αναγνώριση ταυτότητας', fi: 'Laitteen ominaisuuksien käyttäminen tunnistamista varten', hu: 'Az eszköz jellemzőinek aktív szkennelése az azonosítás érdekében', ro: 'Scanarea activă a caracteristicilor dispozitivului pentru identificare', sk: 'Aktívne skenovanie charakteristík zariadenia na identifikáciu', sl: 'Aktivno skeniranje značilnosti naprave za identifikacijo', sv: 'Aktivt läsa av enhetens egenskaper för identifieringsändamål', ca: 'Explorar activament les característiques del dispositiu per a la identificació', et: 'Seadme parameetrite aktiivne skannimine tuvastamiseks', lv: 'Ierīces parametru aktīva skenēšana identifikācijas nolūkā', lt: 'Aktyviai skenuoti įrenginio charakteristikas identifikavimo tikslais', mt: 'Skennjar attiv tal-karatteristiċi tat-tagħmir għall-identifikazzjoni', no: 'Aktivt skanne enhetsegenskaper for identifikasjon', tr: 'Belirleme amacı ile cihaz özelliklerini aktif şekilde taramak', uk: 'Активно сканувати характеристики пристрою для ідентифікації', ru: 'Активное сканирование характеристик устройства для идентификации', ar: 'فحص خصائص الجهاز بشكل فعال من أجل تحديد الهوية', he: 'סריקה פעילה של מאפייני מכשיר לצורך זיהוי', ja: '識別のためにデバイス特性をアクティブにスキャンする', zh: '主动扫描设备特性以进行识别', pt: 'Analisar ativamente as características do dispositivo para identificação' }
+  };
+
+
+  // ==========================================================================
+  // GVL DATA CATEGORIES (Official IAB TCF Data Category names, all 39 languages)
+  // ==========================================================================
+
+  const GVL_DATA_CATEGORIES = {
+    1: { ar: 'عناوين IP', bg: 'IP адреси', bs: 'IP adrese', ca: 'Adreces IP', cs: 'IP adresy', da: 'IP-adresser', de: 'IP-Adressen', el: 'Διευθύνσεις IP', en: 'IP addresses', es: 'Direcciones IP', et: 'IP-aadressid', eu: 'IP helbideak', fi: 'IP-osoitteet', fr: 'Adresses IP', gl: 'Enderezos IP', he: 'כתובות IP', hi: 'IP पते', hr: 'IP adrese', hu: 'IP-címek', id: 'Alamat IP', it: 'Indirizzi IP', ja: 'IPアドレス', lt: 'IP adresai', lv: 'IP adreses', mr: 'IP पत्ते', mt: 'Indirizzi IP', nb: 'IP-adresser', nl: 'IP-adressen', no: 'IP-adresser', pl: 'Adresy IP', pt: 'Endereços IP', ro: 'Adrese IP', ru: 'IP-адреса', sk: 'IP adresy', sl: 'IP-naslovi', sr: 'IP adrese', sv: 'IP-adresser', th: 'ที่อยู่ IP', tr: 'IP adresleri', uk: 'IP-адреси', vi: 'Địa chỉ IP', zh: 'IP 地址', 'zh-TW': 'IP 位址' },
+    2: { ar: 'خصائص الأجهزة', bg: 'Характеристики на устройството', bs: 'Karakteristike uređaja', ca: 'Característiques del dispositiu', cs: 'Vlastnosti zařízení', da: 'Enhedskarakteristika', de: 'Gerätemerkmale', el: 'Χαρακτηριστικά συσκευής', en: 'Device characteristics', es: 'Características del dispositivo', et: 'Seadme omadused', eu: 'Gailuaren ezaugarriak', fi: 'Laitteen ominaisuudet', fr: 'Caractéristiques de l\'appareil', gl: 'Características do dispositivo', he: 'מאפייני המכשיר', hi: 'डिवाइस विशेषताएँ', hr: 'Karakteristike uređaja', hu: 'Az eszköz jellemzői', id: 'Karakteristik perangkat', it: 'Caratteristiche del dispositivo', ja: 'デバイス特性', lt: 'Prietaiso charakteristikos', lv: 'Ierīces raksturlielumi', mr: 'डिव्हाइस वैशिष्ट्ये', mt: 'Karatteristiċi tal-apparat', nb: 'Enhetens egenskaper', nl: 'Apparaatkenmerken', no: 'Enhetens egenskaper', pl: 'Charakterystyka urządzenia', pt: 'Características do dispositivo', ro: 'Caracteristicile dispozitivului', ru: 'Характеристики устройств', sk: 'Charakteristiky zariadenia', sl: 'Značilnosti naprave', sr: 'Karakteristike uređaja', sv: 'Enhetens egenskaper', th: 'ลักษณะของอุปกรณ์', tr: 'Cihaz özellikleri', uk: 'Характеристики пристрою', vi: 'Đặc điểm thiết bị', zh: '设备特征', 'zh-TW': '裝置特性' },
+    3: { ar: 'معرفات الأجهزة', bg: 'Идентификатори на устройството', bs: 'Identifikatori uređaja', ca: 'Identificadors del dispositiu', cs: 'Identifikátory zařízení', da: 'Enhedsidentifikatorer', de: 'Gerätekennungen', el: 'Αναγνωριστικά συσκευής', en: 'Device identifiers', es: 'Identificadores del dispositivo', et: 'Seadme identifikaatorid', eu: 'Gailuaren identifikatzaileak', fi: 'Laitteen tunnisteet', fr: 'Identifiants de l’appareil', gl: 'Identificadores de dispositivo', he: 'מזהי המכשיר', hi: 'डिवाइस पहचानकर्ता', hr: 'Identifikatori uređaja', hu: 'Eszközazonosítók', id: 'Pengidentifikasi perangkat', it: 'Identificatori del dispositivo', ja: 'デバイス識別子', lt: 'Įrenginio identifikatoriai', lv: 'Ierīces identifikatori', mr: 'डिव्हाइस ओळखकर्ते', mt: 'Identifikaturi tal-apparat', nb: 'Enhetsidentifikatorer', nl: 'Apparaat-ID\'s', no: 'Enhetsidentifikatorer', pl: 'Identyfikatory urządzeń', pt: 'Identificadores de dispositivos', ro: 'Identificatorii dispozitivului', ru: 'Идентификаторы устройств', sk: 'Identifikátory zariadenia', sl: 'Identifikatorji naprave', sr: 'Identifikatori uređaja', sv: 'Enhetsidentifierare', th: 'ตัวระบุอุปกรณ์', tr: 'Cihaz tanımlayıcılar', uk: 'Ідентифікатори пристрою', vi: 'Mã nhận dạng thiết bị', zh: '设备标识符', 'zh-TW': '裝置識別碼' },
+    4: { ar: 'المعرفات الاحتمالية', bg: 'Вероятни идентификатори', bs: 'Probabilistički identifikatori', ca: 'Identificadors probabilístics', cs: 'Pravděpodobnostní identifikátory', da: 'Probabilistiske identifikatorer', de: 'Probabilistische Kennungen', el: 'Πιθανά αναγνωριστικά', en: 'Probabilistic identifiers', es: 'Identificadores probabilísticos', et: 'Tõenäosuspõhised identifikaatorid', eu: 'Identifikatzaile probabilistikoak', fi: 'Todennäköiset tunnisteet', fr: 'Identifiants probabilistes', gl: 'Identificadores probabilísticos', he: 'מזהים הסתברותיים', hi: 'संभाव्य पहचानकर्ता', hr: 'Vjerojatnosni identifikatori', hu: 'Valószínűségi azonosítók', id: 'Pengidentifikasi probabilistik', it: 'Identificatori probabilistici', ja: '確率的識別子', lt: 'Tikimybiniai identifikatoriai', lv: 'Varbūtiskie identifikatori', mr: 'संभाव्यता ओळखकर्ते', mt: 'Identifikaturi bbażati fuq il-probabbiltà', nb: 'Sannsynlige identifikatorer', nl: 'Probabilistische identificatoren', no: 'Sannsynlige identifikatorer', pl: 'Identyfikatory probabilistyczne', pt: 'Identificadores de probabilidades', ro: 'Identificatori probabilistici', ru: 'Вероятностные идентификаторы', sk: 'Pravdepodobnostné identifikátory', sl: 'Verjetnostni identifikatorji', sr: 'Probabilistički identifikatori', sv: 'Probabilistiska identifierare', th: 'ตัวระบุแบบความน่าจะเป็น', tr: 'Olasılıksal tanımlayıcılar', uk: 'Імовірні ідентифікатори', vi: 'Mã nhận dạng xác suất', zh: '概率标识符', 'zh-TW': '機率識別碼' },
+    5: { ar: 'المعرفات المستمدة من المصادقة', bg: 'Идентификатори, получени от удостоверяване', bs: 'Identifikatori izvedeni iz autentifikacije', ca: 'Identificadors derivats d’autenticació', cs: 'Identifikátory odvozené z ověření', da: 'Godkendelsesafledte identifikatorer', de: 'Aus Authentifizierungen abgeleitete Kennungen', el: 'Αναγνωριστικά που προέρχονται από έλεγχο ταυτότητας', en: 'Authentication-derived identifiers', es: 'Identificadores determinísticos (derivados de la autenticación)', et: 'Autentimisega saadud identifikaatorid', eu: 'Autentifikaziotik eratorritako identifikatzaileak', fi: 'Todennukseen perustuvat tunnisteet', fr: 'Identifiants dérivés de l’authentification', gl: 'Identificadores derivados da autenticación', he: 'מזהים שנגזרים מהאימות', hi: 'प्रमाणीकरण-व्युत्पन्न पहचानकर्ता', hr: 'Identifikatori dobiveni autentifikacijom', hu: 'Hitelesítésből származó azonosítók', id: 'Pengidentifikasi berbasis autentikasi', it: 'Identificatori derivati dall’autenticazione', ja: '認証由来の識別子', lt: 'Autentifikavimo išvestiniai identifikatoriai', lv: 'No autentifikācijas iegūtie identifikatori', mr: 'प्रमाणीकरण-व्युत्पन्न ओळखकर्ते', mt: 'Identifikaturi bbażati fuq l-awtentikazzjoni', nb: 'Autentiseringsavledede identifikatorer', nl: 'Van authenticatie afgeleide identificatoren', no: 'Autentiseringsavledede identifikatorer', pl: 'Identyfikatory pochodzące z uwierzytelniania', pt: 'Identificadores derivados de autenticação', ro: 'Identificatori derivați din autentificare', ru: 'Идентификаторы на основе данных аутентификации', sk: 'Identifikátory odvodené z overovania', sl: 'Identifikatorji, pridobljeni s preverjanjem pristnosti', sr: 'Identifikatori izvedeni iz provere identiteta', sv: 'Autentiseringshärledda identifierare', th: 'ตัวระบุจากการยืนยันตัวตน', tr: 'Kimlik doğrulama ile türetilen tanımlayıcılar', uk: 'Ідентифікатори, отримані під час автентифікації', vi: 'Mã nhận dạng từ xác thực', zh: '身份认证派生标识符', 'zh-TW': '驗證衍生識別碼' },
+    6: { ar: 'بيانات التصفح والتفاعل', bg: 'Данни за сърфиране и взаимодействие', bs: 'Podaci o pregledavanju i interakciji', ca: 'Dades de navegació i interacció', cs: 'Údaje o procházení a interakci', da: 'Browsing- og interaktionsoplysninger', de: 'Surf- und Interaktionsdaten', el: 'Δεδομένα περιήγησης και αλληλεπίδρασης', en: 'Browsing and interaction data', es: 'Datos de navegación e interacción', et: 'Brausimis- ja suhtlemisandmed', eu: 'Nabigazioa eta interakzio datuak', fi: 'Tietojen selaus ja vuorovaikutus', fr: 'Données de navigation et d’interaction', gl: 'Datos de navegación e interacción', he: 'נתוני גלישה ואינטראקציה', hi: 'ब्राउज़िंग और इंटरैक्शन डेटा', hr: 'Podaci o pregledavanju i interakciji', hu: 'Böngészési és interakciós adatok', id: 'Data penjelajahan dan interaksi', it: 'Dati di navigazione e interazione', ja: '閲覧およびインタラクションデータ', lt: 'Naršymo ir sąveikos duomenys', lv: 'Pārlūkošanas un mijiedarbības dati', mr: 'ब्राउझिंग आणि परस्परसंवाद डेटा', mt: 'Data tal-ibbrawżjar u ta’ interazzjoni', nb: 'Nettleser- og samhandlingsdata', nl: 'Browse- en interactiegegevens', no: 'Nettleser- og samhandlingsdata', pl: 'Dane z przeglądania i interakcji', pt: 'Navegar e interagir com dados', ro: 'Date privind navigarea și interacțiunea', ru: 'Данные о просмотрах и взаимодействии', sk: 'Údaje o prehliadaní a interakcii', sl: 'Podatki o brskanju in interakcijah', sr: 'Podaci o pretraživanju i interakcijama', sv: 'Bläddring- och interaktionsdata', th: 'ข้อมูลการเรียกดูและการโต้ตอบ', tr: 'Tarama ve etkileşim verileri', uk: 'Дані перегляду та взаємодії', vi: 'Dữ liệu duyệt web và tương tác', zh: '浏览和交互数据', 'zh-TW': '瀏覽與互動資料' },
+    7: { ar: 'البيانات المقدمة من المستخدم', bg: 'Предоставени от потребителя данни', bs: 'Podaci koje je korisnik pružio', ca: 'Dades proporcionades per l’usuari', cs: 'Údaje poskytnuté uživatelem', da: 'Bruger-tilvejebragte oplysninger', de: 'Vom Benutzer bereitgestellte Daten', el: 'Δεδομένα που παρέχονται από τον χρήστη', en: 'User-provided data', es: 'Datos declarativos', et: 'Kasutaja esitatud andmed', eu: 'Erabiltzaileak emandako datuak', fi: 'Käyttäjän antamat tiedot', fr: 'Données fournies par l’utilisateur', gl: 'Datos proporcionados polo usuario', he: 'נתונים שהמשתמשים סיפקו', hi: 'उपयोगकर्ता द्वारा प्रदान किया गया डेटा', hr: 'Podaci koje je dostavio korisnik', hu: 'Felhasználó által megadott adatok', id: 'Data yang diberikan pengguna', it: 'Dati forniti dall’utente', ja: 'ユーザー提供データ', lt: 'Naudotojo pateikti duomenys', lv: 'Lietotāja sniegtie dati', mr: 'वापरकर्त्याने दिलेला डेटा', mt: 'Data pprovduta mill-utent', nb: 'Data gitt av brukeren', nl: 'Door de gebruiker verstrekte gegevens', no: 'Data gitt av brukeren', pl: 'Dane dostarczone przez użytkownika', pt: 'Dados fornecidos pelo usuário', ro: 'Date furnizate de utilizator', ru: 'Данные, предоставленные пользователем', sk: 'Údaje poskytnuté používateľom', sl: 'Podatki, ki jih zagotovi uporabnik', sr: 'Podaci koje dostavlja korisnik', sv: 'Data som tillhandahålls av användaren', th: 'ข้อมูลที่ผู้ใช้ให้', tr: 'Kullanıcı tarafından sağlanan veriler', uk: 'Дані, надані користувачем', vi: 'Dữ liệu do người dùng cung cấp', zh: '用户提供的数据', 'zh-TW': '使用者提供的資料' },
+    8: { ar: 'بيانات الموقع غير الدقيقة', bg: 'Приблизителни данни за местоположението', bs: 'Podaci o nepreciznoj lokaciji', ca: 'Dades d’ubicació imprecises', cs: 'Používání nespecifických údajů o geografické poloze', da: 'Omtrentlige placeringsoplysninger', de: 'Ungefähre Standort-Daten', el: 'Μη επακριβή δεδομένα γεωεντοπισμού', en: 'Non-precise location data', es: 'Datos de localización geográfica no precisa', et: 'Ebatäpsed asukohaandmed', eu: 'Kokapen ez-zehatza datuak', fi: 'Likimääräiset sijaintitiedot', fr: 'Données de localisation non précises', gl: 'Datos de localización non precisa', he: 'נתוני מיקום לא מדויקים', hi: 'गैर-सटीक स्थान डेटा', hr: 'Podaci o približnoj lokaciji', hu: 'Nem pontos földrajzi helymeghatározási adatok felhasználása', id: 'Data lokasi tidak presisi', it: 'Dati di geolocalizzazione non precisi', ja: 'おおよその位置情報データ', lt: 'Apytiksliai buvimo vietos duomenys', lv: 'Neprecīzas atrašanās vietas dati', mr: 'अचूक नसलेला स्थान डेटा', mt: 'Data dwar il-post mhux preċiż', nb: 'Unøyaktige lokasjonsdata', nl: 'Niet-precieze locatiegegevens', no: 'Unøyaktige lokasjonsdata', pl: 'Nieprecyzyjne dane lokalizacyjne', pt: 'Dados não exatos de localização geográfica', ro: 'Date neprecise despre locație', ru: 'Примерные данные о местоположении', sk: 'Nepresné údaje o geografickej polohe', sl: 'Nenatančni geolokacijski podatki', sr: 'Podaci o približnoj lokaciji', sv: 'Icke-exakta lokaliseringsdata', th: 'ข้อมูลตำแหน่งที่ไม่แม่นยำ', tr: 'Kesin olmayan konum verileri', uk: 'Неточні дані місцезнаходження', vi: 'Dữ liệu vị trí không chính xác', zh: '非精确位置数据', 'zh-TW': '非精確位置資料' },
+    9: { ar: 'بيانات الموقع الدقيقة', bg: 'Точни данни за местоположението', bs: 'Podaci o preciznoj lokaciji', ca: 'Dades d’ubicació precises', cs: 'Přesné údaje o geografické poloze', da: 'Præcise placeringsoplysninger', de: 'Genaue Standortdaten', el: 'Επακριβή δεδομένα γεωεντοπισμού', en: 'Precise location data', es: 'Datos de localización geográfica precisa', et: 'Täpsed asukohaandmed', eu: 'Kokapen zehatzeko datuak', fi: 'Tarkat sijaintitiedot', fr: 'Données de localisation précises', gl: 'Datos de localización precisa', he: 'נתוני מיקום מדויקים', hi: 'सटीक स्थान डेटा', hr: 'Precizni podaci o lokaciji', hu: 'Pontos helymeghatározási adatok', id: 'Data lokasi presisi', it: 'Dati di geolocalizzazione precisi', ja: '正確な位置情報データ', lt: 'Tikslūs buvimo vietos duomenys', lv: 'Precīzas atrašanās vietas dati', mr: 'अचूक स्थान डेटा', mt: 'Data dwar il-post preċiż', nb: 'Nøyaktige lokasjonsdata', nl: 'Precieze locatiegegevens', no: 'Nøyaktige lokasjonsdata', pl: 'Precyzyjne dane lokalizacyjne', pt: 'Dados exatos de localização', ro: 'Date precise despre locație', ru: 'Точные данные о местоположении', sk: 'Presné údaje o geografickej polohe', sl: 'Natančni geolokacijski podatki', sr: 'Podaci o preciznoj lokaciji', sv: 'Exakta lokaliseringsdata', th: 'ข้อมูลตำแหน่งที่แม่นยำ', tr: 'Kesin konum verileri', uk: 'Точні дані місцезнаходження', vi: 'Dữ liệu vị trí chính xác', zh: '精确位置数据', 'zh-TW': '精確位置資料' },
+    10: { ar: 'ملفات المستخدمين', bg: 'Потребителски профили', bs: 'Profili korisnika', ca: 'Perfils dels usuaris', cs: 'Profily uživatelů', da: 'Brugeres profiler', de: 'Benutzerprofile', el: 'Προφίλ χρηστών', en: 'Users’ profiles', es: 'Inferencias o segmentación de audiencia', et: 'Kasutajaprofiilid', eu: 'Erabiltzaileen profilak', fi: 'Käyttäjien profiilit', fr: 'Profils d’utilisateurs', gl: 'Perfís de usuarios', he: 'פרופילי משתמשים', hi: 'उपयोगकर्ता प्रोफ़ाइल', hr: 'Profili korisnika', hu: 'Felhasználói profilok', id: 'Profil pengguna', it: 'Profili degli utenti', ja: 'ユーザーのプロファイル', lt: 'Naudotojų profiliai', lv: 'Lietotāju profili', mr: 'वापरकर्ता प्रोफाइल', mt: 'Profili tal-utenti', nb: 'Brukernes profiler', nl: 'Profielen van gebruikers', no: 'Brukernes profiler', pl: 'Profile użytkowników', pt: 'Perfis dos usuários', ro: 'Profilurile utilizatorilor', ru: 'Профили пользователей', sk: 'Profily používateľov', sl: 'Profili uporabnikov', sr: 'Profili korisnika', sv: 'Användares profiler', th: 'โปรไฟล์ผู้ใช้', tr: 'Kullanıcı profilleri', uk: 'Користувацькі профілі', vi: 'Hồ sơ người dùng', zh: '用户个人资料', 'zh-TW': '使用者個人資料' },
+    11: { ar: 'خيارات الخصوصية', bg: 'Избори на поверителност', bs: 'Izbori privatnosti', ca: 'Opcions de privadesa', cs: 'Volby v oblasti ochrany osobních údajů', da: 'Databeskyttelsesvalg', de: 'Datenschutzeinstellungen', el: 'Επιλογές απορρήτου', en: 'Privacy choices', es: 'Configuración de privacidad', et: 'Eraelu puutumatusega seotud valikud', eu: 'Pribatutasun aukerak', fi: 'Tietosuojan valinnat', fr: 'Choix en matière de confidentialité', gl: 'Opcións de privacidade', he: 'בחירות בנושא פרטיות', hi: 'गोपनीयता विकल्प', hr: 'Izbori u pogledu privatnosti', hu: 'Adatvédelmi döntések', id: 'Pilihan privasi', it: 'Scelte sulla privacy', ja: 'プライバシーの選択', lt: 'Privatumo pasirinkimai', lv: 'Konfidencialitātes izvēles iespējas', mr: 'गोपनीयता निवडी', mt: 'Għażliet tal-privatezza', nb: 'Valg av personvern', nl: 'Keuzes voor privacy', no: 'Valg av personvern', pl: 'Wybory (preferencje) dotyczące prywatności', pt: 'Opções de privacidade', ro: 'Opțiuni de confidențialitate', ru: 'Выбранные настройки конфиденциальности', sk: 'Možnosti ochrany osobných údajov', sl: 'Nastavitve glede zasebnosti', sr: 'Izbori privatnosti', sv: 'Integritetsval', th: 'ตัวเลือกความเป็นส่วนตัว', tr: 'Gizlilik seçenekleri', uk: 'Налаштування конфіденційності', vi: 'Lựa chọn quyền riêng tư', zh: '隐私选择', 'zh-TW': '隱私選擇' },
+  };
+
+    // ==========================================================================
+  // PROVIDER DATABASE (for per-provider consent)
+  // ==========================================================================
+
+  const PROVIDER_DATABASE = {
+    analytics: {
+      google_analytics: {
+        name: 'Google Analytics',
+        patterns: ['google-analytics', 'googletagmanager', 'analytics.google', 'gtag/js', 'gtm.js'],
+        cookies: ['_ga', '_ga_*', '_gid', '_gat'],
+        description: { de: 'Analyse des Nutzerverhaltens', en: 'User behavior analysis', fr: "Analyse du comportement des utilisateurs", es: 'Análisis del comportamiento del usuario', it: "Analisi del comportamento degli utenti", nl: 'Analyse van gebruikersgedrag', pl: 'Analiza zachowań użytkowników', pt: 'Análise do comportamento do utilizador', da: 'Analyse af brugeradfærd' , 'ar': "تحليل سلوك المستخدم", 'bg': "Анализ на потребителското поведение", 'bs': "Analiza ponašanja korisnika", 'ca': "Anàlisi del comportament dels usuaris", 'cs': "Analýza uživatelského chování", 'el': "Ανάλυση συμπεριφοράς χρήστη", 'eu': "Erabiltzaileen portaeraren azterketa", 'fi': "Käyttäjien käyttäytymisen analyysi", 'gl': "Análise do comportamento do usuario", 'he': "ניתוח התנהגות משתמשים", 'hi': "उपयोगकर्ता व्यवहार विश्लेषण", 'hr': "Analiza ponašanja korisnika", 'hu': "Felhasználói viselkedés elemzése", 'id': "Analisis perilaku pengguna", 'ja': "ユーザー行動分析", 'lt': "Vartotojų elgesio analizė", 'mr': "वापरकर्ता वर्तन विश्लेषण", 'nb': "Analyse av brukeratferd", 'ro': "Analiza comportamentului utilizatorului", 'ru': "Анализ поведения пользователей", 'sk': "Analýza správania používateľov", 'sl': "Analiza vedenja uporabnikov", 'sr': "Анализа понашања корисника", 'sv': "Användarbeteendeanalys", 'th': "การวิเคราะห์พฤติกรรมผู้ใช้", 'tr': "Kullanıcı davranışı analizi", 'uk': "Аналіз поведінки користувачів" , 'vi': "Phân tích hành vi người dùng", 'zh': "用户行为分析", 'zh-TW': "用戶行為分析" },
+        duration: { de: '2 Jahre (_ga), 24 Stunden (_gid)', en: '2 years (_ga), 24 hours (_gid)', fr: '2 ans (_ga), 24 heures (_gid)', es: '2 años (_ga), 24 horas (_gid)', it: '2 anni (_ga), 24 ore (_gid)', nl: '2 jaar (_ga), 24 uur (_gid)', pl: '2 lata (_ga), 24 godziny (_gid)', pt: '2 anos (_ga), 24 horas (_gid)', da: '2 år (_ga), 24 timer (_gid)' , 'ar': "سنتان (_ga)، 24 ساعة (_gid)", 'bg': "2 години (_ga), 24 часа (_gid)", 'bs': "2 godine (_ga), 24 sata (_gid)", 'ca': "2 anys (_ga), 24 hores (_gid)", 'cs': "2 roky (_ga), 24 hodin (_gid)", 'el': "2 χρόνια (_ga), 24 ώρες (_gid)", 'eu': "2 urte (_ga), 24 ordu (_gid)", 'fi': "2 vuotta (_ga), 24 tuntia (_gid)", 'gl': "2 anos (_ga), 24 horas (_gid)", 'he': "שנתיים (_ga), 24 שעות (_gid)", 'hi': "2 वर्ष (_ga), 24 घंटे (_gid)", 'hr': "2 godine (_ga), 24 sata (_gid)", 'hu': "2 év (_ga), 24 óra (_gid)", 'id': "2 tahun (_ga), 24 jam (_gid)", 'ja': "2 年 (_ga)、24 時間 (_gid)", 'lt': "2 metai (_ga), 24 valandos (_gid)", 'mr': "2 वर्षे (_ga), 24 तास (_gid)", 'nb': "2 år (_ga), 24 timer (_gid)", 'ro': "2 ani (_ga), 24 de ore (_gid)", 'ru': "2 года (_га), 24 часа (_гид)", 'sk': "2 roky (_ga), 24 hodín (_gid)", 'sl': "2 leti (_ga), 24 ur (_gid)", 'sr': "2 године (_га), 24 сата (_гид)", 'sv': "2 år (_ga), 24 timmar (_gid)", 'th': "2 ปี (_ga), 24 ชั่วโมง (_gid)", 'tr': "2 yıl (_ga), 24 saat (_gid)", 'uk': "2 роки (_ga), 24 години (_gid)" , 'vi': "2 năm (_ga), 24 giờ (_gid)", 'zh': "2年 (_ga)，24小时 (_gid)", 'zh-TW': "2 年 (_ga), 24 小時 (_gid)" },
+        purpose: { de: 'Erfassung von Website-Statistiken zur Verbesserung des Angebots', en: 'Collection of website statistics to improve our services', fr: 'Collecte de statistiques pour améliorer nos services', es: 'Recopilación de estadísticas para mejorar nuestros servicios', it: 'Raccolta di statistiche per migliorare i nostri servizi', nl: 'Verzameling van statistieken om onze diensten te verbeteren', pl: 'Zbieranie statystyk w celu ulepszenia naszych usług', pt: 'Recolha de estatísticas para melhorar os nossos serviços', da: 'Indsamling af statistik for at forbedre vores tjenester' , 'ar': "جمع إحصائيات الموقع لتحسين خدماتنا", 'bg': "Събиране на статистически данни за уебсайтове за подобряване на нашите услуги", 'bs': "Prikupljanje statistike web stranice za poboljšanje naših usluga", 'ca': "Recollida d'estadístiques del lloc web per millorar els nostres serveis", 'cs': "Shromažďování statistik webových stránek pro zlepšení našich služeb", 'el': "Συλλογή στατιστικών ιστοτόπων για τη βελτίωση των υπηρεσιών μας", 'eu': "Gure zerbitzuak hobetzeko webguneko estatistikak biltzea", 'fi': "Verkkosivustotilastojen kerääminen palveluidemme parantamiseksi", 'gl': "Recollida de estatísticas do sitio web para mellorar os nosos servizos", 'he': "אוסף סטטיסטיקות של אתרים כדי לשפר את השירותים שלנו", 'hi': "हमारी सेवाओं को बेहतर बनाने के लिए वेबसाइट आँकड़ों का संग्रह", 'hr': "Prikupljanje statistike web stranice za poboljšanje naših usluga", 'hu': "Honlapstatisztikák gyűjtése szolgáltatásaink fejlesztése érdekében", 'id': "Pengumpulan statistik situs web untuk meningkatkan layanan kami", 'ja': "当社のサービスを改善するためのウェブサイト統計の収集", 'lt': "Svetainės statistikos rinkimas, siekiant pagerinti mūsų paslaugas", 'mr': "आमच्या सेवा सुधारण्यासाठी वेबसाइट आकडेवारीचे संकलन", 'nb': "Innsamling av nettsidestatistikk for å forbedre tjenestene våre", 'ro': "Colectarea statisticilor site-ului pentru a ne îmbunătăți serviciile", 'ru': "Сбор статистики сайта для улучшения наших услуг", 'sk': "Zhromažďovanie štatistík webových stránok na zlepšenie našich služieb", 'sl': "Zbiranje statističnih podatkov spletnega mesta za izboljšanje naših storitev", 'sr': "Прикупљање статистике веб странице за побољшање наших услуга", 'sv': "Insamling av webbplatsstatistik för att förbättra våra tjänster", 'th': "การรวบรวมสถิติเว็บไซต์เพื่อปรับปรุงบริการของเรา", 'tr': "Hizmetlerimizi geliştirmek için web sitesi istatistiklerinin toplanması", 'uk': "Збір статистики веб-сайту для покращення наших послуг" , 'vi': "Thu thập số liệu thống kê trang web để cải thiện dịch vụ của chúng tôi", 'zh': "收集网站统计数据以改进我们的服务", 'zh-TW': "收集網站統計資料以改善我們的服務" },
+        legalBasis: { de: 'Art. 6 Abs. 1 lit. a DSGVO (Einwilligung)', en: 'Art. 6(1)(a) GDPR (Consent)', fr: 'Art. 6(1)(a) RGPD (Consentement)', es: 'Art. 6(1)(a) RGPD (Consentimiento)', it: 'Art. 6(1)(a) GDPR (Consenso)', nl: 'Art. 6(1)(a) AVG (Toestemming)', pl: 'Art. 6(1)(a) RODO (Zgoda)', pt: 'Art. 6(1)(a) RGPD (Consentimento)', da: 'Art. 6(1)(a) GDPR (Samtykke)' , 'ar': "فن. 6(1)(أ) اللائحة العامة لحماية البيانات (الموافقة)", 'bg': "Чл. 6(1)(a) GDPR (Съгласие)", 'bs': "Art. 6(1)(a) GDPR (Saglasnost)", 'ca': "Art. 6(1)(a) GDPR (consentiment)", 'cs': "umění. 6(1)(a) GDPR (Souhlas)", 'el': "Τέχνη. 6(1)(α) GDPR (Συναίνεση)", 'eu': "art. 6(1)(a) GDPR (baimena)", 'fi': "Art. 6(1)(a) GDPR (suostumus)", 'gl': "Art. 6(1)(a) GDPR (Consentimento)", 'he': "אמנות. 6(1)(א) GDPR (הסכמה)", 'hi': "कला. 6(1)(ए) जीडीपीआर (सहमति)", 'hr': "čl. 6(1)(a) GDPR (pristanak)", 'hu': "Art. GDPR 6. cikk (1) bekezdés a) pont (beleegyezés)", 'id': "Seni. 6(1)(a) GDPR (Persetujuan)", 'ja': "アート。 6(1)(a) GDPR (同意)", 'lt': "Art. BDAR 6 straipsnio 1 dalies a punktas (sutikimas)", 'mr': "कला. 6(1)(a) GDPR (संमती)", 'nb': "Art. 6(1)(a) GDPR (samtykke)", 'ro': "art. 6(1)(a) GDPR (Consimțământ)", 'ru': "Искусство. 6(1)(a) GDPR (Согласие)", 'sk': "čl. 6(1)(a) GDPR (Súhlas)", 'sl': "Art. 6(1)(a) GDPR (soglasje)", 'sr': "чл. 6(1)(а) ГДПР (сагласност)", 'sv': "Art. 6(1)(a) GDPR (samtycke)", 'th': "ศิลปะ 6(1)(a) GDPR (ความยินยอม)", 'tr': "Sanat. 6(1)(a) GDPR (Rıza)", 'uk': "ст. 6(1)(a) GDPR (Згода)" , 'vi': "Điều. 6(1)(a) GDPR (Sự đồng ý)", 'zh': "GDPR 第6条第1款(a)项（同意）", 'zh-TW': "GDPR 第6條第1款(a)項（同意）" },
+        recipient: 'Google LLC, USA',
+        euEntity: { recipient: 'Google Ireland Limited', vendorLocation: 'Gordon House, Barrow Street, Dublin 4, Ireland' },
+        transferSafeguard: { de: 'EU-US Data Privacy Framework', en: 'EU-US Data Privacy Framework', fr: 'EU-US Data Privacy Framework', es: 'EU-US Data Privacy Framework', it: 'EU-US Data Privacy Framework', nl: 'EU-US Data Privacy Framework', pl: 'EU-US Data Privacy Framework', pt: 'EU-US Data Privacy Framework', da: 'EU-US Data Privacy Framework' , 'ar': "إطار خصوصية البيانات بين الاتحاد الأوروبي والولايات المتحدة", 'bg': "Рамка за поверителност на данните между ЕС и САЩ", 'bs': "EU-US Data Privacy Framework", 'ca': "Marc de privadesa de dades UE-EUA", 'cs': "Rámec ochrany osobních údajů mezi EU a USA", 'el': "Πλαίσιο απορρήτου δεδομένων ΕΕ-ΗΠΑ", 'eu': "EB-AEB Datuen Pribatutasun Esparrua", 'fi': "EU:n ja Yhdysvaltojen välinen tietosuojakehys", 'gl': "Marco de privacidade de datos UE-EUA", 'he': "מסגרת פרטיות נתונים של האיחוד האירופי-ארה\"ב", 'hi': "ईयू-यूएस डेटा गोपनीयता ढांचा", 'hr': "EU-SAD okvir za zaštitu privatnosti podataka", 'hu': "EU-USA adatvédelmi keretrendszer", 'id': "Kerangka Privasi Data UE-AS", 'ja': "EU-US データプライバシーフレームワーク", 'lt': "ES ir JAV duomenų privatumo sistema", 'mr': "EU-US डेटा गोपनीयता फ्रेमवर्क", 'nb': "EU-US Data Privacy Framework", 'ro': "Cadrul UE-SUA privind confidențialitatea datelor", 'ru': "Рамочная программа конфиденциальности данных ЕС-США", 'sk': "Rámec ochrany osobných údajov medzi EÚ a USA", 'sl': "EU-ZDA okvir zasebnosti podatkov", 'sr': "Оквир приватности података ЕУ-САД", 'sv': "EU-US Data Privacy Framework", 'th': "กรอบความเป็นส่วนตัวของข้อมูลในสหภาพยุโรปและสหรัฐอเมริกา", 'tr': "AB-ABD Veri Gizliliği Çerçevesi", 'uk': "Конфіденційність даних між ЄС і США" , 'vi': "Khung bảo mật dữ liệu EU-Hoa Kỳ", 'zh': "欧盟-美国数据隐私框架", 'zh-TW': "歐盟－美國數據隱私框架" }
+      },
+      hotjar: {
+        name: 'Hotjar',
+        patterns: ['hotjar.com', 'static.hotjar.com'],
+        cookies: ['_hj*', 'hjSessionUser', 'hjSession'],
+        description: { de: 'Heatmaps und Session-Aufnahmen', en: 'Heatmaps and session recordings', fr: 'Cartes de chaleur et enregistrements de sessions', es: 'Mapas de calor y grabaciones de sesiones', it: 'Mappe di calore e registrazioni di sessioni', nl: 'Heatmaps en sessie-opnamen', pl: 'Mapy cieplne i nagrania sesji', pt: 'Mapas de calor e gravações de sessões', da: 'Heatmaps og sessionsoptagelser' , 'ar': "الخرائط الحرارية وتسجيلات الجلسة", 'bg': "Топлинни карти и записи на сесии", 'bs': "Toplotne karte i snimci sesija", 'ca': "Mapes de calor i enregistraments de sessions", 'cs': "Teplotní mapy a záznamy relací", 'el': "Χάρτες θερμότητας και εγγραφές συνεδριών", 'eu': "Bero-mapak eta saioen grabaketak", 'fi': "Lämpökartat ja istuntojen tallenteet", 'gl': "Mapas de calor e gravacións de sesións", 'he': "מפות חום והקלטות הפעלות", 'hi': "हीटमैप्स और सत्र रिकॉर्डिंग", 'hr': "Toplinske karte i snimke sesija", 'hu': "Hőtérképek és munkamenet-felvételek", 'id': "Peta panas dan rekaman sesi", 'ja': "ヒートマップとセッション記録", 'lt': "Šilumos žemėlapiai ir seansų įrašai", 'mr': "हीटमॅप आणि सत्र रेकॉर्डिंग", 'nb': "Heatmaps og øktopptak", 'ro': "Hărți termice și înregistrări de sesiuni", 'ru': "Тепловые карты и записи сессий", 'sk': "Teplotné mapy a záznamy relácií", 'sl': "Toplotni zemljevidi in posnetki sej", 'sr': "Топлотне мапе и снимци сесија", 'sv': "Värmekartor och sessionsinspelningar", 'th': "แผนที่ความร้อนและการบันทึกเซสชัน", 'tr': "Isı haritaları ve oturum kayıtları", 'uk': "Теплові карти та записи сеансів" , 'vi': "Bản đồ nhiệt và bản ghi phiên", 'zh': "热力图和会话录制", 'zh-TW': "熱圖和會話錄影" },
+        duration: { de: '1 Jahr (hjSessionUser), 30 Minuten (hjSession)', en: '1 year (hjSessionUser), 30 minutes (hjSession)', fr: '1 an (hjSessionUser), 30 minutes (hjSession)', es: '1 año (hjSessionUser), 30 minutos (hjSession)', it: '1 anno (hjSessionUser), 30 minuti (hjSession)', nl: '1 jaar (hjSessionUser), 30 minuten (hjSession)', pl: '1 rok (hjSessionUser), 30 minut (hjSession)', pt: '1 ano (hjSessionUser), 30 minutos (hjSession)', da: '1 år (hjSessionUser), 30 minutter (hjSession)' , 'ar': "سنة واحدة (hjSessionUser)، 30 دقيقة (hjSession)", 'bg': "1 година (hjSessionUser), 30 минути (hjSession)", 'bs': "1 godina (hjSessionUser), 30 minuta (hjSession)", 'ca': "1 any (hjSessionUser), 30 minuts (hjSession)", 'cs': "1 rok (hjSessionUser), 30 minut (hjSession)", 'el': "1 έτος (hjSessionUser), 30 λεπτά (hjSession)", 'eu': "1 urte (hjSessionUser), 30 minutu (hjSession)", 'fi': "1 vuosi (hjSessionUser), 30 minuuttia (hjSession)", 'gl': "1 ano (hjSessionUser), 30 minutos (hjSession)", 'he': "שנה אחת (hjSessionUser), 30 דקות (hjSession)", 'hi': "1 वर्ष (hjSessionUser), 30 मिनट (hjSession)", 'hr': "1 godina (hjSessionUser), 30 minuta (hjSession)", 'hu': "1 év (hjSessionUser), 30 perc (hjSession)", 'id': "1 tahun (hjSessionUser), 30 menit (hjSession)", 'ja': "1年(hjSessionUser)、30分(hjSession)", 'lt': "1 metai (hjSessionUser), 30 minučių (hjSession)", 'mr': "1 वर्ष (hjSessionUser), 30 मिनिटे (hjSession)", 'nb': "1 år (hjSessionUser), 30 minutter (hjSession)", 'ro': "1 an (hjSessionUser), 30 de minute (hjSession)", 'ru': "1 год (hjSessionUser), 30 минут (hjSession)", 'sk': "1 rok (hjSessionUser), 30 minút (hjSession)", 'sl': "1 leto (hjSessionUser), 30 minut (hjSession)", 'sr': "1 година (хјСессионУсер), 30 минута (хјСессион)", 'sv': "1 år (hjSessionUser), 30 minuter (hjSession)", 'th': "1 ปี (hjSessionUser), 30 นาที (hjSession)", 'tr': "1 yıl (hjSessionUser), 30 dakika (hjSession)", 'uk': "1 рік (hjSessionUser), 30 хвилин (hjSession)" , 'vi': "1 năm (hjSessionUser), 30 phút (hjSession)", 'zh': "1年（hjSessionUser），30分钟（hjSession）", 'zh-TW': "1 年（hjSessionUser），30 分鐘（hjSession）" },
+        purpose: { de: 'Analyse der Nutzerinteraktion durch Heatmaps und Recordings', en: 'Analysis of user interaction through heatmaps and recordings', fr: "Analyse de l'interaction utilisateur par cartes de chaleur", es: 'Análisis de la interacción del usuario mediante mapas de calor', it: "Analisi dell'interazione utente tramite mappe di calore", nl: 'Analyse van gebruikersinteractie via heatmaps', pl: 'Analiza interakcji użytkowników za pomocą map cieplnych', pt: 'Análise da interação do utilizador através de mapas de calor', da: 'Analyse af brugerinteraktion via heatmaps' , 'ar': "تحليل تفاعل المستخدم من خلال الخرائط الحرارية والتسجيلات", 'bg': "Анализ на потребителското взаимодействие чрез топлинни карти и записи", 'bs': "Analiza interakcije korisnika kroz toplotne karte i snimke", 'ca': "Anàlisi de la interacció dels usuaris mitjançant mapes de calor i enregistraments", 'cs': "Analýza interakce uživatele prostřednictvím teplotních map a záznamů", 'el': "Ανάλυση της αλληλεπίδρασης των χρηστών μέσω θερμικών χαρτών και εγγραφών", 'eu': "Erabiltzaileen elkarrekintzaren azterketa bero-mapen eta grabazioen bidez", 'fi': "Käyttäjävuorovaikutuksen analysointi lämpökarttojen ja tallenteiden avulla", 'gl': "Análise da interacción do usuario mediante mapas de calor e gravacións", 'he': "ניתוח אינטראקציה של משתמשים באמצעות מפות חום והקלטות", 'hi': "हीटमैप और रिकॉर्डिंग के माध्यम से उपयोगकर्ता की बातचीत का विश्लेषण", 'hr': "Analiza interakcije korisnika kroz heatmape i snimke", 'hu': "A felhasználói interakció elemzése hőtérképeken és felvételeken keresztül", 'id': "Analisis interaksi pengguna melalui peta panas dan rekaman", 'ja': "ヒートマップと記録によるユーザー インタラクションの分析", 'lt': "Vartotojo sąveikos analizė naudojant šilumos žemėlapius ir įrašus", 'mr': "हीटमॅप आणि रेकॉर्डिंगद्वारे वापरकर्त्याच्या परस्परसंवादाचे विश्लेषण", 'nb': "Analyse av brukerinteraksjon gjennom varmekart og opptak", 'ro': "Analiza interacțiunii utilizatorului prin hărți termice și înregistrări", 'ru': "Анализ взаимодействия пользователей с помощью тепловых карт и записей", 'sk': "Analýza interakcie používateľa prostredníctvom tepelných máp a záznamov", 'sl': "Analiza interakcije uporabnikov s toplotnimi zemljevidi in posnetki", 'sr': "Анализа интеракције корисника кроз топлотне мапе и снимке", 'sv': "Analys av användarinteraktion genom värmekartor och inspelningar", 'th': "การวิเคราะห์ปฏิสัมพันธ์ของผู้ใช้ผ่านแผนที่ความร้อนและการบันทึก", 'tr': "Isı haritaları ve kayıtlar aracılığıyla kullanıcı etkileşiminin analizi", 'uk': "Аналіз взаємодії користувача за допомогою теплових карт і записів" , 'vi': "Phân tích tương tác của người dùng thông qua bản đồ nhiệt và bản ghi", 'zh': "通过热图和录音分析用户互动", 'zh-TW': "透過熱圖和錄音分析使用者互動" },
+        legalBasis: { de: 'Art. 6 Abs. 1 lit. a DSGVO (Einwilligung)', en: 'Art. 6(1)(a) GDPR (Consent)', fr: 'Art. 6(1)(a) RGPD (Consentement)', es: 'Art. 6(1)(a) RGPD (Consentimiento)', it: 'Art. 6(1)(a) GDPR (Consenso)', nl: 'Art. 6(1)(a) AVG (Toestemming)', pl: 'Art. 6(1)(a) RODO (Zgoda)', pt: 'Art. 6(1)(a) RGPD (Consentimento)', da: 'Art. 6(1)(a) GDPR (Samtykke)' , 'ar': "فن. 6(1)(أ) اللائحة العامة لحماية البيانات (الموافقة)", 'bg': "Чл. 6(1)(a) GDPR (Съгласие)", 'bs': "Art. 6(1)(a) GDPR (Saglasnost)", 'ca': "Art. 6(1)(a) GDPR (consentiment)", 'cs': "umění. 6(1)(a) GDPR (Souhlas)", 'el': "Τέχνη. 6(1)(α) GDPR (Συναίνεση)", 'eu': "art. 6(1)(a) GDPR (baimena)", 'fi': "Art. 6(1)(a) GDPR (suostumus)", 'gl': "Art. 6(1)(a) GDPR (Consentimento)", 'he': "אמנות. 6(1)(א) GDPR (הסכמה)", 'hi': "कला. 6(1)(ए) जीडीपीआर (सहमति)", 'hr': "čl. 6(1)(a) GDPR (pristanak)", 'hu': "Art. GDPR 6. cikk (1) bekezdés a) pont (beleegyezés)", 'id': "Seni. 6(1)(a) GDPR (Persetujuan)", 'ja': "アート。 6(1)(a) GDPR (同意)", 'lt': "Art. BDAR 6 straipsnio 1 dalies a punktas (sutikimas)", 'mr': "कला. 6(1)(a) GDPR (संमती)", 'nb': "Art. 6(1)(a) GDPR (samtykke)", 'ro': "art. 6(1)(a) GDPR (Consimțământ)", 'ru': "Искусство. 6(1)(a) GDPR (Согласие)", 'sk': "čl. 6(1)(a) GDPR (Súhlas)", 'sl': "Art. 6(1)(a) GDPR (soglasje)", 'sr': "чл. 6(1)(а) ГДПР (сагласност)", 'sv': "Art. 6(1)(a) GDPR (samtycke)", 'th': "ศิลปะ 6(1)(a) GDPR (ความยินยอม)", 'tr': "Sanat. 6(1)(a) GDPR (Rıza)", 'uk': "ст. 6(1)(a) GDPR (Згода)" , 'vi': "Điều. 6(1)(a) GDPR (Sự đồng ý)", 'zh': "GDPR 第6条第1款(a)项（同意）", 'zh-TW': "GDPR 第6條第1款(a)項（同意）" },
+        recipient: 'Hotjar Ltd., Malta',
+        transferSafeguard: { de: 'Standardvertragsklauseln', en: 'Standard Contractual Clauses', fr: 'Clauses contractuelles types', es: 'Cláusulas contractuales tipo', it: 'Clausole contrattuali standard', nl: 'Standaard contractbepalingen', pl: 'Standardowe klauzule umowne', pt: 'Cláusulas contratuais-tipo', da: 'Standardkontraktbestemmelser' , 'ar': "الشروط التعاقدية القياسية", 'bg': "Стандартни договорни клаузи", 'bs': "Standardne ugovorne klauzule", 'ca': "Clàusules contractuals tipus", 'cs': "Standardní smluvní doložky", 'el': "Τυπικές συμβατικές ρήτρες", 'eu': "Kontratu-klausula estandarrak", 'fi': "Vakiosopimuslausekkeet", 'gl': "Cláusulas contractuais tipo", 'he': "סעיפים חוזיים סטנדרטיים", 'hi': "मानक संविदात्मक धाराएँ", 'hr': "Standardne ugovorne klauzule", 'hu': "Általános szerződési feltételek", 'id': "Klausul Kontrak Standar", 'ja': "標準契約条項", 'lt': "Standartinės sutarties sąlygos", 'mr': "मानक करार कलमे", 'nb': "Standard kontraktsmessige klausuler", 'ro': "Clauze Contractuale Standard", 'ru': "Стандартные договорные условия", 'sk': "Štandardné zmluvné doložky", 'sl': "Standardne pogodbene klavzule", 'sr': "Стандардне уговорне клаузуле", 'sv': "Standardavtalsklausuler", 'th': "ข้อสัญญามาตรฐาน", 'tr': "Standart Sözleşme Maddeleri", 'uk': "Стандартні договірні положення" , 'vi': "Điều khoản hợp đồng tiêu chuẩn", 'zh': "标准合同条款", 'zh-TW': "標準合約條款" }
+      },
+      clarity: {
+        name: 'Microsoft Clarity',
+        patterns: ['clarity.ms'],
+        cookies: ['_clck', '_clsk'],
+        description: { de: 'Nutzerinteraktions-Analyse', en: 'User interaction analysis', fr: "Analyse de l'interaction utilisateur", es: 'Análisis de interacción del usuario', it: "Analisi dell'interazione utente", nl: 'Analyse van gebruikersinteractie', pl: 'Analiza interakcji użytkowników', pt: 'Análise da interação do utilizador', da: 'Analyse af brugerinteraktion' , 'ar': "تحليل تفاعل المستخدم", 'bg': "Анализ на взаимодействието с потребителя", 'bs': "Analiza interakcije korisnika", 'ca': "Anàlisi de la interacció dels usuaris", 'cs': "Analýza interakce s uživatelem", 'el': "Ανάλυση αλληλεπίδρασης χρήστη", 'eu': "Erabiltzaileen interakzioaren azterketa", 'fi': "Käyttäjävuorovaikutuksen analyysi", 'gl': "Análise da interacción do usuario", 'he': "ניתוח אינטראקציות של משתמשים", 'hi': "उपयोगकर्ता इंटरैक्शन विश्लेषण", 'hr': "Analiza interakcije korisnika", 'hu': "Felhasználói interakció elemzése", 'id': "Analisis interaksi pengguna", 'ja': "ユーザーインタラクション分析", 'lt': "Vartotojo sąveikos analizė", 'mr': "वापरकर्ता परस्परसंवाद विश्लेषण", 'nb': "Brukerinteraksjonsanalyse", 'ro': "Analiza interacțiunii cu utilizatorul", 'ru': "Анализ взаимодействия с пользователем", 'sk': "Analýza interakcie používateľa", 'sl': "Analiza interakcije uporabnikov", 'sr': "Анализа интеракције корисника", 'sv': "Analys av användarinteraktion", 'th': "การวิเคราะห์การโต้ตอบของผู้ใช้", 'tr': "Kullanıcı etkileşimi analizi", 'uk': "Аналіз взаємодії з користувачем" , 'vi': "Phân tích tương tác người dùng", 'zh': "用户交互分析", 'zh-TW': "用戶互動分析" },
+        duration: { de: '1 Jahr (_clck), 1 Tag (_clsk)', en: '1 year (_clck), 1 day (_clsk)', fr: '1 an (_clck), 1 jour (_clsk)', es: '1 año (_clck), 1 día (_clsk)', it: '1 anno (_clck), 1 giorno (_clsk)', nl: '1 jaar (_clck), 1 dag (_clsk)', pl: '1 rok (_clck), 1 dzień (_clsk)', pt: '1 ano (_clck), 1 dia (_clsk)', da: '1 år (_clck), 1 dag (_clsk)' , 'ar': "سنة واحدة (_clck)، يوم واحد (_clsk)", 'bg': "1 година (_clck), 1 ден (_clsk)", 'bs': "1 godina (_clck), 1 dan (_clsk)", 'ca': "1 any (_clck), 1 dia (_clsk)", 'cs': "1 rok (_clck), 1 den (_clsk)", 'el': "1 έτος (_clck), 1 ημέρα (_clsk)", 'eu': "1 urte (_clck), 1 egun (_clsk)", 'fi': "1 vuosi (_clck), 1 päivä (_clsk)", 'gl': "1 ano (_clck), 1 día (_clsk)", 'he': "שנה אחת (_clck), יום אחד (_clsk)", 'hi': "1 वर्ष (_clck), 1 दिन (_clsk)", 'hr': "1 godina (_clck), 1 dan (_clsk)", 'hu': "1 év (_clck), 1 nap (_clsk)", 'id': "1 tahun (_clck), 1 hari (_clsk)", 'ja': "1 年 (_clck)、1 日 (_clsk)", 'lt': "1 metai (_clck), 1 diena (_clsk)", 'mr': "1 वर्ष (_clck), 1 दिवस (_clsk)", 'nb': "1 år (_clck), 1 dag (_clsk)", 'ro': "1 an (_clck), 1 zi (_clsk)", 'ru': "1 год (_clck), 1 день (_clsk)", 'sk': "1 rok (_clck), 1 deň (_clsk)", 'sl': "1 leto (_clck), 1 dan (_clsk)", 'sr': "1 година (_цлцк), 1 дан (_цлск)", 'sv': "1 år (_clck), 1 dag (_clsk)", 'th': "1 ปี (_clck), 1 วัน (_clsk)", 'tr': "1 yıl (_clck), 1 gün (_clsk)", 'uk': "1 рік (_clck), 1 день (_clsk)" , 'vi': "1 năm (_clck), 1 ngày (_clsk)", 'zh': "1年（_clck），1天（_clsk）", 'zh-TW': "1 年 (_clck)，1 天 (_clsk)" },
+        purpose: { de: 'Session-Replay und Heatmap-Analyse zur UX-Optimierung', en: 'Session replay and heatmap analysis for UX optimization', fr: 'Replay de session et analyse heatmap pour optimisation UX', es: 'Repetición de sesiones y análisis de mapas de calor para optimización UX', it: 'Replay di sessione e analisi heatmap per ottimizzazione UX', nl: 'Sessie-replay en heatmap-analyse voor UX-optimalisatie', pl: 'Replay sesji i analiza map cieplnych do optymalizacji UX', pt: 'Repetição de sessão e análise heatmap para otimização UX', da: 'Sessionsgenafspilning og heatmap-analyse til UX-optimering' , 'ar': "إعادة تشغيل الجلسة وتحليل خريطة الحرارة لتحسين تجربة المستخدم", 'bg': "Повторение на сесията и анализ на топлинна карта за UX оптимизация", 'bs': "Ponavljanje sesije i analiza toplotne mape za UX optimizaciju", 'ca': "Reproducció de sessions i anàlisi de mapes de calor per a l'optimització d'UX", 'cs': "Přehrání relace a analýza teplotní mapy pro optimalizaci UX", 'el': "Επανάληψη συνεδρίας και ανάλυση χαρτών θερμότητας για βελτιστοποίηση UX", 'eu': "Saioaren errepikapena eta bero-mapen azterketa UX optimizatzeko", 'fi': "Istunnon toisto ja lämpökartta-analyysi UX-optimointia varten", 'gl': "Reprodución de sesións e análise de mapas de calor para a optimización de UX", 'he': "הפעלה חוזרת וניתוח מפת חום לאופטימיזציה של UX", 'hi': "यूएक्स अनुकूलन के लिए सत्र रीप्ले और हीटमैप विश्लेषण", 'hr': "Ponavljanje sesije i analiza toplinske karte za optimizaciju korisničkog doživljaja", 'hu': "Munkamenet-visszajátszás és hőtérkép elemzés az UX optimalizálásához", 'id': "Pemutaran ulang sesi dan analisis peta panas untuk pengoptimalan UX", 'ja': "セッションリプレイとヒートマップ分析によるUX最適化", 'lt': "Seanso atkūrimas ir šilumos žemėlapio analizė UX optimizavimui", 'mr': "UX ऑप्टिमायझेशनसाठी सत्र रीप्ले आणि हीटमॅप विश्लेषण", 'nb': "Sesjonsavspilling og varmekartanalyse for UX-optimalisering", 'ro': "Reluarea sesiunii și analiza hărții termice pentru optimizarea UX", 'ru': "Воспроизведение сеанса и анализ тепловой карты для оптимизации UX", 'sk': "Prehrávanie relácie a analýza teplotnej mapy pre optimalizáciu UX", 'sl': "Ponovno predvajanje seje in analiza toplotnega zemljevida za optimizacijo UX", 'sr': "Понављање сесије и анализа топлотне мапе за оптимизацију корисничког искуства", 'sv': "Session replay och heatmap-analys för UX-optimering", 'th': "การเล่นซ้ำเซสชันและการวิเคราะห์แผนที่ความร้อนเพื่อการเพิ่มประสิทธิภาพ UX", 'tr': "UX optimizasyonu için oturum tekrarı ve ısı haritası analizi", 'uk': "Відтворення сесії та аналіз теплової карти для оптимізації UX" , 'vi': "Phát lại phiên và phân tích bản đồ nhiệt để tối ưu hóa UX", 'zh': "会话重播和热图分析以优化用户体验", 'zh-TW': "用於使用者經驗優化的會話重播和熱點圖分析" },
+        legalBasis: { de: 'Art. 6 Abs. 1 lit. a DSGVO (Einwilligung)', en: 'Art. 6(1)(a) GDPR (Consent)', fr: 'Art. 6(1)(a) RGPD (Consentement)', es: 'Art. 6(1)(a) RGPD (Consentimiento)', it: 'Art. 6(1)(a) GDPR (Consenso)', nl: 'Art. 6(1)(a) AVG (Toestemming)', pl: 'Art. 6(1)(a) RODO (Zgoda)', pt: 'Art. 6(1)(a) RGPD (Consentimento)', da: 'Art. 6(1)(a) GDPR (Samtykke)' , 'ar': "فن. 6(1)(أ) اللائحة العامة لحماية البيانات (الموافقة)", 'bg': "Чл. 6(1)(a) GDPR (Съгласие)", 'bs': "Art. 6(1)(a) GDPR (Saglasnost)", 'ca': "Art. 6(1)(a) GDPR (consentiment)", 'cs': "umění. 6(1)(a) GDPR (Souhlas)", 'el': "Τέχνη. 6(1)(α) GDPR (Συναίνεση)", 'eu': "art. 6(1)(a) GDPR (baimena)", 'fi': "Art. 6(1)(a) GDPR (suostumus)", 'gl': "Art. 6(1)(a) GDPR (Consentimento)", 'he': "אמנות. 6(1)(א) GDPR (הסכמה)", 'hi': "कला. 6(1)(ए) जीडीपीआर (सहमति)", 'hr': "čl. 6(1)(a) GDPR (pristanak)", 'hu': "Art. GDPR 6. cikk (1) bekezdés a) pont (beleegyezés)", 'id': "Seni. 6(1)(a) GDPR (Persetujuan)", 'ja': "アート。 6(1)(a) GDPR (同意)", 'lt': "Art. BDAR 6 straipsnio 1 dalies a punktas (sutikimas)", 'mr': "कला. 6(1)(a) GDPR (संमती)", 'nb': "Art. 6(1)(a) GDPR (samtykke)", 'ro': "art. 6(1)(a) GDPR (Consimțământ)", 'ru': "Искусство. 6(1)(a) GDPR (Согласие)", 'sk': "čl. 6(1)(a) GDPR (Súhlas)", 'sl': "Art. 6(1)(a) GDPR (soglasje)", 'sr': "чл. 6(1)(а) ГДПР (сагласност)", 'sv': "Art. 6(1)(a) GDPR (samtycke)", 'th': "ศิลปะ 6(1)(a) GDPR (ความยินยอม)", 'tr': "Sanat. 6(1)(a) GDPR (Rıza)", 'uk': "ст. 6(1)(a) GDPR (Згода)" , 'vi': "Điều. 6(1)(a) GDPR (Sự đồng ý)", 'zh': "GDPR 第6条第1款(a)项（同意）", 'zh-TW': "GDPR 第6條第1款(a)項（同意）" },
+        recipient: 'Microsoft Corporation, USA',
+        euEntity: { recipient: 'Microsoft Ireland Operations Ltd.', vendorLocation: 'One Microsoft Place, South County Business Park, Leopardstown, Dublin 18, Ireland' },
+        transferSafeguard: { de: 'EU-US Data Privacy Framework', en: 'EU-US Data Privacy Framework', fr: 'EU-US Data Privacy Framework', es: 'EU-US Data Privacy Framework', it: 'EU-US Data Privacy Framework', nl: 'EU-US Data Privacy Framework', pl: 'EU-US Data Privacy Framework', pt: 'EU-US Data Privacy Framework', da: 'EU-US Data Privacy Framework' , 'ar': "إطار خصوصية البيانات بين الاتحاد الأوروبي والولايات المتحدة", 'bg': "Рамка за поверителност на данните между ЕС и САЩ", 'bs': "EU-US Data Privacy Framework", 'ca': "Marc de privadesa de dades UE-EUA", 'cs': "Rámec ochrany osobních údajů mezi EU a USA", 'el': "Πλαίσιο απορρήτου δεδομένων ΕΕ-ΗΠΑ", 'eu': "EB-AEB Datuen Pribatutasun Esparrua", 'fi': "EU:n ja Yhdysvaltojen välinen tietosuojakehys", 'gl': "Marco de privacidade de datos UE-EUA", 'he': "מסגרת פרטיות נתונים של האיחוד האירופי-ארה\"ב", 'hi': "ईयू-यूएस डेटा गोपनीयता ढांचा", 'hr': "EU-SAD okvir za zaštitu privatnosti podataka", 'hu': "EU-USA adatvédelmi keretrendszer", 'id': "Kerangka Privasi Data UE-AS", 'ja': "EU-US データプライバシーフレームワーク", 'lt': "ES ir JAV duomenų privatumo sistema", 'mr': "EU-US डेटा गोपनीयता फ्रेमवर्क", 'nb': "EU-US Data Privacy Framework", 'ro': "Cadrul UE-SUA privind confidențialitatea datelor", 'ru': "Рамочная программа конфиденциальности данных ЕС-США", 'sk': "Rámec ochrany osobných údajov medzi EÚ a USA", 'sl': "EU-ZDA okvir zasebnosti podatkov", 'sr': "Оквир приватности података ЕУ-САД", 'sv': "EU-US Data Privacy Framework", 'th': "กรอบความเป็นส่วนตัวของข้อมูลในสหภาพยุโรปและสหรัฐอเมริกา", 'tr': "AB-ABD Veri Gizliliği Çerçevesi", 'uk': "Конфіденційність даних між ЄС і США" , 'vi': "Khung bảo mật dữ liệu EU-Hoa Kỳ", 'zh': "欧盟-美国数据隐私框架", 'zh-TW': "歐盟－美國數據隱私框架" }
+      },
+      matomo: {
+        name: 'Matomo',
+        patterns: ['matomo', 'piwik'],
+        cookies: ['_pk_id', '_pk_ses'],
+        description: { de: 'Datenschutzfreundliche Webanalyse', en: 'Privacy-friendly web analytics', fr: 'Analyse web respectueuse de la vie privée', es: 'Análisis web respetuoso con la privacidad', it: 'Analisi web rispettosa della privacy', nl: 'Privacyvriendelijke webanalyse', pl: 'Analityka internetowa przyjazna prywatności', pt: 'Análise web respeitosa da privacidade', da: 'Privatlivsvenlig webanalyse' , 'ar': "تحليلات الويب الصديقة للخصوصية", 'bg': "Удобен за поверителност уеб анализ", 'bs': "Web analitika prilagođena privatnosti", 'ca': "Analítica web amigable amb la privadesa", 'cs': "Webová analytika šetrná k soukromí", 'el': "Αναλυτικά στοιχεία Ιστού φιλικά προς το απόρρητο", 'eu': "Pribatutasuna errespetatzen duen web analitika", 'fi': "Tietosuojaystävällinen verkkoanalytiikka", 'gl': "Analítica web amigable coa privacidade", 'he': "ניתוח אינטרנט ידידותי לפרטיות", 'hi': "गोपनीयता-अनुकूल वेब विश्लेषण", 'hr': "Web analitika koja štiti privatnost", 'hu': "Adatvédelem-barát webelemzés", 'id': "Analisis web yang ramah privasi", 'ja': "プライバシーに配慮したウェブ分析", 'lt': "Privatumui palanki žiniatinklio analizė", 'mr': "गोपनीयता-अनुकूल वेब विश्लेषणे", 'nb': "Personvernvennlig nettanalyse", 'ro': "Analize web prietenoase cu confidențialitatea", 'ru': "Веб-аналитика, безопасная для конфиденциальности", 'sk': "Webová analýza šetrná k ochrane osobných údajov", 'sl': "Zasebnosti prijazna spletna analitika", 'sr': "Веб аналитика прилагођена приватности", 'sv': "Sekretessvänlig webbanalys", 'th': "การวิเคราะห์เว็บที่เป็นมิตรกับความเป็นส่วนตัว", 'tr': "Gizlilik dostu web analitiği", 'uk': "Конфіденційна веб-аналітика" , 'vi': "Phân tích web thân thiện với quyền riêng tư", 'zh': "注重隐私的网页分析", 'zh-TW': "注重隱私的網頁分析" },
+        duration: { de: '13 Monate (_pk_id), 30 Minuten (_pk_ses)', en: '13 months (_pk_id), 30 minutes (_pk_ses)', fr: '13 mois (_pk_id), 30 minutes (_pk_ses)', es: '13 meses (_pk_id), 30 minutos (_pk_ses)', it: '13 mesi (_pk_id), 30 minuti (_pk_ses)', nl: '13 maanden (_pk_id), 30 minuten (_pk_ses)', pl: '13 miesięcy (_pk_id), 30 minut (_pk_ses)', pt: '13 meses (_pk_id), 30 minutos (_pk_ses)', da: '13 måneder (_pk_id), 30 minutter (_pk_ses)' , 'ar': "13 شهرًا (_pk_id)، 30 دقيقة (_pk_ses)", 'bg': "13 месеца (_pk_id), 30 минути (_pk_ses)", 'bs': "13 mjeseci (_pk_id), 30 minuta (_pk_ses)", 'ca': "13 mesos (_pk_id), 30 minuts (_pk_ses)", 'cs': "13 měsíců (_pk_id), 30 minut (_pk_ses)", 'el': "13 μήνες (_pk_id), 30 λεπτά (_pk_ses)", 'eu': "13 hilabete (_pk_id), 30 minutu (_pk_ses)", 'fi': "13 kuukautta (_pk_id), 30 minuuttia (_pk_ses)", 'gl': "13 meses (_pk_id), 30 minutos (_pk_ses)", 'he': "13 חודשים (_pk_id), 30 דקות (_pk_ses)", 'hi': "13 महीने (_pk_id), 30 मिनट (_pk_ses)", 'hr': "13 mjeseci (_pk_id), 30 minuta (_pk_ses)", 'hu': "13 hónap (_pk_id), 30 perc (_pk_ses)", 'id': "13 bulan (_pk_id), 30 menit (_pk_ses)", 'ja': "13 か月 (_pk_id)、30 分 (_pk_ses)", 'lt': "13 mėnesių (_pk_id), 30 minučių (_pk_ses)", 'mr': "13 महिने (_pk_id), 30 मिनिटे (_pk_ses)", 'nb': "13 måneder (_pk_id), 30 minutter (_pk_ses)", 'ro': "13 luni (_pk_id), 30 de minute (_pk_ses)", 'ru': "13 месяцев (_pk_id), 30 минут (_pk_ses)", 'sk': "13 mesiacov (_pk_id), 30 minút (_pk_ses)", 'sl': "13 mesecev (_pk_id), 30 minut (_pk_ses)", 'sr': "13 месеци (_пк_ид), 30 минута (_пк_сес)", 'sv': "13 månader (_pk_id), 30 minuter (_pk_ses)", 'th': "13 เดือน (_pk_id), 30 นาที (_pk_ses)", 'tr': "13 ay (_pk_id), 30 dakika (_pk_ses)", 'uk': "13 місяців (_pk_id), 30 хвилин (_pk_ses)" , 'vi': "13 tháng (_pk_id), 30 phút (_pk_ses)", 'zh': "13个月 (_pk_id)，30分钟 (_pk_ses)", 'zh-TW': "13 個月 (_pk_id)，30 分鐘 (_pk_ses)" },
+        purpose: { de: 'Anonymisierte Besucherstatistiken', en: 'Anonymized visitor statistics', fr: 'Statistiques anonymisées des visiteurs', es: 'Estadísticas anónimas de visitantes', it: 'Statistiche anonime dei visitatori', nl: 'Geanonimiseerde bezoekersstatistieken', pl: 'Zanonimizowane statystyki odwiedzających', pt: 'Estatísticas anonimizadas de visitantes', da: 'Anonymiserede besøgsstatistikker' , 'ar': "إحصائيات الزوار المجهولين", 'bg': "Анонимна статистика на посетителите", 'bs': "Anonimizirana statistika posjetitelja", 'ca': "Estadístiques de visitants anònimes", 'cs': "Anonymizované statistiky návštěvníků", 'el': "Ανώνυμα στατιστικά επισκεπτών", 'eu': "Bisitarien estatistikak anonimizatuak", 'fi': "Anonymisoidut kävijätilastot", 'gl': "Estatísticas de visitantes anónimas", 'he': "סטטיסטיקות מבקרים אנונימיות", 'hi': "अज्ञात आगंतुक आँकड़े", 'hr': "Anonimizirana statistika posjetitelja", 'hu': "Anonimizált látogatói statisztikák", 'id': "Statistik pengunjung yang dianonimkan", 'ja': "匿名化された訪問者の統計", 'lt': "Anonimizuota lankytojų statistika", 'mr': "अनामित अभ्यागतांची आकडेवारी", 'nb': "Anonymisert besøksstatistikk", 'ro': "Statistici anonimizate ale vizitatorilor", 'ru': "Анонимная статистика посещений", 'sk': "Anonymizované štatistiky návštevníkov", 'sl': "Anonimizirana statistika obiskovalcev", 'sr': "Анонимизована статистика посетилаца", 'sv': "Anonymiserad besöksstatistik", 'th': "สถิติผู้เยี่ยมชมที่ไม่ระบุชื่อ", 'tr': "Anonimleştirilmiş ziyaretçi istatistikleri", 'uk': "Анонімна статистика відвідувачів" , 'vi': "Thống kê khách truy cập ẩn danh", 'zh': "匿名访问者统计", 'zh-TW': "匿名訪客統計" },
+        legalBasis: { de: 'Art. 6 Abs. 1 lit. f DSGVO (berechtigtes Interesse) bei Anonymisierung, sonst lit. a', en: 'Art. 6(1)(f) GDPR (legitimate interest) with anonymization, otherwise (a)', fr: 'Art. 6(1)(f) RGPD (intérêt légitime) avec anonymisation, sinon (a)', es: 'Art. 6(1)(f) RGPD (interés legítimo) con anonimización, de lo contrario (a)', it: 'Art. 6(1)(f) GDPR (interesse legittimo) con anonimizzazione, altrimenti (a)', nl: 'Art. 6(1)(f) AVG (gerechtvaardigd belang) bij anonimisering, anders (a)', pl: 'Art. 6(1)(f) RODO (uzasadniony interes) przy anonimizacji, inaczej (a)', pt: 'Art. 6(1)(f) RGPD (interesse legítimo) com anonimização, caso contrário (a)', da: 'Art. 6(1)(f) GDPR (berettiget interesse) med anonymisering, ellers (a)' , 'ar': "فن. 6(1)(و) القانون العام لحماية البيانات (المصلحة المشروعة) مع إخفاء الهوية، وإلا (أ)", 'bg': "Чл. 6(1)(f) GDPR (легитимен интерес) с анонимизиране, в противен случай (a)", 'bs': "Art. 6(1)(f) GDPR (legitimni interes) sa anonimizacijom, u suprotnom (a)", 'ca': "Art. 6(1)(f) GDPR (interès legítim) amb anonimització, en cas contrari (a)", 'cs': "umění. 6(1)(f) GDPR (oprávněný zájem) s anonymizací, jinak (a)", 'el': "Τέχνη. 6(1)(στ) GDPR (νόμιμο συμφέρον) με ανωνυμοποίηση, διαφορετικά (α)", 'eu': "art. 6(1)(f) GDPR (interes legitimoa) anonimoarekin, bestela (a)", 'fi': "Art. 6(1)(f) GDPR (oikeutettu etu) anonymisoituna, muuten (a)", 'gl': "Art. 6(1)(f) GDPR (interese lexítimo) con anonimización, en caso contrario (a)", 'he': "אמנות. 6(1)(ו) GDPR (אינטרס לגיטימי) עם אנונימיזציה, אחרת (א)", 'hi': "कला. 6(1)(एफ) जीडीपीआर (वैध हित) गुमनामीकरण के साथ, अन्यथा (ए)", 'hr': "čl. 6(1)(f) GDPR (legitimni interes) s anonimizacijom, inače (a)", 'hu': "Art. 6(1)(f) GDPR (jogos érdek) anonimizálással, egyébként (a)", 'id': "Seni. 6(1)(f) GDPR (kepentingan sah) dengan anonimisasi, jika tidak (a)", 'ja': "アート。 6(1)(f) 匿名化を伴う GDPR (正当な利益)、それ以外の場合 (a)", 'lt': "Art. 6(1)(f) BDAR (teisėtas interesas) su anonimiškumu, kitu atveju (a)", 'mr': "कला. 6(1)(f) निनावीपणासह GDPR (कायदेशीर व्याज), अन्यथा (a)", 'nb': "Art. 6(1)(f) GDPR (legitim interesse) med anonymisering, ellers (a)", 'ro': "art. 6(1)(f) GDPR (interes legitim) cu anonimizare, în caz contrar (a)", 'ru': "Искусство. 6(1)(f) GDPR (законный интерес) с анонимизацией, в противном случае (a)", 'sk': "čl. 6(1)(f) GDPR (oprávnený záujem) s anonymizáciou, inak (a)", 'sl': "Art. 6(1)(f) GDPR (legitimni interes) z anonimizacijo, sicer (a)", 'sr': "чл. 6(1)(ф) ГДПР (легитимни интерес) са анонимизацијом, у супротном (а)", 'sv': "Art. 6(1)(f) GDPR (legitimt intresse) med anonymisering, annars (a)", 'th': "ศิลปะ 6(1)(f) GDPR (ประโยชน์โดยชอบด้วยกฎหมาย) พร้อมการลบข้อมูลระบุตัวตน มิฉะนั้น (a)", 'tr': "Sanat. 6(1)(f) GDPR (meşru menfaat) anonimleştirmeyle birlikte, aksi takdirde (a)", 'uk': "ст. 6(1)(f) GDPR (законний інтерес) з анонімізацією, інакше (a)" , 'vi': "Nghệ thuật. 6(1)(f) GDPR (lợi ích hợp pháp) với ẩn danh, nếu không (a)", 'zh': "第6条第1款(f) GDPR（合法利益）与匿名化，否则(a)", 'zh-TW': "GDPR第6條第1款(f)項（合法利益）搭配匿名化，否則為(a)" },
+        recipient: { de: 'Eigener Server / Matomo Cloud', en: 'Own server / Matomo Cloud', fr: 'Serveur propre / Matomo Cloud', es: 'Servidor propio / Matomo Cloud', it: 'Server proprio / Matomo Cloud', nl: 'Eigen server / Matomo Cloud', pl: 'Własny serwer / Matomo Cloud', pt: 'Servidor próprio / Matomo Cloud', da: 'Egen server / Matomo Cloud' , 'ar': "الخادم الخاص / Matomo Cloud", 'bg': "Собствен сървър / Matomo Cloud", 'bs': "Vlastiti server / Matomo Cloud", 'ca': "Servidor propi / Matomo Cloud", 'cs': "Vlastní server / Matomo Cloud", 'el': "Ιδιος διακομιστής / Matomo Cloud", 'eu': "Zerbitzari propioa / Matomo Cloud", 'fi': "Oma palvelin / Matomo Cloud", 'gl': "Servidor propio / Matomo Cloud", 'he': "שרת משלו / Matomo Cloud", 'hi': "स्वयं का सर्वर/माटोमो क्लाउड", 'hr': "Vlastiti poslužitelj / Matomo Cloud", 'hu': "Saját szerver / Matomo Cloud", 'id': "Server sendiri / Matomo Cloud", 'ja': "独自サーバー / Piwik クラウド", 'lt': "Nuosavas serveris / Matomo Cloud", 'mr': "स्वतःचा सर्व्हर / Matomo क्लाउड", 'nb': "Egen server / Matomo Cloud", 'ro': "Server propriu / Matomo Cloud", 'ru': "Собственный сервер / Matomo Cloud", 'sk': "Vlastný server / Matomo Cloud", 'sl': "Lasten strežnik / Matomo Cloud", 'sr': "Сопствени сервер / Матомо Цлоуд", 'sv': "Egen server / Matomo Cloud", 'th': "เซิร์ฟเวอร์ของตัวเอง / Matomo Cloud", 'tr': "Kendi sunucusu / Matomo Cloud", 'uk': "Власний сервер / Matomo Cloud" , 'vi': "Máy chủ riêng / Matomo Cloud", 'zh': "自有服务器 / Matomo 云", 'zh-TW': "自建伺服器 / Matomo 雲端" },
+        transferSafeguard: { de: 'Datenverarbeitung in der EU möglich', en: 'Data processing in the EU possible', fr: 'Traitement des données dans l\'UE possible', es: 'Procesamiento de datos en la UE posible', it: 'Trattamento dei dati nell\'UE possibile', nl: 'Gegevensverwerking in de EU mogelijk', pl: 'Przetwarzanie danych w UE możliwe', pt: 'Processamento de dados na UE possível', da: 'Databehandling i EU muligt' , 'ar': "معالجة البيانات في الاتحاد الأوروبي ممكنة", 'bg': "Възможност за обработка на данни в ЕС", 'bs': "Moguća obrada podataka u EU", 'ca': "Tractament de dades possible a la UE", 'cs': "Zpracování dat v EU možné", 'el': "Δυνατότητα επεξεργασίας δεδομένων στην ΕΕ", 'eu': "Datuen tratamendua EBn posible", 'fi': "Tietojen käsittely EU:ssa mahdollista", 'gl': "O tratamento de datos é posible na UE", 'he': "עיבוד נתונים באיחוד האירופי אפשרי", 'hi': "ईयू में डेटा प्रोसेसिंग संभव", 'hr': "Moguća obrada podataka u EU", 'hu': "Adatkezelés az EU-ban lehetséges", 'id': "Pemrosesan data di UE dimungkinkan", 'ja': "EU内でのデータ処理が可能", 'lt': "Galimas duomenų tvarkymas ES", 'mr': "EU मध्ये डेटा प्रोसेसिंग शक्य आहे", 'nb': "Databehandling i EU mulig", 'ro': "Este posibilă prelucrarea datelor în UE", 'ru': "Возможна обработка данных в ЕС", 'sk': "Spracovanie údajov v EÚ možné", 'sl': "Možna obdelava podatkov v EU", 'sr': "Могућа обрада података у ЕУ", 'sv': "Databehandling inom EU möjlig", 'th': "การประมวลผลข้อมูลในสหภาพยุโรปเป็นไปได้", 'tr': "AB'de veri işleme mümkün", 'uk': "Можлива обробка даних в ЄС" , 'vi': "Có thể xử lý dữ liệu ở EU", 'zh': "欧盟内的数据处理是可能的", 'zh-TW': "在歐盟內可能進行資料處理" }
+      }
+    },
+    marketing: {
+      meta: {
+        name: 'Meta (Facebook/Instagram)',
+        patterns: ['facebook.net', 'fbevents', 'connect.facebook', 'facebook.com/tr'],
+        cookies: ['_fbp', '_fbc', 'fr'],
+        description: { de: 'Werbung und Remarketing', en: 'Advertising and remarketing', fr: 'Publicité et remarketing', es: 'Publicidad y remarketing', it: 'Pubblicità e remarketing', nl: 'Advertenties en remarketing', pl: 'Reklama i remarketing', pt: 'Publicidade e remarketing', da: 'Annoncering og remarketing' , 'ar': "الإعلان وتجديد النشاط التسويقي", 'bg': "Реклама и ремаркетинг", 'bs': "Oglašavanje i remarketing", 'ca': "Publicitat i remàrqueting", 'cs': "Reklama a remarketing", 'el': "Διαφήμιση και επαναληπτικό μάρκετινγκ", 'eu': "Publizitatea eta birmarketina", 'fi': "Mainonta ja uudelleenmarkkinointi", 'gl': "Publicidade e remarketing", 'he': "פרסום ושיווק מחדש", 'hi': "विज्ञापन और रीमार्केटिंग", 'hr': "Oglašavanje i remarketing", 'hu': "Reklámozás és remarketing", 'id': "Periklanan dan pemasaran ulang", 'ja': "広告とリマーケティング", 'lt': "Reklama ir pakartotinė rinkodara", 'mr': "जाहिरात आणि रीमार्केटिंग", 'nb': "Annonsering og remarketing", 'ro': "Publicitate și remarketing", 'ru': "Реклама и ремаркетинг", 'sk': "Reklama a remarketing", 'sl': "Oglaševanje in ponovno trženje", 'sr': "Оглашавање и поновно оглашавање", 'sv': "Reklam och remarketing", 'th': "การโฆษณาและรีมาร์เก็ตติ้ง", 'tr': "Reklamcılık ve yeniden pazarlama", 'uk': "Реклама та ремаркетинг" , 'vi': "Quảng cáo và tiếp thị lại", 'zh': "广告与再营销", 'zh-TW': "廣告與再行銷" },
+        duration: { de: '3 Monate (_fbp, _fbc), 90 Tage (fr)', en: '3 months (_fbp, _fbc), 90 days (fr)', fr: '3 mois (_fbp, _fbc), 90 jours (fr)', es: '3 meses (_fbp, _fbc), 90 días (fr)', it: '3 mesi (_fbp, _fbc), 90 giorni (fr)', nl: '3 maanden (_fbp, _fbc), 90 dagen (fr)', pl: '3 miesiące (_fbp, _fbc), 90 dni (fr)', pt: '3 meses (_fbp, _fbc), 90 dias (fr)', da: '3 måneder (_fbp, _fbc), 90 dage (fr)' , 'ar': "3 أشهر (_fbp، _fbc)، 90 يومًا (بالفرنسية)", 'bg': "3 месеца (_fbp, _fbc), 90 дни (fr)", 'bs': "3 mjeseca (_fbp, _fbc), 90 dana (fr)", 'ca': "3 mesos (_fbp, _fbc), 90 dies (fr)", 'cs': "3 měsíce (_fbp, _fbc), 90 dní (fr)", 'el': "3 μήνες (_fbp, _fbc), 90 ημέρες (fr)", 'eu': "3 hilabete (_fbp, _fbc), 90 egun (fr)", 'fi': "3 kuukautta (_fbp, _fbc), 90 päivää (fr)", 'gl': "3 meses (_fbp, _fbc), 90 días (fr)", 'he': "3 חודשים (_fbp, _fbc), 90 ימים (fr)", 'hi': "3 महीने (_fbp, _fbc), 90 दिन (fr)", 'hr': "3 mjeseca (_fbp, _fbc), 90 dana (fr)", 'hu': "3 hónap (_fbp, _fbc), 90 nap (fr)", 'id': "3 bulan (_fbp, _fbc), 90 hari (fr)", 'ja': "3 か月 (_fbp、_fbc)、90 日 (fr)", 'lt': "3 mėnesiai (_fbp, _fbc), 90 dienų (fr)", 'mr': "3 महिने (_fbp, _fbc), 90 दिवस (fr)", 'nb': "3 måneder (_fbp, _fbc), 90 dager (fr)", 'ro': "3 luni (_fbp, _fbc), 90 de zile (fr)", 'ru': "3 месяца (_fbp, _fbc), 90 дней (фр)", 'sk': "3 mesiace (_fbp, _fbc), 90 dní (fr)", 'sl': "3 meseci (_fbp, _fbc), 90 dni (fr)", 'sr': "3 месеца (_фбп, _фбц), 90 дана (фр)", 'sv': "3 månader (_fbp, _fbc), 90 dagar (fr)", 'th': "3 เดือน (_fbp, _fbc), 90 วัน (fr)", 'tr': "3 ay (_fbp, _fbc), 90 gün (fr)", 'uk': "3 місяці (_fbp, _fbc), 90 днів (fr)" , 'vi': "3 tháng (_fbp, _fbc), 90 ngày (fr)", 'zh': "3个月（_fbp, _fbc），90天（fr）", 'zh-TW': "3 個月 (_fbp、_fbc)、90 天 (fr)" },
+        purpose: { de: 'Conversion-Tracking, Remarketing und Zielgruppenbildung', en: 'Conversion tracking, remarketing and audience building', fr: 'Suivi des conversions, remarketing et ciblage', es: 'Seguimiento de conversiones, remarketing y segmentación', it: 'Tracciamento conversioni, remarketing e targeting', nl: 'Conversietracking, remarketing en doelgroepvorming', pl: 'Śledzenie konwersji, remarketing i budowanie grup docelowych', pt: 'Rastreamento de conversões, remarketing e segmentação', da: 'Konverteringssporing, remarketing og målgruppeopbygning' , 'ar': "تتبع التحويل وتجديد النشاط التسويقي وبناء الجمهور", 'bg': "Проследяване на реализациите, ремаркетинг и изграждане на аудитория", 'bs': "Praćenje konverzija, remarketing i izgradnja publike", 'ca': "Seguiment de conversions, remàrqueting i creació de públic", 'cs': "Sledování konverzí, remarketing a budování publika", 'el': "Παρακολούθηση μετατροπών, επαναληπτικό μάρκετινγκ και δημιουργία κοινού", 'eu': "Bihurketen jarraipena, birmarketina eta audientzia sortzea", 'fi': "Tulosseuranta, uudelleenmarkkinointi ja yleisön kasvattaminen", 'gl': "Seguimento de conversións, remarketing e creación de público", 'he': "מעקב המרות, שיווק מחדש ובניית קהל", 'hi': "रूपांतरण ट्रैकिंग, रीमार्केटिंग और दर्शक निर्माण", 'hr': "Praćenje konverzija, remarketing i stvaranje publike", 'hu': "Konverziókövetés, remarketing és közönségépítés", 'id': "Pelacakan konversi, pemasaran ulang, dan pembangunan pemirsa", 'ja': "コンバージョントラッキング、リマーケティング、オーディエンス構築", 'lt': "Konversijų stebėjimas, pakartotinė rinkodara ir auditorijos formavimas", 'mr': "रूपांतरण ट्रॅकिंग, रीमार्केटिंग आणि प्रेक्षक बिल्डिंग", 'nb': "Konverteringssporing, remarketing og målgruppebygging", 'ro': "Urmărirea conversiilor, remarketing și crearea de public", 'ru': "Отслеживание конверсий, ремаркетинг и формирование аудитории", 'sk': "Sledovanie konverzií, remarketing a budovanie publika", 'sl': "Sledenje konverzijam, ponovno trženje in pridobivanje občinstva", 'sr': "Праћење конверзија, поновно оглашавање и изградња публике", 'sv': "Konverteringsspårning, remarketing och målgruppsbyggande", 'th': "การติดตามคอนเวอร์ชัน รีมาร์เก็ตติ้ง และการสร้างกลุ่มเป้าหมาย", 'tr': "Dönüşüm izleme, yeniden pazarlama ve kitle oluşturma", 'uk': "Відстеження конверсій, ремаркетинг і формування аудиторії" , 'vi': "Theo dõi chuyển đổi, tiếp thị lại và xây dựng đối tượng", 'zh': "转化跟踪、再营销和受众构建", 'zh-TW': "轉換追蹤、再行銷與受眾建立" },
+        legalBasis: { de: 'Art. 6 Abs. 1 lit. a DSGVO (Einwilligung)', en: 'Art. 6(1)(a) GDPR (Consent)', fr: 'Art. 6(1)(a) RGPD (Consentement)', es: 'Art. 6(1)(a) RGPD (Consentimiento)', it: 'Art. 6(1)(a) GDPR (Consenso)', nl: 'Art. 6(1)(a) AVG (Toestemming)', pl: 'Art. 6(1)(a) RODO (Zgoda)', pt: 'Art. 6(1)(a) RGPD (Consentimento)', da: 'Art. 6(1)(a) GDPR (Samtykke)' , 'ar': "فن. 6(1)(أ) اللائحة العامة لحماية البيانات (الموافقة)", 'bg': "Чл. 6(1)(a) GDPR (Съгласие)", 'bs': "Art. 6(1)(a) GDPR (Saglasnost)", 'ca': "Art. 6(1)(a) GDPR (consentiment)", 'cs': "umění. 6(1)(a) GDPR (Souhlas)", 'el': "Τέχνη. 6(1)(α) GDPR (Συναίνεση)", 'eu': "art. 6(1)(a) GDPR (baimena)", 'fi': "Art. 6(1)(a) GDPR (suostumus)", 'gl': "Art. 6(1)(a) GDPR (Consentimento)", 'he': "אמנות. 6(1)(א) GDPR (הסכמה)", 'hi': "कला. 6(1)(ए) जीडीपीआर (सहमति)", 'hr': "čl. 6(1)(a) GDPR (pristanak)", 'hu': "Art. GDPR 6. cikk (1) bekezdés a) pont (beleegyezés)", 'id': "Seni. 6(1)(a) GDPR (Persetujuan)", 'ja': "アート。 6(1)(a) GDPR (同意)", 'lt': "Art. BDAR 6 straipsnio 1 dalies a punktas (sutikimas)", 'mr': "कला. 6(1)(a) GDPR (संमती)", 'nb': "Art. 6(1)(a) GDPR (samtykke)", 'ro': "art. 6(1)(a) GDPR (Consimțământ)", 'ru': "Искусство. 6(1)(a) GDPR (Согласие)", 'sk': "čl. 6(1)(a) GDPR (Súhlas)", 'sl': "Art. 6(1)(a) GDPR (soglasje)", 'sr': "чл. 6(1)(а) ГДПР (сагласност)", 'sv': "Art. 6(1)(a) GDPR (samtycke)", 'th': "ศิลปะ 6(1)(a) GDPR (ความยินยอม)", 'tr': "Sanat. 6(1)(a) GDPR (Rıza)", 'uk': "ст. 6(1)(a) GDPR (Згода)" , 'vi': "Điều. 6(1)(a) GDPR (Sự đồng ý)", 'zh': "GDPR 第6条第1款(a)项（同意）", 'zh-TW': "GDPR 第6條第1款(a)項（同意）" },
+        recipient: 'Meta Platforms Ireland Ltd. / Meta Platforms Inc., USA',
+        euEntity: { recipient: 'Meta Platforms Ireland Ltd.', vendorLocation: '4 Grand Canal Square, Dublin 2, Ireland' },
+        transferSafeguard: { de: 'EU-US Data Privacy Framework', en: 'EU-US Data Privacy Framework', fr: 'EU-US Data Privacy Framework', es: 'EU-US Data Privacy Framework', it: 'EU-US Data Privacy Framework', nl: 'EU-US Data Privacy Framework', pl: 'EU-US Data Privacy Framework', pt: 'EU-US Data Privacy Framework', da: 'EU-US Data Privacy Framework' , 'ar': "إطار خصوصية البيانات بين الاتحاد الأوروبي والولايات المتحدة", 'bg': "Рамка за поверителност на данните между ЕС и САЩ", 'bs': "EU-US Data Privacy Framework", 'ca': "Marc de privadesa de dades UE-EUA", 'cs': "Rámec ochrany osobních údajů mezi EU a USA", 'el': "Πλαίσιο απορρήτου δεδομένων ΕΕ-ΗΠΑ", 'eu': "EB-AEB Datuen Pribatutasun Esparrua", 'fi': "EU:n ja Yhdysvaltojen välinen tietosuojakehys", 'gl': "Marco de privacidade de datos UE-EUA", 'he': "מסגרת פרטיות נתונים של האיחוד האירופי-ארה\"ב", 'hi': "ईयू-यूएस डेटा गोपनीयता ढांचा", 'hr': "EU-SAD okvir za zaštitu privatnosti podataka", 'hu': "EU-USA adatvédelmi keretrendszer", 'id': "Kerangka Privasi Data UE-AS", 'ja': "EU-US データプライバシーフレームワーク", 'lt': "ES ir JAV duomenų privatumo sistema", 'mr': "EU-US डेटा गोपनीयता फ्रेमवर्क", 'nb': "EU-US Data Privacy Framework", 'ro': "Cadrul UE-SUA privind confidențialitatea datelor", 'ru': "Рамочная программа конфиденциальности данных ЕС-США", 'sk': "Rámec ochrany osobných údajov medzi EÚ a USA", 'sl': "EU-ZDA okvir zasebnosti podatkov", 'sr': "Оквир приватности података ЕУ-САД", 'sv': "EU-US Data Privacy Framework", 'th': "กรอบความเป็นส่วนตัวของข้อมูลในสหภาพยุโรปและสหรัฐอเมริกา", 'tr': "AB-ABD Veri Gizliliği Çerçevesi", 'uk': "Конфіденційність даних між ЄС і США" , 'vi': "Khung bảo mật dữ liệu EU-Hoa Kỳ", 'zh': "欧盟-美国数据隐私框架", 'zh-TW': "歐盟－美國數據隱私框架" }
+      },
+      google_ads: {
+        name: 'Google Ads',
+        patterns: ['googleadservices', 'googlesyndication', 'doubleclick', 'adservice.google', 'pagead'],
+        cookies: ['_gcl_au', '_gcl_aw', 'IDE', 'NID'],
+        description: { de: 'Conversion-Tracking und Remarketing', en: 'Conversion tracking and remarketing', fr: 'Suivi des conversions et remarketing', es: 'Seguimiento de conversiones y remarketing', it: 'Tracciamento conversioni e remarketing', nl: 'Conversietracking en remarketing', pl: 'Śledzenie konwersji i remarketing', pt: 'Rastreamento de conversões e remarketing', da: 'Konverteringssporing og remarketing' , 'ar': "تتبع التحويل وتجديد النشاط التسويقي", 'bg': "Проследяване на реализациите и ремаркетинг", 'bs': "Praćenje konverzija i remarketing", 'ca': "Seguiment de conversions i remàrqueting", 'cs': "Sledování konverzí a remarketing", 'el': "Παρακολούθηση μετατροπών και επαναληπτικό μάρκετινγκ", 'eu': "Bihurketen jarraipena eta birmarketina", 'fi': "Tulosseuranta ja uudelleenmarkkinointi", 'gl': "Seguimento de conversións e remarketing", 'he': "מעקב המרות ושיווק מחדש", 'hi': "रूपांतरण ट्रैकिंग और रीमार्केटिंग", 'hr': "Praćenje konverzija i remarketing", 'hu': "Konverziókövetés és remarketing", 'id': "Pelacakan konversi dan pemasaran ulang", 'ja': "コンバージョントラッキングとリマーケティング", 'lt': "Konversijų stebėjimas ir pakartotinė rinkodara", 'mr': "रूपांतरण ट्रॅकिंग आणि रीमार्केटिंग", 'nb': "Konverteringssporing og remarketing", 'ro': "Urmărirea conversiilor și remarketing", 'ru': "Отслеживание конверсий и ремаркетинг", 'sk': "Sledovanie konverzií a remarketing", 'sl': "Sledenje konverzijam in ponovno trženje", 'sr': "Праћење конверзија и поновно оглашавање", 'sv': "Omvandlingsspårning och remarketing", 'th': "เครื่องมือวัด Conversion และรีมาร์เก็ตติ้ง", 'tr': "Dönüşüm izleme ve yeniden pazarlama", 'uk': "Відстеження конверсій і ремаркетинг" , 'vi': "Theo dõi chuyển đổi và tiếp thị lại", 'zh': "转化跟踪和再营销", 'zh-TW': "轉換追蹤與再行銷" },
+        duration: { de: '90 Tage (_gcl_*), 13 Monate (IDE, NID)', en: '90 days (_gcl_*), 13 months (IDE, NID)', fr: '90 jours (_gcl_*), 13 mois (IDE, NID)', es: '90 días (_gcl_*), 13 meses (IDE, NID)', it: '90 giorni (_gcl_*), 13 mesi (IDE, NID)', nl: '90 dagen (_gcl_*), 13 maanden (IDE, NID)', pl: '90 dni (_gcl_*), 13 miesięcy (IDE, NID)', pt: '90 dias (_gcl_*), 13 meses (IDE, NID)', da: '90 dage (_gcl_*), 13 måneder (IDE, NID)' , 'ar': "90 يومًا (_gcl_*)، 13 شهرًا (IDE، NID)", 'bg': "90 дни (_gcl_*), 13 месеца (IDE, NID)", 'bs': "90 dana (_gcl_*), 13 mjeseci (IDE, NID)", 'ca': "90 dies (_gcl_*), 13 mesos (IDE, NID)", 'cs': "90 dní (_gcl_*), 13 měsíců (IDE, NID)", 'el': "90 ημέρες (_gcl_*), 13 μήνες (IDE, NID)", 'eu': "90 egun (_gcl_*), 13 hilabete (IDE, NID)", 'fi': "90 päivää (_gcl_*), 13 kuukautta (IDE, NID)", 'gl': "90 días (_gcl_*), 13 meses (IDE, NID)", 'he': "90 ימים (_gcl_*), 13 חודשים (IDE, NID)", 'hi': "90 दिन (_gcl_*), 13 महीने (आईडीई, एनआईडी)", 'hr': "90 dana (_gcl_*), 13 mjeseci (IDE, NID)", 'hu': "90 nap (_gcl_*), 13 hónap (IDE, NID)", 'id': "90 hari (_gcl_*), 13 bulan (IDE, NID)", 'ja': "90 日 (_gcl_*)、13 か月 (IDE、NID)", 'lt': "90 dienų (_gcl_*), 13 mėnesių (IDE, NID)", 'mr': "९० दिवस (_gcl_*), १३ महिने (IDE, NID)", 'nb': "90 dager (_gcl_*), 13 måneder (IDE, NID)", 'ro': "90 de zile (_gcl_*), 13 luni (IDE, NID)", 'ru': "90 дней (_gcl_*), 13 месяцев (IDE, NID)", 'sk': "90 dní (_gcl_*), 13 mesiacov (IDE, NID)", 'sl': "90 dni (_gcl_*), 13 mesecev (IDE, NID)", 'sr': "90 дана (_гцл_*), 13 месеци (ИДЕ, НИД)", 'sv': "90 dagar (_gcl_*), 13 månader (IDE, NID)", 'th': "90 วัน (_gcl_*), 13 เดือน (IDE, NID)", 'tr': "90 gün (_gcl_*), 13 ay (IDE, NID)", 'uk': "90 днів (_gcl_*), 13 місяців (IDE, NID)" , 'vi': "90 ngày (_gcl_*), 13 tháng (IDE, NID)", 'zh': "90天 (_gcl_*)，13个月 (IDE, NID)", 'zh-TW': "90天 (_gcl_*), 13個月 (IDE, NID)" },
+        purpose: { de: 'Messung von Werbeerfolg und personalisierte Anzeigen', en: 'Measurement of advertising success and personalized ads', fr: 'Mesure du succès publicitaire et annonces personnalisées', es: 'Medición del éxito publicitario y anuncios personalizados', it: 'Misurazione del successo pubblicitario e annunci personalizzati', nl: 'Meting van advertentiesucces en gepersonaliseerde advertenties', pl: 'Pomiar skuteczności reklam i reklamy spersonalizowane', pt: 'Medição do sucesso publicitário e anúncios personalizados', da: 'Måling af annoncesucces og personaliserede annoncer' , 'ar': "قياس نجاح الإعلان والإعلانات المخصصة", 'bg': "Измерване на рекламния успех и персонализирани реклами", 'bs': "Mjerenje uspješnosti oglašavanja i personaliziranih oglasa", 'ca': "Mesura de l'èxit publicitari i anuncis personalitzats", 'cs': "Měření úspěšnosti reklamy a personalizované reklamy", 'el': "Μέτρηση διαφημιστικής επιτυχίας και εξατομικευμένες διαφημίσεις", 'eu': "Iragarkien arrakastaren eta iragarki pertsonalizatuen neurketa", 'fi': "Mainonnan menestyksen mittaaminen ja personoidut mainokset", 'gl': "Medición do éxito publicitario e anuncios personalizados", 'he': "מדידת הצלחה בפרסום ומודעות מותאמות אישית", 'hi': "विज्ञापन की सफलता और वैयक्तिकृत विज्ञापनों का मापन", 'hr': "Mjerenje uspješnosti oglašavanja i personaliziranih oglasa", 'hu': "Reklámsiker mérése és személyre szabott hirdetések", 'id': "Pengukuran keberhasilan periklanan dan iklan yang dipersonalisasi", 'ja': "広告の成功の測定とパーソナライズされた広告", 'lt': "Reklamos sėkmės matavimas ir suasmeninti skelbimai", 'mr': "जाहिरात यश आणि वैयक्तिकृत जाहिरातींचे मोजमाप", 'nb': "Måling av reklamesuksess og personlig tilpassede annonser", 'ro': "Măsurarea succesului publicitar și a reclamelor personalizate", 'ru': "Измерение успеха рекламы и персонализированная реклама", 'sk': "Meranie úspešnosti reklamy a personalizované reklamy", 'sl': "Merjenje uspešnosti oglaševanja in personaliziranih oglasov", 'sr': "Мерење успешности оглашавања и персонализованих огласа", 'sv': "Mätning av reklamframgång och personliga annonser", 'th': "การวัดความสำเร็จของการโฆษณาและโฆษณาเฉพาะบุคคล", 'tr': "Reklam başarısının ve kişiselleştirilmiş reklamların ölçümü", 'uk': "Вимірювання успішності реклами та персоналізованої реклами" , 'vi': "Đo lường mức độ thành công của quảng cáo và quảng cáo được cá nhân hóa", 'zh': "广告效果的测量和个性化广告", 'zh-TW': "廣告效果測量與個人化廣告" },
+        legalBasis: { de: 'Art. 6 Abs. 1 lit. a DSGVO (Einwilligung)', en: 'Art. 6(1)(a) GDPR (Consent)', fr: 'Art. 6(1)(a) RGPD (Consentement)', es: 'Art. 6(1)(a) RGPD (Consentimiento)', it: 'Art. 6(1)(a) GDPR (Consenso)', nl: 'Art. 6(1)(a) AVG (Toestemming)', pl: 'Art. 6(1)(a) RODO (Zgoda)', pt: 'Art. 6(1)(a) RGPD (Consentimento)', da: 'Art. 6(1)(a) GDPR (Samtykke)' , 'ar': "فن. 6(1)(أ) اللائحة العامة لحماية البيانات (الموافقة)", 'bg': "Чл. 6(1)(a) GDPR (Съгласие)", 'bs': "Art. 6(1)(a) GDPR (Saglasnost)", 'ca': "Art. 6(1)(a) GDPR (consentiment)", 'cs': "umění. 6(1)(a) GDPR (Souhlas)", 'el': "Τέχνη. 6(1)(α) GDPR (Συναίνεση)", 'eu': "art. 6(1)(a) GDPR (baimena)", 'fi': "Art. 6(1)(a) GDPR (suostumus)", 'gl': "Art. 6(1)(a) GDPR (Consentimento)", 'he': "אמנות. 6(1)(א) GDPR (הסכמה)", 'hi': "कला. 6(1)(ए) जीडीपीआर (सहमति)", 'hr': "čl. 6(1)(a) GDPR (pristanak)", 'hu': "Art. GDPR 6. cikk (1) bekezdés a) pont (beleegyezés)", 'id': "Seni. 6(1)(a) GDPR (Persetujuan)", 'ja': "アート。 6(1)(a) GDPR (同意)", 'lt': "Art. BDAR 6 straipsnio 1 dalies a punktas (sutikimas)", 'mr': "कला. 6(1)(a) GDPR (संमती)", 'nb': "Art. 6(1)(a) GDPR (samtykke)", 'ro': "art. 6(1)(a) GDPR (Consimțământ)", 'ru': "Искусство. 6(1)(a) GDPR (Согласие)", 'sk': "čl. 6(1)(a) GDPR (Súhlas)", 'sl': "Art. 6(1)(a) GDPR (soglasje)", 'sr': "чл. 6(1)(а) ГДПР (сагласност)", 'sv': "Art. 6(1)(a) GDPR (samtycke)", 'th': "ศิลปะ 6(1)(a) GDPR (ความยินยอม)", 'tr': "Sanat. 6(1)(a) GDPR (Rıza)", 'uk': "ст. 6(1)(a) GDPR (Згода)" , 'vi': "Điều. 6(1)(a) GDPR (Sự đồng ý)", 'zh': "GDPR 第6条第1款(a)项（同意）", 'zh-TW': "GDPR 第6條第1款(a)項（同意）" },
+        recipient: 'Google LLC, USA',
+        euEntity: { recipient: 'Google Ireland Limited', vendorLocation: 'Gordon House, Barrow Street, Dublin 4, Ireland' },
+        transferSafeguard: { de: 'EU-US Data Privacy Framework', en: 'EU-US Data Privacy Framework', fr: 'EU-US Data Privacy Framework', es: 'EU-US Data Privacy Framework', it: 'EU-US Data Privacy Framework', nl: 'EU-US Data Privacy Framework', pl: 'EU-US Data Privacy Framework', pt: 'EU-US Data Privacy Framework', da: 'EU-US Data Privacy Framework' , 'ar': "إطار خصوصية البيانات بين الاتحاد الأوروبي والولايات المتحدة", 'bg': "Рамка за поверителност на данните между ЕС и САЩ", 'bs': "EU-US Data Privacy Framework", 'ca': "Marc de privadesa de dades UE-EUA", 'cs': "Rámec ochrany osobních údajů mezi EU a USA", 'el': "Πλαίσιο απορρήτου δεδομένων ΕΕ-ΗΠΑ", 'eu': "EB-AEB Datuen Pribatutasun Esparrua", 'fi': "EU:n ja Yhdysvaltojen välinen tietosuojakehys", 'gl': "Marco de privacidade de datos UE-EUA", 'he': "מסגרת פרטיות נתונים של האיחוד האירופי-ארה\"ב", 'hi': "ईयू-यूएस डेटा गोपनीयता ढांचा", 'hr': "EU-SAD okvir za zaštitu privatnosti podataka", 'hu': "EU-USA adatvédelmi keretrendszer", 'id': "Kerangka Privasi Data UE-AS", 'ja': "EU-US データプライバシーフレームワーク", 'lt': "ES ir JAV duomenų privatumo sistema", 'mr': "EU-US डेटा गोपनीयता फ्रेमवर्क", 'nb': "EU-US Data Privacy Framework", 'ro': "Cadrul UE-SUA privind confidențialitatea datelor", 'ru': "Рамочная программа конфиденциальности данных ЕС-США", 'sk': "Rámec ochrany osobných údajov medzi EÚ a USA", 'sl': "EU-ZDA okvir zasebnosti podatkov", 'sr': "Оквир приватности података ЕУ-САД", 'sv': "EU-US Data Privacy Framework", 'th': "กรอบความเป็นส่วนตัวของข้อมูลในสหภาพยุโรปและสหรัฐอเมริกา", 'tr': "AB-ABD Veri Gizliliği Çerçevesi", 'uk': "Конфіденційність даних між ЄС і США" , 'vi': "Khung bảo mật dữ liệu EU-Hoa Kỳ", 'zh': "欧盟-美国数据隐私框架", 'zh-TW': "歐盟－美國數據隱私框架" }
+      },
+      linkedin: {
+        name: 'LinkedIn',
+        patterns: ['linkedin.com/insight', 'snap.licdn.com', 'px.ads.linkedin'],
+        cookies: ['li_sugr', 'bcookie', 'ln_or'],
+        description: { de: 'B2B-Werbung und Targeting', en: 'B2B advertising and targeting', fr: 'Publicité B2B et ciblage', es: 'Publicidad B2B y segmentación', it: 'Pubblicità B2B e targeting', nl: 'B2B-advertenties en targeting', pl: 'Reklama B2B i targetowanie', pt: 'Publicidade B2B e segmentação', da: 'B2B-annoncering og målretning' , 'ar': "الإعلان والاستهداف B2B", 'bg': "B2B реклама и таргетиране", 'bs': "B2B oglašavanje i ciljanje", 'ca': "Publicitat i segmentació B2B", 'cs': "B2B reklama a cílení", 'el': "Διαφήμιση και στόχευση B2B", 'eu': "B2B publizitatea eta bideratzea", 'fi': "B2B-mainonta ja kohdistaminen", 'gl': "Publicidade e segmentación B2B", 'he': "פרסום ומיקוד B2B", 'hi': "B2B विज्ञापन और लक्ष्यीकरण", 'hr': "B2B oglašavanje i ciljanje", 'hu': "B2B reklámozás és célzás", 'id': "Periklanan dan penargetan B2B", 'ja': "B2B 広告とターゲティング", 'lt': "B2B reklama ir taikymas", 'mr': "B2B जाहिरात आणि लक्ष्यीकरण", 'nb': "B2B-annonsering og målretting", 'ro': "Publicitate B2B și direcționare", 'ru': "B2B реклама и таргетинг", 'sk': "B2B reklama a cielenie", 'sl': "B2B oglaševanje in ciljanje", 'sr': "Б2Б оглашавање и циљање", 'sv': "B2B-annonsering och inriktning", 'th': "การโฆษณาและการกำหนดเป้าหมาย B2B", 'tr': "B2B reklamcılık ve hedefleme", 'uk': "B2B реклама та таргетинг" , 'vi': "Quảng cáo và nhắm mục tiêu B2B", 'zh': "B2B 广告和定位", 'zh-TW': "B2B 廣告與定位" },
+        duration: { de: '2 Jahre (bcookie), 90 Tage (li_sugr)', en: '2 years (bcookie), 90 days (li_sugr)', fr: '2 ans (bcookie), 90 jours (li_sugr)', es: '2 años (bcookie), 90 días (li_sugr)', it: '2 anni (bcookie), 90 giorni (li_sugr)', nl: '2 jaar (bcookie), 90 dagen (li_sugr)', pl: '2 lata (bcookie), 90 dni (li_sugr)', pt: '2 anos (bcookie), 90 dias (li_sugr)', da: '2 år (bcookie), 90 dage (li_sugr)' , 'ar': "سنتان (بكوكي)، 90 يومًا (li_sugr)", 'bg': "2 години (bcookie), 90 дни (li_sugr)", 'bs': "2 godine (bcookie), 90 dana (li_sugr)", 'ca': "2 anys (bcookie), 90 dies (li_sugr)", 'cs': "2 roky (bcookie), 90 dní (li_sugr)", 'el': "2 χρόνια (bcookie), 90 ημέρες (li_sugr)", 'eu': "2 urte (bcookie), 90 egun (li_sugr)", 'fi': "2 vuotta (bcookie), 90 päivää (li_sugr)", 'gl': "2 anos (bcookie), 90 días (li_sugr)", 'he': "שנתיים (bcookie), 90 ימים (li_sugr)", 'hi': "2 वर्ष (बीकुकी), 90 दिन (ली_शुगर)", 'hr': "2 godine (bcookie), 90 dana (li_sugr)", 'hu': "2 év (bcookie), 90 nap (li_sugr)", 'id': "2 tahun (bcookie), 90 hari (li_sugr)", 'ja': "2 年 (bcookie)、90 日 (li_sugr)", 'lt': "2 metai (bcookie), 90 dienų (li_sugr)", 'mr': "2 वर्षे (bcookie), 90 दिवस (li_sugr)", 'nb': "2 år (bcookie), 90 dager (li_sugr)", 'ro': "2 ani (bcookie), 90 de zile (li_sugr)", 'ru': "2 года (bcookie), 90 дней (li_sugr)", 'sk': "2 roky (bcookie), 90 dní (li_sugr)", 'sl': "2 leti (bcookie), 90 dni (li_sugr)", 'sr': "2 године (бцоокие), 90 дана (ли_сугр)", 'sv': "2 år (bcookie), 90 dagar (li_sugr)", 'th': "2 ปี (บุ๊กกี้), 90 วัน (li_sugr)", 'tr': "2 yıl (bçerez), 90 gün (li_sugr)", 'uk': "2 роки (bcookie), 90 днів (li_sugr)" , 'vi': "2 năm (bcookie),  90 ngày (li_sugr)", 'zh': "2年（bcookie），90天（li_sugr）", 'zh-TW': "2 年（bcookie）、90 天（li_sugr）" },
+        purpose: { de: 'Conversion-Tracking für LinkedIn-Werbekampagnen', en: 'Conversion tracking for LinkedIn ad campaigns', fr: 'Suivi des conversions pour les campagnes LinkedIn', es: 'Seguimiento de conversiones para campañas de LinkedIn', it: 'Tracciamento conversioni per campagne LinkedIn', nl: 'Conversietracking voor LinkedIn-campagnes', pl: 'Śledzenie konwersji dla kampanii LinkedIn', pt: 'Rastreamento de conversões para campanhas LinkedIn', da: 'Konverteringssporing for LinkedIn-kampagner' , 'ar': "تتبع التحويل للحملات الإعلانية على LinkedIn", 'bg': "Проследяване на реализациите за рекламни кампании в LinkedIn", 'bs': "Praćenje konverzija za LinkedIn oglasne kampanje", 'ca': "Seguiment de conversions per a campanyes publicitàries de LinkedIn", 'cs': "Sledování konverzí pro reklamní kampaně LinkedIn", 'el': "Παρακολούθηση μετατροπών για διαφημιστικές καμπάνιες LinkedIn", 'eu': "LinkedIn iragarki-kanpainetarako bihurketen jarraipena", 'fi': "LinkedIn-mainoskampanjoiden tulosseuranta", 'gl': "Seguimento de conversións para campañas publicitarias de LinkedIn", 'he': "מעקב המרות עבור מסעות פרסום של LinkedIn", 'hi': "लिंक्डइन विज्ञापन अभियानों के लिए रूपांतरण ट्रैकिंग", 'hr': "Praćenje konverzija za LinkedIn oglasne kampanje", 'hu': "Konverziókövetés LinkedIn hirdetési kampányokhoz", 'id': "Pelacakan konversi untuk kampanye iklan LinkedIn", 'ja': "LinkedIn 広告キャンペーンのコンバージョン トラッキング", 'lt': "„LinkedIn“ reklamos kampanijų konversijų stebėjimas", 'mr': "लिंक्डइन जाहिरात मोहिमांसाठी रूपांतरण ट्रॅकिंग", 'nb': "Konverteringssporing for LinkedIn-annonsekampanjer", 'ro': "Urmărirea conversiilor pentru campaniile publicitare LinkedIn", 'ru': "Отслеживание конверсий для рекламных кампаний LinkedIn", 'sk': "Sledovanie konverzií pre reklamné kampane na LinkedIn", 'sl': "Sledenje konverzijam za oglaševalske akcije LinkedIn", 'sr': "Праћење конверзија за ЛинкедИн огласне кампање", 'sv': "Konverteringsspårning för LinkedIn-annonskampanjer", 'th': "การติดตามคอนเวอร์ชันสำหรับแคมเปญโฆษณา LinkedIn", 'tr': "LinkedIn reklam kampanyaları için dönüşüm izleme", 'uk': "Відстеження конверсій для рекламних кампаній LinkedIn" , 'vi': "Theo dõi chuyển đổi cho các chiến dịch quảng cáo LinkedIn", 'zh': "LinkedIn 广告活动的转化跟踪", 'zh-TW': "LinkedIn 廣告活動的轉換追蹤" },
+        legalBasis: { de: 'Art. 6 Abs. 1 lit. a DSGVO (Einwilligung)', en: 'Art. 6(1)(a) GDPR (Consent)', fr: 'Art. 6(1)(a) RGPD (Consentement)', es: 'Art. 6(1)(a) RGPD (Consentimiento)', it: 'Art. 6(1)(a) GDPR (Consenso)', nl: 'Art. 6(1)(a) AVG (Toestemming)', pl: 'Art. 6(1)(a) RODO (Zgoda)', pt: 'Art. 6(1)(a) RGPD (Consentimento)', da: 'Art. 6(1)(a) GDPR (Samtykke)' , 'ar': "فن. 6(1)(أ) اللائحة العامة لحماية البيانات (الموافقة)", 'bg': "Чл. 6(1)(a) GDPR (Съгласие)", 'bs': "Art. 6(1)(a) GDPR (Saglasnost)", 'ca': "Art. 6(1)(a) GDPR (consentiment)", 'cs': "umění. 6(1)(a) GDPR (Souhlas)", 'el': "Τέχνη. 6(1)(α) GDPR (Συναίνεση)", 'eu': "art. 6(1)(a) GDPR (baimena)", 'fi': "Art. 6(1)(a) GDPR (suostumus)", 'gl': "Art. 6(1)(a) GDPR (Consentimento)", 'he': "אמנות. 6(1)(א) GDPR (הסכמה)", 'hi': "कला. 6(1)(ए) जीडीपीआर (सहमति)", 'hr': "čl. 6(1)(a) GDPR (pristanak)", 'hu': "Art. GDPR 6. cikk (1) bekezdés a) pont (beleegyezés)", 'id': "Seni. 6(1)(a) GDPR (Persetujuan)", 'ja': "アート。 6(1)(a) GDPR (同意)", 'lt': "Art. BDAR 6 straipsnio 1 dalies a punktas (sutikimas)", 'mr': "कला. 6(1)(a) GDPR (संमती)", 'nb': "Art. 6(1)(a) GDPR (samtykke)", 'ro': "art. 6(1)(a) GDPR (Consimțământ)", 'ru': "Искусство. 6(1)(a) GDPR (Согласие)", 'sk': "čl. 6(1)(a) GDPR (Súhlas)", 'sl': "Art. 6(1)(a) GDPR (soglasje)", 'sr': "чл. 6(1)(а) ГДПР (сагласност)", 'sv': "Art. 6(1)(a) GDPR (samtycke)", 'th': "ศิลปะ 6(1)(a) GDPR (ความยินยอม)", 'tr': "Sanat. 6(1)(a) GDPR (Rıza)", 'uk': "ст. 6(1)(a) GDPR (Згода)" , 'vi': "Điều. 6(1)(a) GDPR (Sự đồng ý)", 'zh': "GDPR 第6条第1款(a)项（同意）", 'zh-TW': "GDPR 第6條第1款(a)項（同意）" },
+        recipient: 'LinkedIn Ireland Unlimited Company / LinkedIn Corporation, USA',
+        transferSafeguard: { de: 'EU-US Data Privacy Framework', en: 'EU-US Data Privacy Framework', fr: 'EU-US Data Privacy Framework', es: 'EU-US Data Privacy Framework', it: 'EU-US Data Privacy Framework', nl: 'EU-US Data Privacy Framework', pl: 'EU-US Data Privacy Framework', pt: 'EU-US Data Privacy Framework', da: 'EU-US Data Privacy Framework' , 'ar': "إطار خصوصية البيانات بين الاتحاد الأوروبي والولايات المتحدة", 'bg': "Рамка за поверителност на данните между ЕС и САЩ", 'bs': "EU-US Data Privacy Framework", 'ca': "Marc de privadesa de dades UE-EUA", 'cs': "Rámec ochrany osobních údajů mezi EU a USA", 'el': "Πλαίσιο απορρήτου δεδομένων ΕΕ-ΗΠΑ", 'eu': "EB-AEB Datuen Pribatutasun Esparrua", 'fi': "EU:n ja Yhdysvaltojen välinen tietosuojakehys", 'gl': "Marco de privacidade de datos UE-EUA", 'he': "מסגרת פרטיות נתונים של האיחוד האירופי-ארה\"ב", 'hi': "ईयू-यूएस डेटा गोपनीयता ढांचा", 'hr': "EU-SAD okvir za zaštitu privatnosti podataka", 'hu': "EU-USA adatvédelmi keretrendszer", 'id': "Kerangka Privasi Data UE-AS", 'ja': "EU-US データプライバシーフレームワーク", 'lt': "ES ir JAV duomenų privatumo sistema", 'mr': "EU-US डेटा गोपनीयता फ्रेमवर्क", 'nb': "EU-US Data Privacy Framework", 'ro': "Cadrul UE-SUA privind confidențialitatea datelor", 'ru': "Рамочная программа конфиденциальности данных ЕС-США", 'sk': "Rámec ochrany osobných údajov medzi EÚ a USA", 'sl': "EU-ZDA okvir zasebnosti podatkov", 'sr': "Оквир приватности података ЕУ-САД", 'sv': "EU-US Data Privacy Framework", 'th': "กรอบความเป็นส่วนตัวของข้อมูลในสหภาพยุโรปและสหรัฐอเมริกา", 'tr': "AB-ABD Veri Gizliliği Çerçevesi", 'uk': "Конфіденційність даних між ЄС і США" , 'vi': "Khung bảo mật dữ liệu EU-Hoa Kỳ", 'zh': "欧盟-美国数据隐私框架", 'zh-TW': "歐盟－美國數據隱私框架" }
+      },
+      tiktok: {
+        name: 'TikTok',
+        patterns: ['tiktok.com/i18n', 'analytics.tiktok.com', 'tiktok.com/events'],
+        cookies: ['_ttp'],
+        description: { de: 'TikTok Pixel für Werbung', en: 'TikTok Pixel for advertising', fr: 'Pixel TikTok pour la publicité', es: 'Píxel de TikTok para publicidad', it: 'Pixel TikTok per la pubblicità', nl: 'TikTok Pixel voor advertenties', pl: 'Piksel TikTok do reklamy', pt: 'Pixel TikTok para publicidade', da: 'TikTok Pixel til annoncering' , 'ar': "TikTok Pixel للإعلان", 'bg': "TikTok Pixel за реклама", 'bs': "TikTok Pixel za oglašavanje", 'ca': "TikTok Pixel per a publicitat", 'cs': "TikTok Pixel pro reklamu", 'el': "TikTok Pixel για διαφήμιση", 'eu': "TikTok Pixel publizitatea egiteko", 'fi': "TikTok Pixel mainontaan", 'gl': "TikTok Pixel para publicidade", 'he': "TikTok Pixel לפרסום", 'hi': "विज्ञापन के लिए टिकटॉक पिक्सेल", 'hr': "TikTok Pixel za oglašavanje", 'hu': "TikTok Pixel reklámozáshoz", 'id': "Piksel TikTok untuk iklan", 'ja': "広告用の TikTok Pixel", 'lt': "TikTok Pixel reklamai", 'mr': "जाहिरातीसाठी TikTok Pixel", 'nb': "TikTok Pixel for annonsering", 'ro': "Pixel TikTok pentru publicitate", 'ru': "TikTok Pixel для рекламы", 'sk': "TikTok Pixel na reklamu", 'sl': "TikTok Pixel za oglaševanje", 'sr': "ТикТок Пикел за оглашавање", 'sv': "TikTok Pixel för reklam", 'th': "TikTok Pixel สำหรับการโฆษณา", 'tr': "Reklamcılık için TikTok Pixel", 'uk': "TikTok Pixel для реклами" , 'vi': "TikTok Pixel cho quảng cáo", 'zh': "用于广告的抖音像素", 'zh-TW': "TikTok 廣告像素" },
+        duration: { de: '13 Monate', en: '13 months', fr: '13 mois', es: '13 meses', it: '13 mesi', nl: '13 maanden', pl: '13 miesięcy', pt: '13 meses', da: '13 måneder' , 'ar': "13 شهرا", 'bg': "13 месеца", 'bs': "13 mjeseci", 'ca': "13 mesos", 'cs': "13 měsíců", 'el': "13 μηνών", 'eu': "13 hilabete", 'fi': "13 kuukautta", 'gl': "13 meses", 'he': "13 חודשים", 'hi': "13 महीने", 'hr': "13 mjeseci", 'hu': "13 hónap", 'id': "13 bulan", 'ja': "13ヶ月", 'lt': "13 mėnesių", 'mr': "13 महिने", 'nb': "13 måneder", 'ro': "13 luni", 'ru': "13 месяцев", 'sk': "13 mesiacov", 'sl': "13 mesecev", 'sr': "13 месеци", 'sv': "13 månader", 'th': "13 เดือน", 'tr': "13 ay", 'uk': "13 місяців" , 'vi': "13 tháng", 'zh': "13个月", 'zh-TW': "13個月" },
+        purpose: { de: 'Conversion-Tracking und Zielgruppenbildung für TikTok-Werbung', en: 'Conversion tracking and audience building for TikTok advertising', fr: 'Suivi des conversions et ciblage pour la publicité TikTok', es: 'Seguimiento de conversiones y segmentación para publicidad TikTok', it: 'Tracciamento conversioni e targeting per pubblicità TikTok', nl: 'Conversietracking en doelgroepvorming voor TikTok-advertenties', pl: 'Śledzenie konwersji i budowanie grup docelowych dla reklam TikTok', pt: 'Rastreamento de conversões e segmentação para publicidade TikTok', da: 'Konverteringssporing og målgruppeopbygning for TikTok-annoncering' , 'ar': "تتبع التحويل وبناء الجمهور لإعلانات TikTok", 'bg': "Проследяване на реализациите и изграждане на аудитория за TikTok реклама", 'bs': "Praćenje konverzija i izgradnja publike za TikTok oglašavanje", 'ca': "Seguiment de conversions i creació d'audiència per a la publicitat de TikTok", 'cs': "Sledování konverzí a budování publika pro reklamu TikTok", 'el': "Παρακολούθηση μετατροπών και δημιουργία κοινού για διαφημίσεις TikTok", 'eu': "Bihurketen jarraipena eta audientzia sortzea TikTok iragarkietarako", 'fi': "Tulosseuranta ja yleisön kasvattaminen TikTok-mainonnassa", 'gl': "Seguimento de conversións e creación de audiencia para a publicidade de TikTok", 'he': "מעקב המרות ובניית קהל עבור פרסום TikTok", 'hi': "टिकटॉक विज्ञापन के लिए रूपांतरण ट्रैकिंग और दर्शक निर्माण", 'hr': "Praćenje konverzija i stvaranje publike za TikTok oglašavanje", 'hu': "Konverziókövetés és közönségépítés a TikTok hirdetéshez", 'id': "Pelacakan konversi dan pembangunan audiens untuk iklan TikTok", 'ja': "TikTok広告のコンバージョン追跡とオーディエンス構築", 'lt': "TikTok reklamos konversijų stebėjimas ir auditorijos formavimas", 'mr': "TikTok जाहिरातीसाठी रूपांतरण ट्रॅकिंग आणि प्रेक्षक बिल्डिंग", 'nb': "Konverteringssporing og publikumsbygging for TikTok-annonsering", 'ro': "Urmărirea conversiilor și construirea audienței pentru publicitatea TikTok", 'ru': "Отслеживание конверсий и создание аудитории для рекламы в TikTok", 'sk': "Sledovanie konverzií a budovanie publika pre reklamu TikTok", 'sl': "Sledenje konverzijam in ustvarjanje občinstva za oglaševanje v TikToku", 'sr': "Праћење конверзија и изградња публике за ТикТок оглашавање", 'sv': "Omvandlingsspårning och målgruppsbyggande för TikTok-annonsering", 'th': "การติดตามคอนเวอร์ชันและการสร้างผู้ชมสำหรับการโฆษณา TikTok", 'tr': "TikTok reklamcılığı için dönüşüm izleme ve kitle oluşturma", 'uk': "Відстеження конверсій і формування аудиторії для реклами TikTok" , 'vi': "Theo dõi chuyển đổi và xây dựng đối tượng cho quảng cáo TikTok", 'zh': "TikTok 广告的转化跟踪和受众构建", 'zh-TW': "TikTok 廣告的轉換追蹤與受眾建立" },
+        legalBasis: { de: 'Art. 6 Abs. 1 lit. a DSGVO (Einwilligung)', en: 'Art. 6(1)(a) GDPR (Consent)', fr: 'Art. 6(1)(a) RGPD (Consentement)', es: 'Art. 6(1)(a) RGPD (Consentimiento)', it: 'Art. 6(1)(a) GDPR (Consenso)', nl: 'Art. 6(1)(a) AVG (Toestemming)', pl: 'Art. 6(1)(a) RODO (Zgoda)', pt: 'Art. 6(1)(a) RGPD (Consentimento)', da: 'Art. 6(1)(a) GDPR (Samtykke)' , 'ar': "فن. 6(1)(أ) اللائحة العامة لحماية البيانات (الموافقة)", 'bg': "Чл. 6(1)(a) GDPR (Съгласие)", 'bs': "Art. 6(1)(a) GDPR (Saglasnost)", 'ca': "Art. 6(1)(a) GDPR (consentiment)", 'cs': "umění. 6(1)(a) GDPR (Souhlas)", 'el': "Τέχνη. 6(1)(α) GDPR (Συναίνεση)", 'eu': "art. 6(1)(a) GDPR (baimena)", 'fi': "Art. 6(1)(a) GDPR (suostumus)", 'gl': "Art. 6(1)(a) GDPR (Consentimento)", 'he': "אמנות. 6(1)(א) GDPR (הסכמה)", 'hi': "कला. 6(1)(ए) जीडीपीआर (सहमति)", 'hr': "čl. 6(1)(a) GDPR (pristanak)", 'hu': "Art. GDPR 6. cikk (1) bekezdés a) pont (beleegyezés)", 'id': "Seni. 6(1)(a) GDPR (Persetujuan)", 'ja': "アート。 6(1)(a) GDPR (同意)", 'lt': "Art. BDAR 6 straipsnio 1 dalies a punktas (sutikimas)", 'mr': "कला. 6(1)(a) GDPR (संमती)", 'nb': "Art. 6(1)(a) GDPR (samtykke)", 'ro': "art. 6(1)(a) GDPR (Consimțământ)", 'ru': "Искусство. 6(1)(a) GDPR (Согласие)", 'sk': "čl. 6(1)(a) GDPR (Súhlas)", 'sl': "Art. 6(1)(a) GDPR (soglasje)", 'sr': "чл. 6(1)(а) ГДПР (сагласност)", 'sv': "Art. 6(1)(a) GDPR (samtycke)", 'th': "ศิลปะ 6(1)(a) GDPR (ความยินยอม)", 'tr': "Sanat. 6(1)(a) GDPR (Rıza)", 'uk': "ст. 6(1)(a) GDPR (Згода)" , 'vi': "Điều. 6(1)(a) GDPR (Sự đồng ý)", 'zh': "GDPR 第6条第1款(a)项（同意）", 'zh-TW': "GDPR 第6條第1款(a)項（同意）" },
+        recipient: 'TikTok Technology Limited, Irland / ByteDance Ltd.',
+        transferSafeguard: { de: 'Standardvertragsklauseln', en: 'Standard Contractual Clauses', fr: 'Clauses contractuelles types', es: 'Cláusulas contractuales tipo', it: 'Clausole contrattuali standard', nl: 'Standaard contractbepalingen', pl: 'Standardowe klauzule umowne', pt: 'Cláusulas contratuais-tipo', da: 'Standardkontraktbestemmelser' , 'ar': "الشروط التعاقدية القياسية", 'bg': "Стандартни договорни клаузи", 'bs': "Standardne ugovorne klauzule", 'ca': "Clàusules contractuals tipus", 'cs': "Standardní smluvní doložky", 'el': "Τυπικές συμβατικές ρήτρες", 'eu': "Kontratu-klausula estandarrak", 'fi': "Vakiosopimuslausekkeet", 'gl': "Cláusulas contractuais tipo", 'he': "סעיפים חוזיים סטנדרטיים", 'hi': "मानक संविदात्मक धाराएँ", 'hr': "Standardne ugovorne klauzule", 'hu': "Általános szerződési feltételek", 'id': "Klausul Kontrak Standar", 'ja': "標準契約条項", 'lt': "Standartinės sutarties sąlygos", 'mr': "मानक करार कलमे", 'nb': "Standard kontraktsmessige klausuler", 'ro': "Clauze Contractuale Standard", 'ru': "Стандартные договорные условия", 'sk': "Štandardné zmluvné doložky", 'sl': "Standardne pogodbene klavzule", 'sr': "Стандардне уговорне клаузуле", 'sv': "Standardavtalsklausuler", 'th': "ข้อสัญญามาตรฐาน", 'tr': "Standart Sözleşme Maddeleri", 'uk': "Стандартні договірні положення" , 'vi': "Điều khoản hợp đồng tiêu chuẩn", 'zh': "标准合同条款", 'zh-TW': "標準合約條款" }
+      },
+      twitter: {
+        name: 'Twitter/X',
+        patterns: ['ads.twitter.com', 'ads-twitter', 'static.ads-twitter'],
+        cookies: ['muc_ads', 'twid'],
+        description: { de: 'Twitter Ads Conversion Tracking', en: 'Twitter Ads Conversion Tracking', fr: 'Suivi des conversions Twitter Ads', es: 'Seguimiento de conversiones de Twitter Ads', it: 'Tracciamento conversioni Twitter Ads', nl: 'Twitter Ads conversietracking', pl: 'Śledzenie konwersji Twitter Ads', pt: 'Rastreamento de conversões Twitter Ads', da: 'Twitter Ads konverteringssporing' , 'ar': "تتبع تحويل إعلانات تويتر", 'bg': "Проследяване на реализациите на реклами в Twitter", 'bs': "Praćenje konverzije Twitter oglasa", 'ca': "Seguiment de conversions d'anuncis de Twitter", 'cs': "Sledování konverzí reklam na Twitteru", 'el': "Παρακολούθηση μετατροπών διαφημίσεων Twitter", 'eu': "Twitter Iragarkien Bihurketen Jarraipena", 'fi': "Twitter-mainosten tulosseuranta", 'gl': "Seguimento de conversións de Twitter Ads", 'he': "מעקב המרות של מודעות Twitter", 'hi': "ट्विटर विज्ञापन रूपांतरण ट्रैकिंग", 'hr': "Praćenje konverzija oglasa na Twitteru", 'hu': "Twitter-hirdetések konverziókövetése", 'id': "Pelacakan Konversi Iklan Twitter", 'ja': "Twitter広告コンバージョントラッキング", 'lt': "„Twitter“ skelbimų konversijų stebėjimas", 'mr': "Twitter जाहिराती रूपांतरण ट्रॅकिंग", 'nb': "Konverteringssporing for Twitter-annonser", 'ro': "Urmărirea conversiilor reclamelor Twitter", 'ru': "Отслеживание конверсий в рекламе в Твиттере", 'sk': "Sledovanie konverzií reklám na Twitteri", 'sl': "Sledenje konverzijam oglasov na Twitterju", 'sr': "Праћење конверзија Твиттер огласа", 'sv': "Twitter Ads Conversion Tracking", 'th': "เครื่องมือติดตามการแปลงโฆษณา Twitter", 'tr': "Twitter Reklamları Dönüşüm Takibi", 'uk': "Відстеження конверсій оголошень Twitter" , 'vi': "Theo dõi chuyển đổi quảng cáo Twitter", 'zh': "Twitter 广告转化跟踪", 'zh-TW': "Twitter 廣告轉換追蹤" },
+        duration: { de: '2 Jahre', en: '2 years', fr: '2 ans', es: '2 años', it: '2 anni', nl: '2 jaar', pl: '2 lata', pt: '2 anos', da: '2 år' , 'ar': "2 سنة", 'bg': "2 години", 'bs': "2 godine", 'ca': "2 anys", 'cs': "2 roky", 'el': "2 χρόνια", 'eu': "2 urte", 'fi': "2 vuotta", 'gl': "2 anos", 'he': "2 שנים", 'hi': "2 साल", 'hr': "2 godine", 'hu': "2 év", 'id': "2 tahun", 'ja': "2年", 'lt': "2 metai", 'mr': "2 वर्षे", 'nb': "2 år", 'ro': "2 ani", 'ru': "2 года", 'sk': "2 roky", 'sl': "2 leti", 'sr': "2 године", 'sv': "2 år", 'th': "2 ปี", 'tr': "2 yıl", 'uk': "2 роки" , 'vi': "2 năm", 'zh': "2年", 'zh-TW': "2年" },
+        purpose: { de: 'Messung von Werbekonversionen auf Twitter/X', en: 'Measurement of ad conversions on Twitter/X', fr: 'Mesure des conversions publicitaires sur Twitter/X', es: 'Medición de conversiones publicitarias en Twitter/X', it: 'Misurazione delle conversioni pubblicitarie su Twitter/X', nl: 'Meting van advertentieconversies op Twitter/X', pl: 'Pomiar konwersji reklamowych na Twitter/X', pt: 'Medição de conversões publicitárias no Twitter/X', da: 'Måling af annoncekonverteringer på Twitter/X' , 'ar': "قياس تحويلات الإعلانات على Twitter/X", 'bg': "Измерване на рекламни реализации в Twitter/X", 'bs': "Mjerenje konverzija oglasa na Twitter/X", 'ca': "Mesura de les conversions d'anuncis a Twitter/X", 'cs': "Měření konverzí reklam na Twitteru/X", 'el': "Μέτρηση μετατροπών διαφημίσεων στο Twitter/X", 'eu': "Twitter/X-en iragarkien bihurketen neurketa", 'fi': "Mainosten tulosten mittaus Twitter/X:ssä", 'gl': "Medición das conversións de anuncios en Twitter/X", 'he': "מדידת המרות מודעות בטוויטר/X", 'hi': "Twitter/X पर विज्ञापन रूपांतरणों का मापन", 'hr': "Mjerenje konverzija oglasa na Twitteru/X", 'hu': "Hirdetéskonverziók mérése a Twitter/X-en", 'id': "Pengukuran konversi iklan di Twitter/X", 'ja': "Twitter/Xにおける広告コンバージョンの計測", 'lt': "„Twitter“ / X skelbimų konversijų matavimas", 'mr': "Twitter/X वर जाहिरात रूपांतरणांचे मोजमाप", 'nb': "Måling av annonsekonverteringer på Twitter/X", 'ro': "Măsurarea conversiilor reclamelor pe Twitter/X", 'ru': "Измерение рекламных конверсий в Twitter/X", 'sk': "Meranie konverzií reklamy na Twitteri/X", 'sl': "Merjenje oglasnih konverzij na Twitterju/X", 'sr': "Мерење конверзија огласа на Твиттер/Кс", 'sv': "Mätning av annonskonverteringar på Twitter/X", 'th': "การวัด Conversion ของโฆษณาบน Twitter/X", 'tr': "Twitter/X'te reklam dönüşümlerinin ölçümü", 'uk': "Вимірювання рекламних конверсій у Twitter/X" , 'vi': "Đo lường chuyển đổi quảng cáo trên Twitter/X", 'zh': "在推特/X上测量广告转化", 'zh-TW': "在 Twitter/X 上衡量廣告轉換" },
+        legalBasis: { de: 'Art. 6 Abs. 1 lit. a DSGVO (Einwilligung)', en: 'Art. 6(1)(a) GDPR (Consent)', fr: 'Art. 6(1)(a) RGPD (Consentement)', es: 'Art. 6(1)(a) RGPD (Consentimiento)', it: 'Art. 6(1)(a) GDPR (Consenso)', nl: 'Art. 6(1)(a) AVG (Toestemming)', pl: 'Art. 6(1)(a) RODO (Zgoda)', pt: 'Art. 6(1)(a) RGPD (Consentimento)', da: 'Art. 6(1)(a) GDPR (Samtykke)' , 'ar': "فن. 6(1)(أ) اللائحة العامة لحماية البيانات (الموافقة)", 'bg': "Чл. 6(1)(a) GDPR (Съгласие)", 'bs': "Art. 6(1)(a) GDPR (Saglasnost)", 'ca': "Art. 6(1)(a) GDPR (consentiment)", 'cs': "umění. 6(1)(a) GDPR (Souhlas)", 'el': "Τέχνη. 6(1)(α) GDPR (Συναίνεση)", 'eu': "art. 6(1)(a) GDPR (baimena)", 'fi': "Art. 6(1)(a) GDPR (suostumus)", 'gl': "Art. 6(1)(a) GDPR (Consentimento)", 'he': "אמנות. 6(1)(א) GDPR (הסכמה)", 'hi': "कला. 6(1)(ए) जीडीपीआर (सहमति)", 'hr': "čl. 6(1)(a) GDPR (pristanak)", 'hu': "Art. GDPR 6. cikk (1) bekezdés a) pont (beleegyezés)", 'id': "Seni. 6(1)(a) GDPR (Persetujuan)", 'ja': "アート。 6(1)(a) GDPR (同意)", 'lt': "Art. BDAR 6 straipsnio 1 dalies a punktas (sutikimas)", 'mr': "कला. 6(1)(a) GDPR (संमती)", 'nb': "Art. 6(1)(a) GDPR (samtykke)", 'ro': "art. 6(1)(a) GDPR (Consimțământ)", 'ru': "Искусство. 6(1)(a) GDPR (Согласие)", 'sk': "čl. 6(1)(a) GDPR (Súhlas)", 'sl': "Art. 6(1)(a) GDPR (soglasje)", 'sr': "чл. 6(1)(а) ГДПР (сагласност)", 'sv': "Art. 6(1)(a) GDPR (samtycke)", 'th': "ศิลปะ 6(1)(a) GDPR (ความยินยอม)", 'tr': "Sanat. 6(1)(a) GDPR (Rıza)", 'uk': "ст. 6(1)(a) GDPR (Згода)" , 'vi': "Điều. 6(1)(a) GDPR (Sự đồng ý)", 'zh': "GDPR 第6条第1款(a)项（同意）", 'zh-TW': "GDPR 第6條第1款(a)項（同意）" },
+        recipient: 'X Corp. (ehem. Twitter, Inc.), USA',
+        transferSafeguard: { de: 'EU-US Data Privacy Framework', en: 'EU-US Data Privacy Framework', fr: 'EU-US Data Privacy Framework', es: 'EU-US Data Privacy Framework', it: 'EU-US Data Privacy Framework', nl: 'EU-US Data Privacy Framework', pl: 'EU-US Data Privacy Framework', pt: 'EU-US Data Privacy Framework', da: 'EU-US Data Privacy Framework' , 'ar': "إطار خصوصية البيانات بين الاتحاد الأوروبي والولايات المتحدة", 'bg': "Рамка за поверителност на данните между ЕС и САЩ", 'bs': "EU-US Data Privacy Framework", 'ca': "Marc de privadesa de dades UE-EUA", 'cs': "Rámec ochrany osobních údajů mezi EU a USA", 'el': "Πλαίσιο απορρήτου δεδομένων ΕΕ-ΗΠΑ", 'eu': "EB-AEB Datuen Pribatutasun Esparrua", 'fi': "EU:n ja Yhdysvaltojen välinen tietosuojakehys", 'gl': "Marco de privacidade de datos UE-EUA", 'he': "מסגרת פרטיות נתונים של האיחוד האירופי-ארה\"ב", 'hi': "ईयू-यूएस डेटा गोपनीयता ढांचा", 'hr': "EU-SAD okvir za zaštitu privatnosti podataka", 'hu': "EU-USA adatvédelmi keretrendszer", 'id': "Kerangka Privasi Data UE-AS", 'ja': "EU-US データプライバシーフレームワーク", 'lt': "ES ir JAV duomenų privatumo sistema", 'mr': "EU-US डेटा गोपनीयता फ्रेमवर्क", 'nb': "EU-US Data Privacy Framework", 'ro': "Cadrul UE-SUA privind confidențialitatea datelor", 'ru': "Рамочная программа конфиденциальности данных ЕС-США", 'sk': "Rámec ochrany osobných údajov medzi EÚ a USA", 'sl': "EU-ZDA okvir zasebnosti podatkov", 'sr': "Оквир приватности података ЕУ-САД", 'sv': "EU-US Data Privacy Framework", 'th': "กรอบความเป็นส่วนตัวของข้อมูลในสหภาพยุโรปและสหรัฐอเมริกา", 'tr': "AB-ABD Veri Gizliliği Çerçevesi", 'uk': "Конфіденційність даних між ЄС і США" , 'vi': "Khung bảo mật dữ liệu EU-Hoa Kỳ", 'zh': "欧盟-美国数据隐私框架", 'zh-TW': "歐盟－美國數據隱私框架" }
+      },
+      pinterest: {
+        name: 'Pinterest',
+        patterns: ['pinterest.com/ct', 'pinimg.com/ct'],
+        cookies: ['_pinterest_ct_rt'],
+        description: { de: 'Pinterest Tag für Werbung', en: 'Pinterest Tag for advertising', fr: 'Tag Pinterest pour la publicité', es: 'Tag de Pinterest para publicidad', it: 'Tag Pinterest per la pubblicità', nl: 'Pinterest Tag voor advertenties', pl: 'Tag Pinterest do reklamy', pt: 'Tag Pinterest para publicidade', da: 'Pinterest Tag til annoncering' , 'ar': "علامة Pinterest للإعلان", 'bg': "Pinterest Таг за реклама", 'bs': "Pinterest oznaka za oglašavanje", 'ca': "Etiqueta de Pinterest per a publicitat", 'cs': "Pinterest Tag pro reklamu", 'el': "Ετικέτα Pinterest για διαφήμιση", 'eu': "Pinterest etiketa publizitaterako", 'fi': "Pinterest-tagi mainontaan", 'gl': "Etiqueta de Pinterest para publicidade", 'he': "תג Pinterest לפרסום", 'hi': "विज्ञापन के लिए Pinterest टैग", 'hr': "Pinterest oznaka za oglašavanje", 'hu': "Pinterest címke reklámozáshoz", 'id': "Tag Pinterest untuk iklan", 'ja': "Pinterest の広告用タグ", 'lt': "Pinterest žyma reklamai", 'mr': "जाहिरातीसाठी Pinterest टॅग", 'nb': "Pinterest-tag for annonsering", 'ro': "Etichetă Pinterest pentru publicitate", 'ru': "Тег Pinterest для рекламы", 'sk': "Pinterest Tag pre reklamu", 'sl': "Oznaka Pinterest za oglaševanje", 'sr': "Пинтерест ознака за оглашавање", 'sv': "Pinterest-tagg för reklam", 'th': "แท็ก Pinterest สำหรับการโฆษณา", 'tr': "Reklamcılık için Pinterest Etiketi", 'uk': "Тег Pinterest для реклами" , 'vi': "Thẻ Pinterest để quảng cáo", 'zh': "Pinterest 广告标签", 'zh-TW': "Pinterest 廣告標籤" },
+        duration: { de: '1 Jahr', en: '1 year', fr: '1 an', es: '1 año', it: '1 anno', nl: '1 jaar', pl: '1 rok', pt: '1 ano', da: '1 år' , 'ar': "1 سنة", 'bg': "1 година", 'bs': "1 godina", 'ca': "1 any", 'cs': "1 rok", 'el': "1 έτος", 'eu': "1 urte", 'fi': "1 vuosi", 'gl': "1 ano", 'he': "שנה אחת", 'hi': "1 वर्ष", 'hr': "1 godina", 'hu': "1 év", 'id': "1 tahun", 'ja': "1年", 'lt': "1 metai", 'mr': "1 वर्ष", 'nb': "1 år", 'ro': "1 an", 'ru': "1 год", 'sk': "1 rok", 'sl': "1 leto", 'sr': "1 година", 'sv': "1 år", 'th': "1 ปี", 'tr': "1 yıl", 'uk': "1 рік" , 'vi': "1 năm", 'zh': "1年", 'zh-TW': "1年" },
+        purpose: { de: 'Conversion-Tracking und Remarketing auf Pinterest', en: 'Conversion tracking and remarketing on Pinterest', fr: 'Suivi des conversions et remarketing sur Pinterest', es: 'Seguimiento de conversiones y remarketing en Pinterest', it: 'Tracciamento conversioni e remarketing su Pinterest', nl: 'Conversietracking en remarketing op Pinterest', pl: 'Śledzenie konwersji i remarketing na Pinterest', pt: 'Rastreamento de conversões e remarketing no Pinterest', da: 'Konverteringssporing og remarketing på Pinterest' , 'ar': "تتبع التحويل وتجديد النشاط التسويقي على موقع Pinterest", 'bg': "Проследяване на реализациите и ремаркетинг в Pinterest", 'bs': "Praćenje konverzija i ponovni marketing na Pinterestu", 'ca': "Seguiment de conversions i remàrqueting a Pinterest", 'cs': "Sledování konverzí a remarketing na Pinterestu", 'el': "Παρακολούθηση μετατροπών και επαναληπτικό μάρκετινγκ στο Pinterest", 'eu': "Bihurketen jarraipena eta birmarketina Pinterest-en", 'fi': "Tulosseuranta ja uudelleenmarkkinointi Pinterestissä", 'gl': "Seguimento de conversións e remarketing en Pinterest", 'he': "מעקב המרות ושיווק מחדש בפינטרסט", 'hi': "Pinterest पर रूपांतरण ट्रैकिंग और रीमार्केटिंग", 'hr': "Praćenje konverzija i remarketing na Pinterestu", 'hu': "Konverziókövetés és remarketing a Pinteresten", 'id': "Pelacakan konversi dan pemasaran ulang di Pinterest", 'ja': "Pinterest でのコンバージョン トラッキングとリマーケティング", 'lt': "Konversijų stebėjimas ir pakartotinė rinkodara „Pinterest“.", 'mr': "Pinterest वर रूपांतरण ट्रॅकिंग आणि रीमार्केटिंग", 'nb': "Konverteringssporing og remarketing på Pinterest", 'ro': "Urmărirea conversiilor și remarketing pe Pinterest", 'ru': "Отслеживание конверсий и ремаркетинг на Pinterest", 'sk': "Sledovanie konverzií a remarketing na Pintereste", 'sl': "Sledenje konverzijam in ponovno trženje na Pinterestu", 'sr': "Праћење конверзија и поновно оглашавање на Пинтерест-у", 'sv': "Omvandlingsspårning och remarketing på Pinterest", 'th': "การติดตามคอนเวอร์ชันและรีมาร์เก็ตติ้งบน Pinterest", 'tr': "Pinterest'te dönüşüm izleme ve yeniden pazarlama", 'uk': "Відстеження конверсій і ремаркетинг на Pinterest" , 'vi': "Theo dõi chuyển đổi và tiếp thị lại trên Pinterest", 'zh': "Pinterest上的转化跟踪和再营销", 'zh-TW': "Pinterest 上的轉換追蹤與再行銷" },
+        legalBasis: { de: 'Art. 6 Abs. 1 lit. a DSGVO (Einwilligung)', en: 'Art. 6(1)(a) GDPR (Consent)', fr: 'Art. 6(1)(a) RGPD (Consentement)', es: 'Art. 6(1)(a) RGPD (Consentimiento)', it: 'Art. 6(1)(a) GDPR (Consenso)', nl: 'Art. 6(1)(a) AVG (Toestemming)', pl: 'Art. 6(1)(a) RODO (Zgoda)', pt: 'Art. 6(1)(a) RGPD (Consentimento)', da: 'Art. 6(1)(a) GDPR (Samtykke)' , 'ar': "فن. 6(1)(أ) اللائحة العامة لحماية البيانات (الموافقة)", 'bg': "Чл. 6(1)(a) GDPR (Съгласие)", 'bs': "Art. 6(1)(a) GDPR (Saglasnost)", 'ca': "Art. 6(1)(a) GDPR (consentiment)", 'cs': "umění. 6(1)(a) GDPR (Souhlas)", 'el': "Τέχνη. 6(1)(α) GDPR (Συναίνεση)", 'eu': "art. 6(1)(a) GDPR (baimena)", 'fi': "Art. 6(1)(a) GDPR (suostumus)", 'gl': "Art. 6(1)(a) GDPR (Consentimento)", 'he': "אמנות. 6(1)(א) GDPR (הסכמה)", 'hi': "कला. 6(1)(ए) जीडीपीआर (सहमति)", 'hr': "čl. 6(1)(a) GDPR (pristanak)", 'hu': "Art. GDPR 6. cikk (1) bekezdés a) pont (beleegyezés)", 'id': "Seni. 6(1)(a) GDPR (Persetujuan)", 'ja': "アート。 6(1)(a) GDPR (同意)", 'lt': "Art. BDAR 6 straipsnio 1 dalies a punktas (sutikimas)", 'mr': "कला. 6(1)(a) GDPR (संमती)", 'nb': "Art. 6(1)(a) GDPR (samtykke)", 'ro': "art. 6(1)(a) GDPR (Consimțământ)", 'ru': "Искусство. 6(1)(a) GDPR (Согласие)", 'sk': "čl. 6(1)(a) GDPR (Súhlas)", 'sl': "Art. 6(1)(a) GDPR (soglasje)", 'sr': "чл. 6(1)(а) ГДПР (сагласност)", 'sv': "Art. 6(1)(a) GDPR (samtycke)", 'th': "ศิลปะ 6(1)(a) GDPR (ความยินยอม)", 'tr': "Sanat. 6(1)(a) GDPR (Rıza)", 'uk': "ст. 6(1)(a) GDPR (Згода)" , 'vi': "Điều. 6(1)(a) GDPR (Sự đồng ý)", 'zh': "GDPR 第6条第1款(a)项（同意）", 'zh-TW': "GDPR 第6條第1款(a)項（同意）" },
+        recipient: 'Pinterest Europe Ltd., Irland / Pinterest, Inc., USA',
+        transferSafeguard: { de: 'EU-US Data Privacy Framework', en: 'EU-US Data Privacy Framework', fr: 'EU-US Data Privacy Framework', es: 'EU-US Data Privacy Framework', it: 'EU-US Data Privacy Framework', nl: 'EU-US Data Privacy Framework', pl: 'EU-US Data Privacy Framework', pt: 'EU-US Data Privacy Framework', da: 'EU-US Data Privacy Framework' , 'ar': "إطار خصوصية البيانات بين الاتحاد الأوروبي والولايات المتحدة", 'bg': "Рамка за поверителност на данните между ЕС и САЩ", 'bs': "EU-US Data Privacy Framework", 'ca': "Marc de privadesa de dades UE-EUA", 'cs': "Rámec ochrany osobních údajů mezi EU a USA", 'el': "Πλαίσιο απορρήτου δεδομένων ΕΕ-ΗΠΑ", 'eu': "EB-AEB Datuen Pribatutasun Esparrua", 'fi': "EU:n ja Yhdysvaltojen välinen tietosuojakehys", 'gl': "Marco de privacidade de datos UE-EUA", 'he': "מסגרת פרטיות נתונים של האיחוד האירופי-ארה\"ב", 'hi': "ईयू-यूएस डेटा गोपनीयता ढांचा", 'hr': "EU-SAD okvir za zaštitu privatnosti podataka", 'hu': "EU-USA adatvédelmi keretrendszer", 'id': "Kerangka Privasi Data UE-AS", 'ja': "EU-US データプライバシーフレームワーク", 'lt': "ES ir JAV duomenų privatumo sistema", 'mr': "EU-US डेटा गोपनीयता फ्रेमवर्क", 'nb': "EU-US Data Privacy Framework", 'ro': "Cadrul UE-SUA privind confidențialitatea datelor", 'ru': "Рамочная программа конфиденциальности данных ЕС-США", 'sk': "Rámec ochrany osobných údajov medzi EÚ a USA", 'sl': "EU-ZDA okvir zasebnosti podatkov", 'sr': "Оквир приватности података ЕУ-САД", 'sv': "EU-US Data Privacy Framework", 'th': "กรอบความเป็นส่วนตัวของข้อมูลในสหภาพยุโรปและสหรัฐอเมริกา", 'tr': "AB-ABD Veri Gizliliği Çerçevesi", 'uk': "Конфіденційність даних між ЄС і США" , 'vi': "Khung bảo mật dữ liệu EU-Hoa Kỳ", 'zh': "欧盟-美国数据隐私框架", 'zh-TW': "歐盟－美國數據隱私框架" }
+      },
+      bing: {
+        name: 'Microsoft Ads (Bing)',
+        patterns: ['bing.com/bat', 'bat.bing.com'],
+        cookies: ['_uetsid', '_uetvid'],
+        description: { de: 'Bing Ads Universal Event Tracking', en: 'Bing Ads Universal Event Tracking', fr: 'Suivi universel Bing Ads', es: 'Seguimiento universal de Bing Ads', it: 'Tracciamento universale Bing Ads', nl: 'Bing Ads Universal Event Tracking', pl: 'Bing Ads Universal Event Tracking', pt: 'Bing Ads Universal Event Tracking', da: 'Bing Ads Universal Event Tracking' , 'ar': "Bing Ads تتبع الأحداث العالمية", 'bg': "Bing Ads Универсално проследяване на събития", 'bs': "Bing Ads Univerzalno praćenje događaja", 'ca': "Seguiment universal d'esdeveniments de Bing Ads", 'cs': "Bing Ads Universal Event Tracking", 'el': "Καθολική παρακολούθηση συμβάντων διαφημίσεων Bing", 'eu': "Bing Ads-en gertaeren jarraipena unibertsala", 'fi': "Bing Adsin yleinen tapahtumaseuranta", 'gl': "Seguimento universal de eventos de Bing Ads", 'he': "Bing Ads מעקב אחר אירועים אוניברסלי", 'hi': "बिंग विज्ञापन यूनिवर्सल इवेंट ट्रैकिंग", 'hr': "Bing Ads univerzalno praćenje događaja", 'hu': "Bing Ads univerzális eseménykövetés", 'id': "Pelacakan Peristiwa Universal Iklan Bing", 'ja': "Bing Ads のユニバーサル イベント トラッキング", 'lt': "„Bing Ads“ universalus įvykių stebėjimas", 'mr': "Bing जाहिराती युनिव्हर्सल इव्हेंट ट्रॅकिंग", 'nb': "Bing Ads Universal hendelsessporing", 'ro': "Urmărire universală a evenimentelor Bing Ads", 'ru': "Универсальное отслеживание событий Bing Ads", 'sk': "Bing Ads Universal Event Tracking", 'sl': "Bing Ads Univerzalno sledenje dogodkom", 'sr': "Бинг Адс Универзално праћење догађаја", 'sv': "Bing Ads Universal Event Tracking", 'th': "การติดตามกิจกรรมสากลของ Bing Ads", 'tr': "Bing Ads Evrensel Etkinlik Takibi", 'uk': "Універсальне відстеження подій Bing Ads" , 'vi': "Theo dõi sự kiện toàn cầu của Quảng cáo Bing", 'zh': "必应广告通用事件跟踪", 'zh-TW': "Bing 廣告通用事件追蹤" },
+        duration: { de: '1 Tag (_uetsid), 13 Monate (_uetvid)', en: '1 day (_uetsid), 13 months (_uetvid)', fr: '1 jour (_uetsid), 13 mois (_uetvid)', es: '1 día (_uetsid), 13 meses (_uetvid)', it: '1 giorno (_uetsid), 13 mesi (_uetvid)', nl: '1 dag (_uetsid), 13 maanden (_uetvid)', pl: '1 dzień (_uetsid), 13 miesięcy (_uetvid)', pt: '1 dia (_uetsid), 13 meses (_uetvid)', da: '1 dag (_uetsid), 13 måneder (_uetvid)' , 'ar': "يوم واحد (_uetsid)، 13 شهرًا (_uetvid)", 'bg': "1 ден (_uetsid), 13 месеца (_uetvid)", 'bs': "1 dan (_uetsid), 13 mjeseci (_uetvid)", 'ca': "1 dia (_uetsid), 13 mesos (_uetvid)", 'cs': "1 den (_uetsid), 13 měsíců (_uetvid)", 'el': "1 ημέρα (_uetsid), 13 μήνες (_uetvid)", 'eu': "1 egun (_uetsid), 13 hilabete (_uetvid)", 'fi': "1 päivä (_uetsid), 13 kuukautta (_uetvid)", 'gl': "1 día (_uetsid), 13 meses (_uetvid)", 'he': "יום אחד (_uetsid), 13 חודשים (_uetvid)", 'hi': "1 दिन (_uetsid), 13 महीने (_uetvid)", 'hr': "1 dan (_uetsid), 13 mjeseci (_uetvid)", 'hu': "1 nap (_uetsid), 13 hónap (_uetvid)", 'id': "1 hari (_uetsid), 13 bulan (_uetvid)", 'ja': "1 日 (_uetid)、13 か月 (_uetvid)", 'lt': "1 diena (_uetsid), 13 mėnesių (_uetvid)", 'mr': "1 दिवस (_uetsid), 13 महिने (_uetvid)", 'nb': "1 dag (_uetsid), 13 måneder (_uetvid)", 'ro': "1 zi (_uetsid), 13 luni (_uetvid)", 'ru': "1 день (_uetsid), 13 месяцев (_uetvid)", 'sk': "1 deň (_uetsid), 13 mesiacov (_uetvid)", 'sl': "1 dan (_uetsid), 13 mesecev (_uetvid)", 'sr': "1 дан (_уетсид), 13 месеци (_уетвид)", 'sv': "1 dag (_uetsid), 13 månader (_uetvid)", 'th': "1 วัน (_uetsid), 13 เดือน (_uetvid)", 'tr': "1 gün (_uetsid), 13 ay (_uetvid)", 'uk': "1 день (_uetsid), 13 місяців (_uetvid)" , 'vi': "1 ngày (_uetsid),  13 tháng (_uetvid)", 'zh': "1天 (_uetsid)，13个月 (_uetvid)", 'zh-TW': "1天 (_uetsid)，13個月 (_uetvid)" },
+        purpose: { de: 'Conversion-Tracking für Microsoft Advertising', en: 'Conversion tracking for Microsoft Advertising', fr: 'Suivi des conversions pour Microsoft Advertising', es: 'Seguimiento de conversiones para Microsoft Advertising', it: 'Tracciamento conversioni per Microsoft Advertising', nl: 'Conversietracking voor Microsoft Advertising', pl: 'Śledzenie konwersji dla Microsoft Advertising', pt: 'Rastreamento de conversões para Microsoft Advertising', da: 'Konverteringssporing for Microsoft Advertising' , 'ar': "تتبع التحويل لـ Microsoft Advertising", 'bg': "Проследяване на реализациите за Microsoft Advertising", 'bs': "Praćenje konverzija za Microsoft Advertising", 'ca': "Seguiment de conversions per a Microsoft Advertising", 'cs': "Sledování konverzí pro Microsoft Advertising", 'el': "Παρακολούθηση μετατροπών για Microsoft Advertising", 'eu': "Microsoft Advertising-en bihurketen jarraipena", 'fi': "Microsoft Advertisingin tulosseuranta", 'gl': "Seguimento de conversións para Microsoft Advertising", 'he': "מעקב המרות עבור Microsoft Advertising", 'hi': "माइक्रोसॉफ्ट विज्ञापन के लिए रूपांतरण ट्रैकिंग", 'hr': "Praćenje konverzija za Microsoftovo oglašavanje", 'hu': "A Microsoft Advertising konverziókövetése", 'id': "Pelacakan konversi untuk Microsoft Advertising", 'ja': "Microsoft Advertising のコンバージョン トラッキング", 'lt': "„Microsoft Advertising“ konversijų stebėjimas", 'mr': "Microsoft Advertising साठी रूपांतरण ट्रॅकिंग", 'nb': "Konverteringssporing for Microsoft Advertising", 'ro': "Urmărirea conversiilor pentru Microsoft Advertising", 'ru': "Отслеживание конверсий для Microsoft Advertising", 'sk': "Sledovanie konverzií pre Microsoft Advertising", 'sl': "Sledenje konverzijam za Microsoft Advertising", 'sr': "Праћење конверзија за Мицрософт Адвертисинг", 'sv': "Omvandlingsspårning för Microsoft Advertising", 'th': "การติดตามคอนเวอร์ชั่นสำหรับ Microsoft Advertising", 'tr': "Microsoft Publishing için dönüşüm izleme", 'uk': "Відстеження конверсій для Microsoft Advertising" , 'vi': "Theo dõi chuyển đổi cho Microsoft Advertising", 'zh': "Microsoft 广告的转化跟踪", 'zh-TW': "Microsoft 廣告的轉換追蹤" },
+        legalBasis: { de: 'Art. 6 Abs. 1 lit. a DSGVO (Einwilligung)', en: 'Art. 6(1)(a) GDPR (Consent)', fr: 'Art. 6(1)(a) RGPD (Consentement)', es: 'Art. 6(1)(a) RGPD (Consentimiento)', it: 'Art. 6(1)(a) GDPR (Consenso)', nl: 'Art. 6(1)(a) AVG (Toestemming)', pl: 'Art. 6(1)(a) RODO (Zgoda)', pt: 'Art. 6(1)(a) RGPD (Consentimento)', da: 'Art. 6(1)(a) GDPR (Samtykke)' , 'ar': "فن. 6(1)(أ) اللائحة العامة لحماية البيانات (الموافقة)", 'bg': "Чл. 6(1)(a) GDPR (Съгласие)", 'bs': "Art. 6(1)(a) GDPR (Saglasnost)", 'ca': "Art. 6(1)(a) GDPR (consentiment)", 'cs': "umění. 6(1)(a) GDPR (Souhlas)", 'el': "Τέχνη. 6(1)(α) GDPR (Συναίνεση)", 'eu': "art. 6(1)(a) GDPR (baimena)", 'fi': "Art. 6(1)(a) GDPR (suostumus)", 'gl': "Art. 6(1)(a) GDPR (Consentimento)", 'he': "אמנות. 6(1)(א) GDPR (הסכמה)", 'hi': "कला. 6(1)(ए) जीडीपीआर (सहमति)", 'hr': "čl. 6(1)(a) GDPR (pristanak)", 'hu': "Art. GDPR 6. cikk (1) bekezdés a) pont (beleegyezés)", 'id': "Seni. 6(1)(a) GDPR (Persetujuan)", 'ja': "アート。 6(1)(a) GDPR (同意)", 'lt': "Art. BDAR 6 straipsnio 1 dalies a punktas (sutikimas)", 'mr': "कला. 6(1)(a) GDPR (संमती)", 'nb': "Art. 6(1)(a) GDPR (samtykke)", 'ro': "art. 6(1)(a) GDPR (Consimțământ)", 'ru': "Искусство. 6(1)(a) GDPR (Согласие)", 'sk': "čl. 6(1)(a) GDPR (Súhlas)", 'sl': "Art. 6(1)(a) GDPR (soglasje)", 'sr': "чл. 6(1)(а) ГДПР (сагласност)", 'sv': "Art. 6(1)(a) GDPR (samtycke)", 'th': "ศิลปะ 6(1)(a) GDPR (ความยินยอม)", 'tr': "Sanat. 6(1)(a) GDPR (Rıza)", 'uk': "ст. 6(1)(a) GDPR (Згода)" , 'vi': "Điều. 6(1)(a) GDPR (Sự đồng ý)", 'zh': "GDPR 第6条第1款(a)项（同意）", 'zh-TW': "GDPR 第6條第1款(a)項（同意）" },
+        recipient: 'Microsoft Corporation, USA',
+        euEntity: { recipient: 'Microsoft Ireland Operations Ltd.', vendorLocation: 'One Microsoft Place, South County Business Park, Leopardstown, Dublin 18, Ireland' },
+        transferSafeguard: { de: 'EU-US Data Privacy Framework', en: 'EU-US Data Privacy Framework', fr: 'EU-US Data Privacy Framework', es: 'EU-US Data Privacy Framework', it: 'EU-US Data Privacy Framework', nl: 'EU-US Data Privacy Framework', pl: 'EU-US Data Privacy Framework', pt: 'EU-US Data Privacy Framework', da: 'EU-US Data Privacy Framework' , 'ar': "إطار خصوصية البيانات بين الاتحاد الأوروبي والولايات المتحدة", 'bg': "Рамка за поверителност на данните между ЕС и САЩ", 'bs': "EU-US Data Privacy Framework", 'ca': "Marc de privadesa de dades UE-EUA", 'cs': "Rámec ochrany osobních údajů mezi EU a USA", 'el': "Πλαίσιο απορρήτου δεδομένων ΕΕ-ΗΠΑ", 'eu': "EB-AEB Datuen Pribatutasun Esparrua", 'fi': "EU:n ja Yhdysvaltojen välinen tietosuojakehys", 'gl': "Marco de privacidade de datos UE-EUA", 'he': "מסגרת פרטיות נתונים של האיחוד האירופי-ארה\"ב", 'hi': "ईयू-यूएस डेटा गोपनीयता ढांचा", 'hr': "EU-SAD okvir za zaštitu privatnosti podataka", 'hu': "EU-USA adatvédelmi keretrendszer", 'id': "Kerangka Privasi Data UE-AS", 'ja': "EU-US データプライバシーフレームワーク", 'lt': "ES ir JAV duomenų privatumo sistema", 'mr': "EU-US डेटा गोपनीयता फ्रेमवर्क", 'nb': "EU-US Data Privacy Framework", 'ro': "Cadrul UE-SUA privind confidențialitatea datelor", 'ru': "Рамочная программа конфиденциальности данных ЕС-США", 'sk': "Rámec ochrany osobných údajov medzi EÚ a USA", 'sl': "EU-ZDA okvir zasebnosti podatkov", 'sr': "Оквир приватности података ЕУ-САД", 'sv': "EU-US Data Privacy Framework", 'th': "กรอบความเป็นส่วนตัวของข้อมูลในสหภาพยุโรปและสหรัฐอเมริกา", 'tr': "AB-ABD Veri Gizliliği Çerçevesi", 'uk': "Конфіденційність даних між ЄС і США" , 'vi': "Khung bảo mật dữ liệu EU-Hoa Kỳ", 'zh': "欧盟-美国数据隐私框架", 'zh-TW': "歐盟－美國數據隱私框架" }
+      },
+      criteo: {
+        name: 'Criteo',
+        patterns: ['criteo.com', 'criteo.net'],
+        cookies: ['cto_bundle'],
+        description: { de: 'Personalisierte Retargeting-Anzeigen', en: 'Personalized retargeting ads', fr: 'Annonces de retargeting personnalisées', es: 'Anuncios de retargeting personalizados', it: 'Annunci di retargeting personalizzati', nl: 'Gepersonaliseerde retargeting-advertenties', pl: 'Spersonalizowane reklamy retargetingowe', pt: 'Anúncios de retargeting personalizados', da: 'Personaliserede retargeting-annoncer' , 'ar': "إعلانات إعادة الاستهداف المخصصة", 'bg': "Персонализирани реклами за пренасочване", 'bs': "Personalizirani oglasi za ponovno ciljanje", 'ca': "Anuncis de retargeting personalitzats", 'cs': "Personalizované retargetingové reklamy", 'el': "Εξατομικευμένες διαφημίσεις επαναστόχευσης", 'eu': "Retargeting pertsonalizatutako iragarkiak", 'fi': "Henkilökohtaiset uudelleenkohdistavat mainokset", 'gl': "Anuncios de retargeting personalizados", 'he': "מודעות ריטרגינג מותאמות אישית", 'hi': "वैयक्तिकृत पुनर्लक्ष्यीकरण विज्ञापन", 'hr': "Personalizirani oglasi za ponovno ciljanje", 'hu': "Személyre szabott újracélzó hirdetések", 'id': "Iklan penargetan ulang yang dipersonalisasi", 'ja': "パーソナライズされたリターゲティング広告", 'lt': "Suasmeninti pakartotinio taikymo skelbimai", 'mr': "वैयक्तिकृत पुनर्लक्ष्यीकरण जाहिराती", 'nb': "Personlig tilpassede retargeting-annonser", 'ro': "Reclame personalizate de retargeting", 'ru': "Персонализированная ретаргетинговая реклама", 'sk': "Prispôsobené reklamy na opätovné zacielenie", 'sl': "Prilagojeni oglasi za ponovno ciljanje", 'sr': "Персонализовани огласи за поновно циљање", 'sv': "Personliga retargeting-annonser", 'th': "โฆษณากำหนดเป้าหมายใหม่ส่วนบุคคล", 'tr': "Kişiselleştirilmiş yeniden hedefleme reklamları", 'uk': "Персоналізована ретаргетингова реклама" , 'vi': "Quảng cáo nhắm mục tiêu lại được cá nhân hóa", 'zh': "个性化重定向广告", 'zh-TW': "個人化再行銷廣告" },
+        duration: { de: '13 Monate', en: '13 months', fr: '13 mois', es: '13 meses', it: '13 mesi', nl: '13 maanden', pl: '13 miesięcy', pt: '13 meses', da: '13 måneder' , 'ar': "13 شهرا", 'bg': "13 месеца", 'bs': "13 mjeseci", 'ca': "13 mesos", 'cs': "13 měsíců", 'el': "13 μηνών", 'eu': "13 hilabete", 'fi': "13 kuukautta", 'gl': "13 meses", 'he': "13 חודשים", 'hi': "13 महीने", 'hr': "13 mjeseci", 'hu': "13 hónap", 'id': "13 bulan", 'ja': "13ヶ月", 'lt': "13 mėnesių", 'mr': "13 महिने", 'nb': "13 måneder", 'ro': "13 luni", 'ru': "13 месяцев", 'sk': "13 mesiacov", 'sl': "13 mesecev", 'sr': "13 месеци", 'sv': "13 månader", 'th': "13 เดือน", 'tr': "13 ay", 'uk': "13 місяців" , 'vi': "13 tháng", 'zh': "13个月", 'zh-TW': "13個月" },
+        purpose: { de: 'Dynamisches Retargeting und personalisierte Produktanzeigen', en: 'Dynamic retargeting and personalized product ads', fr: 'Retargeting dynamique et annonces de produits personnalisées', es: 'Retargeting dinámico y anuncios de productos personalizados', it: 'Retargeting dinamico e annunci di prodotti personalizzati', nl: 'Dynamische retargeting en gepersonaliseerde productadvertenties', pl: 'Dynamiczny retargeting i spersonalizowane reklamy produktów', pt: 'Retargeting dinâmico e anúncios de produtos personalizados', da: 'Dynamisk retargeting og personaliserede produktannoncer' , 'ar': "إعادة الاستهداف الديناميكي وإعلانات المنتجات المخصصة", 'bg': "Динамично пренасочване и персонализирани продуктови реклами", 'bs': "Dinamičko ponovno ciljanje i personalizirani oglasi proizvoda", 'ca': "Retargeting dinàmic i anuncis de productes personalitzats", 'cs': "Dynamický retargeting a personalizované produktové reklamy", 'el': "Δυναμική επαναστόχευση και εξατομικευμένες διαφημίσεις προϊόντων", 'eu': "Retargeting dinamikoa eta produktuen iragarki pertsonalizatuak", 'fi': "Dynaaminen uudelleenkohdistaminen ja personoidut tuotemainokset", 'gl': "Retargeting dinámico e anuncios de produtos personalizados", 'he': "מיקוד דינמי ומודעות מוצר מותאמות אישית", 'hi': "डायनामिक रीटार्गेटिंग और वैयक्तिकृत उत्पाद विज्ञापन", 'hr': "Dinamičko ponovno ciljanje i personalizirani oglasi proizvoda", 'hu': "Dinamikus újracélzás és személyre szabott termékhirdetések", 'id': "Penargetan ulang dinamis dan iklan produk yang dipersonalisasi", 'ja': "動的なリターゲティングとパーソナライズされた商品広告", 'lt': "Dinaminis pakartotinis taikymas ir suasmeninti produktų skelbimai", 'mr': "डायनॅमिक पुनर्लक्ष्यीकरण आणि वैयक्तिकृत उत्पादन जाहिराती", 'nb': "Dynamisk retargeting og personlig tilpassede produktannonser", 'ro': "Retargeting dinamic și reclame pentru produse personalizate", 'ru': "Динамический ретаргетинг и персонализированная реклама товаров", 'sk': "Dynamický retargeting a personalizované produktové reklamy", 'sl': "Dinamično ponovno ciljanje in prilagojeni oglasi izdelkov", 'sr': "Динамичко поновно циљање и персонализовани огласи за производе", 'sv': "Dynamisk retargeting och personliga produktannonser", 'th': "การกำหนดเป้าหมายใหม่แบบไดนามิกและโฆษณาผลิตภัณฑ์ส่วนบุคคล", 'tr': "Dinamik yeniden hedefleme ve kişiselleştirilmiş ürün reklamları", 'uk': "Динамічне перенацілювання та персоналізована реклама продуктів" , 'vi': "Nhắm mục tiêu lại động và quảng cáo sản phẩm được cá nhân hóa", 'zh': "动态重定向和个性化产品广告", 'zh-TW': "動態重新定位與個人化產品廣告" },
+        legalBasis: { de: 'Art. 6 Abs. 1 lit. a DSGVO (Einwilligung)', en: 'Art. 6(1)(a) GDPR (Consent)', fr: 'Art. 6(1)(a) RGPD (Consentement)', es: 'Art. 6(1)(a) RGPD (Consentimiento)', it: 'Art. 6(1)(a) GDPR (Consenso)', nl: 'Art. 6(1)(a) AVG (Toestemming)', pl: 'Art. 6(1)(a) RODO (Zgoda)', pt: 'Art. 6(1)(a) RGPD (Consentimento)', da: 'Art. 6(1)(a) GDPR (Samtykke)' , 'ar': "فن. 6(1)(أ) اللائحة العامة لحماية البيانات (الموافقة)", 'bg': "Чл. 6(1)(a) GDPR (Съгласие)", 'bs': "Art. 6(1)(a) GDPR (Saglasnost)", 'ca': "Art. 6(1)(a) GDPR (consentiment)", 'cs': "umění. 6(1)(a) GDPR (Souhlas)", 'el': "Τέχνη. 6(1)(α) GDPR (Συναίνεση)", 'eu': "art. 6(1)(a) GDPR (baimena)", 'fi': "Art. 6(1)(a) GDPR (suostumus)", 'gl': "Art. 6(1)(a) GDPR (Consentimento)", 'he': "אמנות. 6(1)(א) GDPR (הסכמה)", 'hi': "कला. 6(1)(ए) जीडीपीआर (सहमति)", 'hr': "čl. 6(1)(a) GDPR (pristanak)", 'hu': "Art. GDPR 6. cikk (1) bekezdés a) pont (beleegyezés)", 'id': "Seni. 6(1)(a) GDPR (Persetujuan)", 'ja': "アート。 6(1)(a) GDPR (同意)", 'lt': "Art. BDAR 6 straipsnio 1 dalies a punktas (sutikimas)", 'mr': "कला. 6(1)(a) GDPR (संमती)", 'nb': "Art. 6(1)(a) GDPR (samtykke)", 'ro': "art. 6(1)(a) GDPR (Consimțământ)", 'ru': "Искусство. 6(1)(a) GDPR (Согласие)", 'sk': "čl. 6(1)(a) GDPR (Súhlas)", 'sl': "Art. 6(1)(a) GDPR (soglasje)", 'sr': "чл. 6(1)(а) ГДПР (сагласност)", 'sv': "Art. 6(1)(a) GDPR (samtycke)", 'th': "ศิลปะ 6(1)(a) GDPR (ความยินยอม)", 'tr': "Sanat. 6(1)(a) GDPR (Rıza)", 'uk': "ст. 6(1)(a) GDPR (Згода)" , 'vi': "Điều. 6(1)(a) GDPR (Sự đồng ý)", 'zh': "GDPR 第6条第1款(a)项（同意）", 'zh-TW': "GDPR 第6條第1款(a)項（同意）" },
+        recipient: { de: 'Criteo SA, Frankreich', en: 'Criteo SA, France', fr: 'Criteo SA, France', es: 'Criteo SA, Francia', it: 'Criteo SA, Francia', nl: 'Criteo SA, Frankrijk', pl: 'Criteo SA, Francja', pt: 'Criteo SA, França', da: 'Criteo SA, Frankrig' , 'ar': "كريتيو سا، فرنسا", 'bg': "Criteo SA, Франция", 'bs': "Criteo SA, Francuska", 'ca': "Criteo SA, França", 'cs': "Criteo SA, Francie", 'el': "Criteo SA, Γαλλία", 'eu': "Criteo SA, Frantzia", 'fi': "Criteo SA, Ranska", 'gl': "Criteo SA, Francia", 'he': "Criteo SA, צרפת", 'hi': "क्राइटियो एसए, फ़्रांस", 'hr': "Criteo SA, Francuska", 'hu': "Criteo SA, Franciaország", 'id': "Criteo SA, Perancis", 'ja': "Criteo SA、フランス", 'lt': "Criteo SA, Prancūzija", 'mr': "क्रिटिओ एसए, फ्रान्स", 'nb': "Criteo SA, Frankrike", 'ro': "Criteo SA, Franța", 'ru': "Criteo SA, Франция", 'sk': "Criteo SA, Francúzsko", 'sl': "Criteo SA, Francija", 'sr': "Цритео СА, Француска", 'sv': "Criteo SA, Frankrike", 'th': "Criteo SA ประเทศฝรั่งเศส", 'tr': "Criteo SA, Fransa", 'uk': "Criteo SA, Франція" , 'vi': "Criteo SA, Pháp", 'zh': "Criteo SA，法国", 'zh-TW': "Criteo股份公司，法國" },
+        transferSafeguard: { de: 'Datenverarbeitung in der EU', en: 'Data processing in the EU', fr: 'Traitement des données dans l\'UE', es: 'Procesamiento de datos en la UE', it: 'Trattamento dei dati nell\'UE', nl: 'Gegevensverwerking in de EU', pl: 'Przetwarzanie danych w UE', pt: 'Processamento de dados na UE', da: 'Databehandling i EU' , 'ar': "معالجة البيانات في الاتحاد الأوروبي", 'bg': "Обработка на данни в ЕС", 'bs': "Obrada podataka u EU", 'ca': "Tractament de dades a la UE", 'cs': "Zpracování dat v EU", 'el': "Επεξεργασία δεδομένων στην ΕΕ", 'eu': "Datuen tratamendua EBn", 'fi': "Tietojen käsittely EU:ssa", 'gl': "Tratamento de datos na UE", 'he': "עיבוד נתונים באיחוד האירופי", 'hi': "यूरोपीय संघ में डेटा प्रोसेसिंग", 'hr': "Obrada podataka u EU", 'hu': "Adatkezelés az EU-ban", 'id': "Pemrosesan data di UE", 'ja': "EU におけるデータ処理", 'lt': "Duomenų tvarkymas ES", 'mr': "EU मध्ये डेटा प्रोसेसिंग", 'nb': "Databehandling i EU", 'ro': "Prelucrarea datelor în UE", 'ru': "Обработка данных в ЕС", 'sk': "Spracovanie údajov v EÚ", 'sl': "Obdelava podatkov v EU", 'sr': "Обрада података у ЕУ", 'sv': "Databehandling inom EU", 'th': "การประมวลผลข้อมูลในสหภาพยุโรป", 'tr': "AB'de veri işleme", 'uk': "Обробка даних в ЄС" , 'vi': "Xử lý dữ liệu ở EU", 'zh': "欧盟的数据处理", 'zh-TW': "歐盟的數據處理" }
+      },
+      propeller_ads: {
+        name: 'Propeller Ads',
+        patterns: ['propellerads.com', 'propeller-tracking', 'serve.propellerads'],
+        cookies: [],
+        description: { de: 'Werbenetzwerk und Monetarisierung', en: 'Advertising network and monetization', fr: 'Réseau publicitaire et monétisation', es: 'Red publicitaria y monetización', it: 'Rete pubblicitaria e monetizzazione', nl: 'Advertentienetwerk en monetisatie', pl: 'Sieć reklamowa i monetyzacja', pt: 'Rede publicitária e monetização', da: 'Annoncenetværk og monetarisering' , 'ar': "شبكة الإعلان وتحقيق الدخل", 'bg': "Рекламна мрежа и монетизация", 'bs': "Mreža za oglašavanje i monetizacija", 'ca': "Xarxa de publicitat i monetització", 'cs': "Reklamní síť a monetizace", 'el': "Δίκτυο διαφήμισης και δημιουργία εσόδων", 'eu': "Publizitate sarea eta monetizazioa", 'fi': "Mainosverkosto ja kaupallistaminen", 'gl': "Rede de publicidade e monetización", 'he': "רשת פרסום ומונטיזציה", 'hi': "विज्ञापन नेटवर्क और मुद्रीकरण", 'hr': "Oglašavačka mreža i monetizacija", 'hu': "Reklámhálózat és bevételszerzés", 'id': "Jaringan periklanan dan monetisasi", 'ja': "広告ネットワークと収益化", 'lt': "Reklamos tinklas ir pajamų gavimas", 'mr': "जाहिरात नेटवर्क आणि कमाई", 'nb': "Annonseringsnettverk og inntektsgenerering", 'ro': "Rețea de publicitate și monetizare", 'ru': "Рекламная сеть и монетизация", 'sk': "Reklamná sieť a speňaženie", 'sl': "Oglaševalsko omrežje in monetizacija", 'sr': "Мрежа за оглашавање и монетизација", 'sv': "Annonsnätverk och intäktsgenerering", 'th': "เครือข่ายโฆษณาและการสร้างรายได้", 'tr': "Reklam ağı ve para kazanma", 'uk': "Рекламна мережа та монетизація" , 'vi': "Mạng quảng cáo và kiếm tiền", 'zh': "广告网络和变现", 'zh-TW': "廣告網絡與變現" },
+        duration: { de: '1 Jahr', en: '1 year', fr: '1 an', es: '1 año', it: '1 anno', nl: '1 jaar', pl: '1 rok', pt: '1 ano', da: '1 år' , 'ar': "1 سنة", 'bg': "1 година", 'bs': "1 godina", 'ca': "1 any", 'cs': "1 rok", 'el': "1 έτος", 'eu': "1 urte", 'fi': "1 vuosi", 'gl': "1 ano", 'he': "שנה אחת", 'hi': "1 वर्ष", 'hr': "1 godina", 'hu': "1 év", 'id': "1 tahun", 'ja': "1年", 'lt': "1 metai", 'mr': "1 वर्ष", 'nb': "1 år", 'ro': "1 an", 'ru': "1 год", 'sk': "1 rok", 'sl': "1 leto", 'sr': "1 година", 'sv': "1 år", 'th': "1 ปี", 'tr': "1 yıl", 'uk': "1 рік" , 'vi': "1 năm", 'zh': "1年", 'zh-TW': "1年" },
+        purpose: { de: 'Anzeigenbereitstellung und Monetarisierung', en: 'Ad serving and monetization', fr: 'Diffusion d\'annonces et monétisation', es: 'Publicación de anuncios y monetización', it: 'Erogazione di annunci e monetizzazione', nl: 'Advertentieweergave en monetisatie', pl: 'Wyświetlanie reklam i monetyzacja', pt: 'Exibição de anúncios e monetização', da: 'Annoncevisning og monetarisering' , 'ar': "عرض الإعلانات وتحقيق الدخل منها", 'bg': "Сервиране на реклами и осигуряване на приходи", 'bs': "Posluživanje oglasa i monetizacija", 'ca': "Publicació d'anuncis i monetització", 'cs': "Zobrazování reklam a zpeněžení", 'el': "Προβολή διαφημίσεων και δημιουργία εσόδων", 'eu': "Iragarkiak hornitzea eta dirua irabaztea", 'fi': "Mainosten näyttäminen ja kaupallistaminen", 'gl': "Publicación e monetización", 'he': "פרסום מודעות ומונטיזציה", 'hi': "विज्ञापन सेवा और मुद्रीकरण", 'hr': "Posluživanje oglasa i monetizacija", 'hu': "Hirdetésmegjelenítés és bevételszerzés", 'id': "Penayangan iklan dan monetisasi", 'ja': "広告配信と収益化", 'lt': "Skelbimų teikimas ir pajamų gavimas", 'mr': "जाहिरात सेवा आणि कमाई", 'nb': "Annonsevisning og inntektsgenerering", 'ro': "Difuzarea anunțurilor și generarea de bani", 'ru': "Показ рекламы и монетизация", 'sk': "Zobrazovanie reklám a speňaženie", 'sl': "Prikazovanje oglasov in monetizacija", 'sr': "Приказивање огласа и монетизација", 'sv': "Annonsvisning och intäktsgenerering", 'th': "การแสดงโฆษณาและการสร้างรายได้", 'tr': "Reklam sunma ve para kazanma", 'uk': "Розміщення реклами та монетизація" , 'vi': "Phân phối quảng cáo và kiếm tiền", 'zh': "广告投放与变现", 'zh-TW': "廣告投放與營利" },
+        legalBasis: { de: 'Art. 6 Abs. 1 lit. a DSGVO (Einwilligung)', en: 'Art. 6(1)(a) GDPR (Consent)', fr: 'Art. 6(1)(a) RGPD (Consentement)', es: 'Art. 6(1)(a) RGPD (Consentimiento)', it: 'Art. 6(1)(a) GDPR (Consenso)', nl: 'Art. 6(1)(a) AVG (Toestemming)', pl: 'Art. 6(1)(a) RODO (Zgoda)', pt: 'Art. 6(1)(a) RGPD (Consentimento)', da: 'Art. 6(1)(a) GDPR (Samtykke)' , 'ar': "فن. 6(1)(أ) اللائحة العامة لحماية البيانات (الموافقة)", 'bg': "Чл. 6(1)(a) GDPR (Съгласие)", 'bs': "Art. 6(1)(a) GDPR (Saglasnost)", 'ca': "Art. 6(1)(a) GDPR (consentiment)", 'cs': "umění. 6(1)(a) GDPR (Souhlas)", 'el': "Τέχνη. 6(1)(α) GDPR (Συναίνεση)", 'eu': "art. 6(1)(a) GDPR (baimena)", 'fi': "Art. 6(1)(a) GDPR (suostumus)", 'gl': "Art. 6(1)(a) GDPR (Consentimento)", 'he': "אמנות. 6(1)(א) GDPR (הסכמה)", 'hi': "कला. 6(1)(ए) जीडीपीआर (सहमति)", 'hr': "čl. 6(1)(a) GDPR (pristanak)", 'hu': "Art. GDPR 6. cikk (1) bekezdés a) pont (beleegyezés)", 'id': "Seni. 6(1)(a) GDPR (Persetujuan)", 'ja': "アート。 6(1)(a) GDPR (同意)", 'lt': "Art. BDAR 6 straipsnio 1 dalies a punktas (sutikimas)", 'mr': "कला. 6(1)(a) GDPR (संमती)", 'nb': "Art. 6(1)(a) GDPR (samtykke)", 'ro': "art. 6(1)(a) GDPR (Consimțământ)", 'ru': "Искусство. 6(1)(a) GDPR (Согласие)", 'sk': "čl. 6(1)(a) GDPR (Súhlas)", 'sl': "Art. 6(1)(a) GDPR (soglasje)", 'sr': "чл. 6(1)(а) ГДПР (сагласност)", 'sv': "Art. 6(1)(a) GDPR (samtycke)", 'th': "ศิลปะ 6(1)(a) GDPR (ความยินยอม)", 'tr': "Sanat. 6(1)(a) GDPR (Rıza)", 'uk': "ст. 6(1)(a) GDPR (Згода)" , 'vi': "Điều. 6(1)(a) GDPR (Sự đồng ý)", 'zh': "GDPR 第6条第1款(a)项（同意）", 'zh-TW': "GDPR 第6條第1款(a)項（同意）" },
+        recipient: { de: 'Propeller Ads, Zypern', en: 'Propeller Ads, Cyprus', fr: 'Propeller Ads, Chypre', es: 'Propeller Ads, Chipre', it: 'Propeller Ads, Cipro', nl: 'Propeller Ads, Cyprus', pl: 'Propeller Ads, Cypr', pt: 'Propeller Ads, Chipre', da: 'Propeller Ads, Cypern' , 'ar': "إعلانات المروحة، قبرص", 'bg': "Propeller Ads, Кипър", 'bs': "Propeller Ads, Kipar", 'ca': "Propeller Ads, Xipre", 'cs': "Propeller Ads, Kypr", 'el': "Propeller Ads, Κύπρος", 'eu': "Propeller Ads, Txipre", 'fi': "Propeller Ads, Kypros", 'gl': "Propeller Ads, Chipre", 'he': "Ads Propeller, קפריסין", 'hi': "प्रोपेलर विज्ञापन, साइप्रस", 'hr': "Propeler oglasi, Cipar", 'hu': "Propeller Ads, Ciprus", 'id': "Iklan Propeller, Siprus", 'ja': "プロペラ広告、キプロス", 'lt': "Propeller Ads, Kipras", 'mr': "प्रोपेलर जाहिराती, सायप्रस", 'nb': "Propeller Ads, Kypros", 'ro': "Propeller Ads, Cipru", 'ru': "Пропеллер Эдс, Кипр", 'sk': "Propeller Ads, Cyprus", 'sl': "Propeller Ads, Ciper", 'sr': "Пропеллер Адс, Кипар", 'sv': "Propeller Ads, Cypern", 'th': "โฆษณาใบพัด ประเทศไซปรัส", 'tr': "Pervane Reklamları, Kıbrıs", 'uk': "Propeller Ads, Кіпр" , 'vi': "Quảng cáo cánh quạt, Síp", 'zh': "螺旋桨广告，塞浦路斯", 'zh-TW': "Propeller 廣告，賽普勒斯" },
+        transferSafeguard: { de: 'Datenverarbeitung in der EU', en: 'Data processing in the EU', fr: 'Traitement des données dans l\'UE', es: 'Procesamiento de datos en la UE', it: 'Trattamento dei dati nell\'UE', nl: 'Gegevensverwerking in de EU', pl: 'Przetwarzanie danych w UE', pt: 'Processamento de dados na UE', da: 'Databehandling i EU' , 'ar': "معالجة البيانات في الاتحاد الأوروبي", 'bg': "Обработка на данни в ЕС", 'bs': "Obrada podataka u EU", 'ca': "Tractament de dades a la UE", 'cs': "Zpracování dat v EU", 'el': "Επεξεργασία δεδομένων στην ΕΕ", 'eu': "Datuen tratamendua EBn", 'fi': "Tietojen käsittely EU:ssa", 'gl': "Tratamento de datos na UE", 'he': "עיבוד נתונים באיחוד האירופי", 'hi': "यूरोपीय संघ में डेटा प्रोसेसिंग", 'hr': "Obrada podataka u EU", 'hu': "Adatkezelés az EU-ban", 'id': "Pemrosesan data di UE", 'ja': "EU におけるデータ処理", 'lt': "Duomenų tvarkymas ES", 'mr': "EU मध्ये डेटा प्रोसेसिंग", 'nb': "Databehandling i EU", 'ro': "Prelucrarea datelor în UE", 'ru': "Обработка данных в ЕС", 'sk': "Spracovanie údajov v EÚ", 'sl': "Obdelava podatkov v EU", 'sr': "Обрада података у ЕУ", 'sv': "Databehandling inom EU", 'th': "การประมวลผลข้อมูลในสหภาพยุโรป", 'tr': "AB'de veri işleme", 'uk': "Обробка даних в ЄС" , 'vi': "Xử lý dữ liệu ở EU", 'zh': "欧盟的数据处理", 'zh-TW': "歐盟的數據處理" }
+      },
+      mgid: {
+        name: 'MGID',
+        patterns: ['mgid.com', 'jsc.mgid.com', 'servicer.mgid'],
+        cookies: [],
+        description: { de: 'Native Advertising Plattform', en: 'Native advertising platform', fr: 'Plateforme de publicité native', es: 'Plataforma de publicidad nativa', it: 'Piattaforma di pubblicità nativa', nl: 'Platform voor native advertenties', pl: 'Platforma reklamy natywnej', pt: 'Plataforma de publicidade nativa', da: 'Platform for native annoncering' , 'ar': "منصة إعلانية أصلية", 'bg': "Нативна рекламна платформа", 'bs': "Nativna platforma za oglašavanje", 'ca': "Plataforma de publicitat nativa", 'cs': "Nativní reklamní platforma", 'el': "Πλατφόρμα εγγενούς διαφήμισης", 'eu': "Publizitate plataforma natiboa", 'fi': "Natiivimainontaalusta", 'gl': "Plataforma de publicidade nativa", 'he': "פלטפורמת פרסום נייטיב", 'hi': "मूल विज्ञापन मंच", 'hr': "Nativna platforma za oglašavanje", 'hu': "Natív hirdetési platform", 'id': "Platform periklanan asli", 'ja': "ネイティブ広告プラットフォーム", 'lt': "Vietinės reklamos platforma", 'mr': "मूळ जाहिरात प्लॅटफॉर्म", 'nb': "Native advertising-plattform", 'ro': "Platformă nativă de publicitate", 'ru': "Нативная рекламная платформа", 'sk': "Natívna reklamná platforma", 'sl': "Izvorna oglaševalska platforma", 'sr': "Изворна платформа за оглашавање", 'sv': "Native advertising-plattform", 'th': "แพลตฟอร์มโฆษณาเนทีฟ", 'tr': "Yerel reklam platformu", 'uk': "Нативна рекламна платформа" , 'vi': "Nền tảng quảng cáo gốc", 'zh': "原生广告平台", 'zh-TW': "原生廣告平台" },
+        duration: { de: '1 Jahr', en: '1 year', fr: '1 an', es: '1 año', it: '1 anno', nl: '1 jaar', pl: '1 rok', pt: '1 ano', da: '1 år' , 'ar': "1 سنة", 'bg': "1 година", 'bs': "1 godina", 'ca': "1 any", 'cs': "1 rok", 'el': "1 έτος", 'eu': "1 urte", 'fi': "1 vuosi", 'gl': "1 ano", 'he': "שנה אחת", 'hi': "1 वर्ष", 'hr': "1 godina", 'hu': "1 év", 'id': "1 tahun", 'ja': "1年", 'lt': "1 metai", 'mr': "1 वर्ष", 'nb': "1 år", 'ro': "1 an", 'ru': "1 год", 'sk': "1 rok", 'sl': "1 leto", 'sr': "1 година", 'sv': "1 år", 'th': "1 ปี", 'tr': "1 yıl", 'uk': "1 рік" , 'vi': "1 năm", 'zh': "1年", 'zh-TW': "1年" },
+        purpose: { de: 'Native Werbeanzeigen und Content-Empfehlungen', en: 'Native ads and content recommendations', fr: 'Annonces natives et recommandations de contenu', es: 'Anuncios nativos y recomendaciones de contenido', it: 'Annunci nativi e raccomandazioni di contenuti', nl: 'Native advertenties en contentaanbevelingen', pl: 'Reklamy natywne i rekomendacje treści', pt: 'Anúncios nativos e recomendações de conteúdo', da: 'Native annoncer og indholdsanbefalinger' , 'ar': "الإعلانات الأصلية وتوصيات المحتوى", 'bg': "Нативни реклами и препоръки за съдържание", 'bs': "Nativni oglasi i preporuke sadržaja", 'ca': "Anuncis natius i recomanacions de contingut", 'cs': "Nativní reklamy a doporučení obsahu", 'el': "Εγγενείς διαφημίσεις και προτάσεις περιεχομένου", 'eu': "Jatorrizko iragarkiak eta edukien gomendioak", 'fi': "Natiivimainokset ja sisältösuositukset", 'gl': "Anuncios nativos e recomendacións de contido", 'he': "מודעות מותאמות והמלצות תוכן", 'hi': "मूल विज्ञापन और सामग्री अनुशंसाएँ", 'hr': "Nativni oglasi i preporuke sadržaja", 'hu': "Natív hirdetések és tartalmi javaslatok", 'id': "Iklan asli dan rekomendasi konten", 'ja': "ネイティブ広告とコンテンツのレコメンデーション", 'lt': "Savieji skelbimai ir turinio rekomendacijos", 'mr': "मूळ जाहिराती आणि सामग्री शिफारसी", 'nb': "Innebygde annonser og innholdsanbefalinger", 'ro': "Reclame native și recomandări de conținut", 'ru': "Нативная реклама и рекомендации по контенту", 'sk': "Natívne reklamy a odporúčania obsahu", 'sl': "Izvorni oglasi in priporočila glede vsebine", 'sr': "Уклопљени огласи и препоруке за садржај", 'sv': "Integrerade annonser och innehållsrekommendationer", 'th': "โฆษณาเนทีฟและคำแนะนำเนื้อหา", 'tr': "Yerel reklamlar ve içerik önerileri", 'uk': "Нативна реклама та рекомендації щодо вмісту" , 'vi': "Quảng cáo gốc và đề xuất nội dung", 'zh': "原生广告和内容推荐", 'zh-TW': "原生廣告和內容推薦" },
+        legalBasis: { de: 'Art. 6 Abs. 1 lit. a DSGVO (Einwilligung)', en: 'Art. 6(1)(a) GDPR (Consent)', fr: 'Art. 6(1)(a) RGPD (Consentement)', es: 'Art. 6(1)(a) RGPD (Consentimiento)', it: 'Art. 6(1)(a) GDPR (Consenso)', nl: 'Art. 6(1)(a) AVG (Toestemming)', pl: 'Art. 6(1)(a) RODO (Zgoda)', pt: 'Art. 6(1)(a) RGPD (Consentimento)', da: 'Art. 6(1)(a) GDPR (Samtykke)' , 'ar': "فن. 6(1)(أ) اللائحة العامة لحماية البيانات (الموافقة)", 'bg': "Чл. 6(1)(a) GDPR (Съгласие)", 'bs': "Art. 6(1)(a) GDPR (Saglasnost)", 'ca': "Art. 6(1)(a) GDPR (consentiment)", 'cs': "umění. 6(1)(a) GDPR (Souhlas)", 'el': "Τέχνη. 6(1)(α) GDPR (Συναίνεση)", 'eu': "art. 6(1)(a) GDPR (baimena)", 'fi': "Art. 6(1)(a) GDPR (suostumus)", 'gl': "Art. 6(1)(a) GDPR (Consentimento)", 'he': "אמנות. 6(1)(א) GDPR (הסכמה)", 'hi': "कला. 6(1)(ए) जीडीपीआर (सहमति)", 'hr': "čl. 6(1)(a) GDPR (pristanak)", 'hu': "Art. GDPR 6. cikk (1) bekezdés a) pont (beleegyezés)", 'id': "Seni. 6(1)(a) GDPR (Persetujuan)", 'ja': "アート。 6(1)(a) GDPR (同意)", 'lt': "Art. BDAR 6 straipsnio 1 dalies a punktas (sutikimas)", 'mr': "कला. 6(1)(a) GDPR (संमती)", 'nb': "Art. 6(1)(a) GDPR (samtykke)", 'ro': "art. 6(1)(a) GDPR (Consimțământ)", 'ru': "Искусство. 6(1)(a) GDPR (Согласие)", 'sk': "čl. 6(1)(a) GDPR (Súhlas)", 'sl': "Art. 6(1)(a) GDPR (soglasje)", 'sr': "чл. 6(1)(а) ГДПР (сагласност)", 'sv': "Art. 6(1)(a) GDPR (samtycke)", 'th': "ศิลปะ 6(1)(a) GDPR (ความยินยอม)", 'tr': "Sanat. 6(1)(a) GDPR (Rıza)", 'uk': "ст. 6(1)(a) GDPR (Згода)" , 'vi': "Điều. 6(1)(a) GDPR (Sự đồng ý)", 'zh': "GDPR 第6条第1款(a)项（同意）", 'zh-TW': "GDPR 第6條第1款(a)項（同意）" },
+        recipient: 'MGID Inc., USA',
+        transferSafeguard: { de: 'Standardvertragsklauseln', en: 'Standard Contractual Clauses', fr: 'Clauses contractuelles types', es: 'Cláusulas contractuales tipo', it: 'Clausole contrattuali standard', nl: 'Standaard contractbepalingen', pl: 'Standardowe klauzule umowne', pt: 'Cláusulas contratuais-tipo', da: 'Standardkontraktbestemmelser' , 'ar': "الشروط التعاقدية القياسية", 'bg': "Стандартни договорни клаузи", 'bs': "Standardne ugovorne klauzule", 'ca': "Clàusules contractuals tipus", 'cs': "Standardní smluvní doložky", 'el': "Τυπικές συμβατικές ρήτρες", 'eu': "Kontratu-klausula estandarrak", 'fi': "Vakiosopimuslausekkeet", 'gl': "Cláusulas contractuais tipo", 'he': "סעיפים חוזיים סטנדרטיים", 'hi': "मानक संविदात्मक धाराएँ", 'hr': "Standardne ugovorne klauzule", 'hu': "Általános szerződési feltételek", 'id': "Klausul Kontrak Standar", 'ja': "標準契約条項", 'lt': "Standartinės sutarties sąlygos", 'mr': "मानक करार कलमे", 'nb': "Standard kontraktsmessige klausuler", 'ro': "Clauze Contractuale Standard", 'ru': "Стандартные договорные условия", 'sk': "Štandardné zmluvné doložky", 'sl': "Standardne pogodbene klavzule", 'sr': "Стандардне уговорне клаузуле", 'sv': "Standardavtalsklausuler", 'th': "ข้อสัญญามาตรฐาน", 'tr': "Standart Sözleşme Maddeleri", 'uk': "Стандартні договірні положення" , 'vi': "Điều khoản hợp đồng tiêu chuẩn", 'zh': "标准合同条款", 'zh-TW': "標準合約條款" }
+      }
+    },
+    functional: {
+      crisp: {
+        name: 'Crisp Chat',
+        patterns: ['crisp.chat', 'client.crisp.chat'],
+        cookies: ['crisp-client/*'],
+        description: { de: 'Live-Chat Support', en: 'Live chat support', fr: 'Support par chat en direct', es: 'Soporte por chat en vivo', it: 'Supporto via chat dal vivo', nl: 'Live chat ondersteuning', pl: 'Wsparcie przez czat na żywo', pt: 'Suporte por chat ao vivo', da: 'Live chat support' , 'ar': "دعم الدردشة الحية", 'bg': "Поддръжка за чат на живо", 'bs': "Podrška za chat uživo", 'ca': "Suport de xat en directe", 'cs': "Podpora živého chatu", 'el': "Υποστήριξη ζωντανής συνομιλίας", 'eu': "Zuzeneko txat laguntza", 'fi': "Live chat -tuki", 'gl': "Soporte de chat en directo", 'he': "תמיכה בצ'אט חי", 'hi': "लाइव चैट समर्थन", 'hr': "Podrška za chat uživo", 'hu': "Élő chat támogatás", 'id': "Dukungan obrolan langsung", 'ja': "ライブチャットサポート", 'lt': "Tiesioginio pokalbio palaikymas", 'mr': "थेट गप्पा समर्थन", 'nb': "Live chat-støtte", 'ro': "Asistență prin chat live", 'ru': "Поддержка в чате", 'sk': "Podpora živého chatu", 'sl': "Podpora za klepet v živo", 'sr': "Подршка за ћаскање уживо", 'sv': "Live chat support", 'th': "รองรับการแชทสด", 'tr': "Canlı sohbet desteği", 'uk': "Підтримка в чаті" , 'vi': "Hỗ trợ trò chuyện trực tiếp", 'zh': "在线聊天支持", 'zh-TW': "即時聊天支援" },
+        duration: { de: '6 Monate', en: '6 months', fr: '6 mois', es: '6 meses', it: '6 mesi', nl: '6 maanden', pl: '6 miesięcy', pt: '6 meses', da: '6 måneder' , 'ar': "6 أشهر", 'bg': "6 месеца", 'bs': "6 mjeseci", 'ca': "6 mesos", 'cs': "6 měsíců", 'el': "6 μηνών", 'eu': "6 hilabete", 'fi': "6 kuukautta", 'gl': "6 meses", 'he': "6 חודשים", 'hi': "6 महीने", 'hr': "6 mjeseci", 'hu': "6 hónap", 'id': "6 bulan", 'ja': "6ヶ月", 'lt': "6 mėn", 'mr': "6 महिने", 'nb': "6 måneder", 'ro': "6 luni", 'ru': "6 месяцев", 'sk': "6 mesiacov", 'sl': "6 mesecev", 'sr': "6 месеци", 'sv': "6 månader", 'th': "6 เดือน", 'tr': "6 ay", 'uk': "6 місяців" , 'vi': "6 tháng", 'zh': "6个月", 'zh-TW': "6個月" },
+        purpose: { de: 'Bereitstellung des Live-Chat-Widgets für Kundensupport', en: 'Providing live chat widget for customer support', fr: 'Mise à disposition du widget de chat pour le support client', es: 'Provisión del widget de chat para atención al cliente', it: 'Fornitura del widget di chat per il supporto clienti', nl: 'Aanbieden van live chat widget voor klantenondersteuning', pl: 'Udostępnienie widgetu czatu dla obsługi klienta', pt: 'Disponibilização do widget de chat para suporte ao cliente', da: 'Levering af live chat widget til kundesupport' , 'ar': "توفير أداة الدردشة المباشرة لدعم العملاء", 'bg': "Предоставяне на джаджа за чат на живо за поддръжка на клиенти", 'bs': "Pružanje widgeta za chat uživo za korisničku podršku", 'ca': "Proporcionar un giny de xat en directe per a l'atenció al client", 'cs': "Poskytování widgetu živého chatu pro zákaznickou podporu", 'el': "Παροχή γραφικού στοιχείου ζωντανής συνομιλίας για υποστήριξη πελατών", 'eu': "Zuzeneko txataren widget-a eskaintzea bezeroarentzako arretarako", 'fi': "Live-chat-widgetin tarjoaminen asiakastukea varten", 'gl': "Ofrecendo widget de chat en directo para atención ao cliente", 'he': "מתן ווידג'ט של צ'אט חי לתמיכת לקוחות", 'hi': "ग्राहक सहायता के लिए लाइव चैट विजेट प्रदान करना", 'hr': "Pružanje widgeta za chat uživo za korisničku podršku", 'hu': "Élő chat widget biztosítása az ügyfélszolgálathoz", 'id': "Menyediakan widget obrolan langsung untuk dukungan pelanggan", 'ja': "カスタマーサポート用のライブチャットウィジェットの提供", 'lt': "Tiesioginio pokalbio valdiklio teikimas klientų aptarnavimui", 'mr': "ग्राहक समर्थनासाठी थेट चॅट विजेट प्रदान करणे", 'nb': "Tilbyr live chat-widget for kundestøtte", 'ro': "Furnizarea unui widget de chat live pentru asistența clienților", 'ru': "Предоставление виджета живого чата для поддержки клиентов", 'sk': "Poskytovanie widgetu živého chatu pre zákaznícku podporu", 'sl': "Zagotavljanje pripomočka za klepet v živo za podporo strankam", 'sr': "Обезбеђивање виџета за ћаскање уживо за корисничку подршку", 'sv': "Tillhandahåller livechattwidget för kundsupport", 'th': "จัดทำวิดเจ็ตแชทสดสำหรับการสนับสนุนลูกค้า", 'tr': "Müşteri desteği için canlı sohbet widget'ı sağlanması", 'uk': "Надання віджета чату для підтримки клієнтів" , 'vi': "Cung cấp tiện ích trò chuyện trực tiếp để hỗ trợ khách hàng", 'zh': "提供用于客户支持的实时聊天小部件", 'zh-TW': "提供用於客戶支持的即時聊天小工具" },
+        legalBasis: { de: 'Art. 6 Abs. 1 lit. a DSGVO (Einwilligung) oder lit. b (Vertragserfüllung)', en: 'Art. 6(1)(a) GDPR (Consent) or (b) (Contract performance)', fr: 'Art. 6(1)(a) RGPD (Consentement) ou (b) (Exécution du contrat)', es: 'Art. 6(1)(a) RGPD (Consentimiento) o (b) (Ejecución del contrato)', it: 'Art. 6(1)(a) GDPR (Consenso) o (b) (Esecuzione del contratto)', nl: 'Art. 6(1)(a) AVG (Toestemming) of (b) (Contractuitvoering)', pl: 'Art. 6(1)(a) RODO (Zgoda) lub (b) (Wykonanie umowy)', pt: 'Art. 6(1)(a) RGPD (Consentimento) ou (b) (Execução do contrato)', da: 'Art. 6(1)(a) GDPR (Samtykke) eller (b) (Kontraktopfyldelse)' , 'ar': "فن. 6(1)(أ) اللائحة العامة لحماية البيانات (الموافقة) أو (ب) (تنفيذ العقد)", 'bg': "Чл. 6(1)(a) GDPR (Съгласие) или (b) (Изпълнение на договора)", 'bs': "Art. 6(1)(a) GDPR (saglasnost) ili (b) (izvršenje ugovora)", 'ca': "Art. 6(1)(a) GDPR (consentiment) o (b) (execució del contracte)", 'cs': "umění. 6(1)(a) GDPR (Souhlas) nebo (b) (Plnění smlouvy)", 'el': "Τέχνη. 6(1)(α) GDPR (Συναίνεση) ή (β) (Εκτέλεση σύμβασης)", 'eu': "art. 6(1)(a) GDPR (Adostasuna) edo (b) (Kontratuaren betetzea)", 'fi': "Art. 6(1)(a) GDPR (suostumus) tai (b) (Sopimuksen toteuttaminen)", 'gl': "Art. 6(1)(a) GDPR (Consentimento) ou (b) (Execución do contrato)", 'he': "אמנות. 6(1)(א) GDPR (הסכמה) או (ב) (ביצוע חוזה)", 'hi': "कला. 6(1)(ए) जीडीपीआर (सहमति) या (बी) (अनुबंध प्रदर्शन)", 'hr': "čl. 6(1)(a) GDPR (Pristanak) ili (b) (Izvedba ugovora)", 'hu': "Art. 6(1)(a) GDPR (beleegyezés) vagy (b) (szerződés teljesítése)", 'id': "Seni. 6(1)(a) GDPR (Persetujuan) atau (b) (Kinerja kontrak)", 'ja': "アート。 6(1)(a) GDPR (同意) または (b) (契約履行)", 'lt': "Art. BDAR 6 straipsnio 1 dalies a punktas (sutikimas) arba b punktas (sutarties vykdymas)", 'mr': "कला. 6(1)(a) GDPR (संमती) किंवा (b) (कराराची कामगिरी)", 'nb': "Art. 6(1)(a) GDPR (samtykke) eller (b) (kontraktsutførelse)", 'ro': "art. 6(1)(a) GDPR (Consimțământ) sau (b) (Executarea contractului)", 'ru': "Искусство. 6(1)(a) GDPR (Согласие) или (b) (Исполнение Договора)", 'sk': "čl. 6(1)(a) GDPR (Súhlas) alebo (b) (Plnenie zmluvy)", 'sl': "Art. 6(1)(a) GDPR (Soglasje) ali (b) (Izvajanje pogodbe)", 'sr': "чл. 6(1)(а) ГДПР (сагласност) или (б) (извршење уговора)", 'sv': "Art. 6(1)(a) GDPR (samtycke) eller (b) (kontraktsutförande)", 'th': "ศิลปะ 6(1)(a) GDPR (ความยินยอม) หรือ (b) (ผลการปฏิบัติงานของสัญญา)", 'tr': "Sanat. 6(1)(a) GDPR (Rıza) veya (b) (Sözleşmenin ifası)", 'uk': "ст. 6(1)(a) GDPR (Згода) або (b) (Виконання контракту)" , 'vi': "Nghệ thuật. 6(1)(a) GDPR (Sự đồng ý) hoặc (b) (Thực hiện hợp đồng)", 'zh': "GDPR第6条第1款(a)（同意）或(b)（合同履行）", 'zh-TW': "第6條第1款(a) GDPR（同意）或(b)（履行合約）" },
+        recipient: { de: 'Crisp IM SAS, Frankreich', en: 'Crisp IM SAS, France', fr: 'Crisp IM SAS, France', es: 'Crisp IM SAS, Francia', it: 'Crisp IM SAS, Francia', nl: 'Crisp IM SAS, Frankrijk', pl: 'Crisp IM SAS, Francja', pt: 'Crisp IM SAS, França', da: 'Crisp IM SAS, Frankrig' , 'ar': "كريسب آي إم ساس، فرنسا", 'bg': "Crisp IM SAS, Франция", 'bs': "Crisp IM SAS, Francuska", 'ca': "Crisp IM SAS, França", 'cs': "Crisp IM SAS, Francie", 'el': "Crisp IM SAS, Γαλλία", 'eu': "Crisp IM SAS, Frantzia", 'fi': "Crisp IM SAS, Ranska", 'gl': "Crisp IM SAS, Francia", 'he': "Crisp IM SAS, צרפת", 'hi': "क्रिस्प आईएम एसएएस, फ्रांस", 'hr': "Crisp IM SAS, Francuska", 'hu': "Crisp IM SAS, Franciaország", 'id': "Crisp IM SAS, Prancis", 'ja': "クリスプ IM SAS、フランス", 'lt': "Crisp IM SAS, Prancūzija", 'mr': "कुरकुरीत IM SAS, फ्रान्स", 'nb': "Crisp IM SAS, Frankrike", 'ro': "Crisp IM SAS, Franța", 'ru': "Крисп ИМ САС, Франция", 'sk': "Crisp IM SAS, Francúzsko", 'sl': "Crisp IM SAS, Francija", 'sr': "Црисп ИМ САС, Француска", 'sv': "Crisp IM SAS, Frankrike", 'th': "Crisp IM SAS ประเทศฝรั่งเศส", 'tr': "Crisp IM SAS, Fransa", 'uk': "Crisp IM SAS, Франція" , 'vi': "Crisp IM SAS, Pháp", 'zh': "Crisp IM SAS，法国", 'zh-TW': "Crisp IM SAS，法國" },
+        transferSafeguard: { de: 'Datenverarbeitung in der EU', en: 'Data processing in the EU', fr: 'Traitement des données dans l\'UE', es: 'Procesamiento de datos en la UE', it: 'Trattamento dei dati nell\'UE', nl: 'Gegevensverwerking in de EU', pl: 'Przetwarzanie danych w UE', pt: 'Processamento de dados na UE', da: 'Databehandling i EU' , 'ar': "معالجة البيانات في الاتحاد الأوروبي", 'bg': "Обработка на данни в ЕС", 'bs': "Obrada podataka u EU", 'ca': "Tractament de dades a la UE", 'cs': "Zpracování dat v EU", 'el': "Επεξεργασία δεδομένων στην ΕΕ", 'eu': "Datuen tratamendua EBn", 'fi': "Tietojen käsittely EU:ssa", 'gl': "Tratamento de datos na UE", 'he': "עיבוד נתונים באיחוד האירופי", 'hi': "यूरोपीय संघ में डेटा प्रोसेसिंग", 'hr': "Obrada podataka u EU", 'hu': "Adatkezelés az EU-ban", 'id': "Pemrosesan data di UE", 'ja': "EU におけるデータ処理", 'lt': "Duomenų tvarkymas ES", 'mr': "EU मध्ये डेटा प्रोसेसिंग", 'nb': "Databehandling i EU", 'ro': "Prelucrarea datelor în UE", 'ru': "Обработка данных в ЕС", 'sk': "Spracovanie údajov v EÚ", 'sl': "Obdelava podatkov v EU", 'sr': "Обрада података у ЕУ", 'sv': "Databehandling inom EU", 'th': "การประมวลผลข้อมูลในสหภาพยุโรป", 'tr': "AB'de veri işleme", 'uk': "Обробка даних в ЄС" , 'vi': "Xử lý dữ liệu ở EU", 'zh': "欧盟的数据处理", 'zh-TW': "歐盟的數據處理" }
+      },
+      intercom: {
+        name: 'Intercom',
+        patterns: ['intercom.io', 'widget.intercom.io'],
+        cookies: ['intercom-*'],
+        description: { de: 'Kunden-Messaging Platform', en: 'Customer messaging platform', fr: 'Plateforme de messagerie client', es: 'Plataforma de mensajería para clientes', it: 'Piattaforma di messaggistica clienti', nl: 'Klantberichten-platform', pl: 'Platforma komunikacji z klientami', pt: 'Plataforma de mensagens de clientes', da: 'Kundebeskedplatform' , 'ar': "منصة رسائل العملاء", 'bg': "Платформа за съобщения на клиенти", 'bs': "Platforma za razmenu poruka klijentima", 'ca': "Plataforma de missatgeria al client", 'cs': "Platforma pro zasílání zpráv zákazníkům", 'el': "Πλατφόρμα ανταλλαγής μηνυμάτων πελατών", 'eu': "Bezeroen mezularitza plataforma", 'fi': "Asiakasviestintäalusta", 'gl': "Plataforma de mensaxería para clientes", 'he': "פלטפורמת מסרים ללקוחות", 'hi': "ग्राहक संदेश मंच", 'hr': "Platforma za slanje poruka korisnicima", 'hu': "Ügyfél üzenetküldő platform", 'id': "Platform perpesanan pelanggan", 'ja': "顧客メッセージングプラットフォーム", 'lt': "Klientų pranešimų platforma", 'mr': "ग्राहक मेसेजिंग प्लॅटफॉर्म", 'nb': "Kundemeldingsplattform", 'ro': "Platformă de mesagerie pentru clienți", 'ru': "Платформа обмена сообщениями с клиентами", 'sk': "Platforma na odosielanie správ zákazníkom", 'sl': "Platforma za sporočanje strank", 'sr': "Платформа за размену порука са клијентима", 'sv': "Kundmeddelandeplattform", 'th': "แพลตฟอร์มการส่งข้อความถึงลูกค้า", 'tr': "Müşteri mesajlaşma platformu", 'uk': "Платформа обміну повідомленнями клієнтів" , 'vi': "Nền tảng nhắn tin khách hàng", 'zh': "客户消息平台", 'zh-TW': "客戶訊息傳遞平台" },
+        duration: { de: '9 Monate', en: '9 months', fr: '9 mois', es: '9 meses', it: '9 mesi', nl: '9 maanden', pl: '9 miesięcy', pt: '9 meses', da: '9 måneder' , 'ar': "9 أشهر", 'bg': "9 месеца", 'bs': "9 mjeseci", 'ca': "9 mesos", 'cs': "9 měsíců", 'el': "9 μήνες", 'eu': "9 hilabete", 'fi': "9 kuukautta", 'gl': "9 meses", 'he': "9 חודשים", 'hi': "9 महीने", 'hr': "9 mjeseci", 'hu': "9 hónap", 'id': "9 bulan", 'ja': "9ヶ月", 'lt': "9 mėn", 'mr': "9 महिने", 'nb': "9 måneder", 'ro': "9 luni", 'ru': "9 месяцев", 'sk': "9 mesiacov", 'sl': "9 mesecev", 'sr': "9 месеци", 'sv': "9 månader", 'th': "9 เดือน", 'tr': "9 ay", 'uk': "9 місяців" , 'vi': "9 tháng", 'zh': "9个月", 'zh-TW': "9個月" },
+        purpose: { de: 'Kundenkommunikation und Support-Anfragen', en: 'Customer communication and support requests', fr: 'Communication client et demandes de support', es: 'Comunicación con clientes y solicitudes de soporte', it: 'Comunicazione clienti e richieste di supporto', nl: 'Klantcommunicatie en support-aanvragen', pl: 'Komunikacja z klientami i zgłoszenia wsparcia', pt: 'Comunicação com clientes e pedidos de suporte', da: 'Kundekommunikation og supportanmodninger' , 'ar': "التواصل مع العملاء وطلبات الدعم", 'bg': "Заявки за комуникация и поддръжка на клиенти", 'bs': "Zahtjevi za komunikaciju i podršku korisnika", 'ca': "Sol·licituds de comunicació i suport al client", 'cs': "Komunikace se zákazníky a požadavky na podporu", 'el': "Αιτήματα επικοινωνίας και υποστήριξης πελατών", 'eu': "Bezeroaren komunikazioa eta laguntza eskaerak", 'fi': "Asiakasviestintä ja tukipyynnöt", 'gl': "Solicitudes de soporte e comunicación con clientes", 'he': "בקשות לתקשורת לקוחות ותמיכה", 'hi': "ग्राहक संचार और सहायता अनुरोध", 'hr': "Komunikacija s korisnicima i zahtjevi za podršku", 'hu': "Ügyfélkapcsolati és támogatási kérések", 'id': "Komunikasi pelanggan dan permintaan dukungan", 'ja': "顧客とのコミュニケーションとサポートのリクエスト", 'lt': "Klientų bendravimo ir palaikymo užklausos", 'mr': "ग्राहक संप्रेषण आणि समर्थन विनंत्या", 'nb': "Kundekommunikasjon og støtteforespørsler", 'ro': "Comunicarea cu clienții și solicitările de asistență", 'ru': "Общение с клиентами и запросы на поддержку", 'sk': "Komunikácia so zákazníkmi a požiadavky na podporu", 'sl': "Komunikacija s strankami in zahteve za podporo", 'sr': "Захтеви за комуникацију и подршку корисника", 'sv': "Kundkommunikation och supportförfrågningar", 'th': "คำขอการสื่อสารและการสนับสนุนลูกค้า", 'tr': "Müşteri iletişimi ve destek talepleri", 'uk': "Спілкування з клієнтами та запити на підтримку" , 'vi': "Yêu cầu hỗ trợ và giao tiếp với khách hàng", 'zh': "客户沟通和支持请求", 'zh-TW': "客戶溝通與支援請求" },
+        legalBasis: { de: 'Art. 6 Abs. 1 lit. a DSGVO (Einwilligung)', en: 'Art. 6(1)(a) GDPR (Consent)', fr: 'Art. 6(1)(a) RGPD (Consentement)', es: 'Art. 6(1)(a) RGPD (Consentimiento)', it: 'Art. 6(1)(a) GDPR (Consenso)', nl: 'Art. 6(1)(a) AVG (Toestemming)', pl: 'Art. 6(1)(a) RODO (Zgoda)', pt: 'Art. 6(1)(a) RGPD (Consentimento)', da: 'Art. 6(1)(a) GDPR (Samtykke)' , 'ar': "فن. 6(1)(أ) اللائحة العامة لحماية البيانات (الموافقة)", 'bg': "Чл. 6(1)(a) GDPR (Съгласие)", 'bs': "Art. 6(1)(a) GDPR (Saglasnost)", 'ca': "Art. 6(1)(a) GDPR (consentiment)", 'cs': "umění. 6(1)(a) GDPR (Souhlas)", 'el': "Τέχνη. 6(1)(α) GDPR (Συναίνεση)", 'eu': "art. 6(1)(a) GDPR (baimena)", 'fi': "Art. 6(1)(a) GDPR (suostumus)", 'gl': "Art. 6(1)(a) GDPR (Consentimento)", 'he': "אמנות. 6(1)(א) GDPR (הסכמה)", 'hi': "कला. 6(1)(ए) जीडीपीआर (सहमति)", 'hr': "čl. 6(1)(a) GDPR (pristanak)", 'hu': "Art. GDPR 6. cikk (1) bekezdés a) pont (beleegyezés)", 'id': "Seni. 6(1)(a) GDPR (Persetujuan)", 'ja': "アート。 6(1)(a) GDPR (同意)", 'lt': "Art. BDAR 6 straipsnio 1 dalies a punktas (sutikimas)", 'mr': "कला. 6(1)(a) GDPR (संमती)", 'nb': "Art. 6(1)(a) GDPR (samtykke)", 'ro': "art. 6(1)(a) GDPR (Consimțământ)", 'ru': "Искусство. 6(1)(a) GDPR (Согласие)", 'sk': "čl. 6(1)(a) GDPR (Súhlas)", 'sl': "Art. 6(1)(a) GDPR (soglasje)", 'sr': "чл. 6(1)(а) ГДПР (сагласност)", 'sv': "Art. 6(1)(a) GDPR (samtycke)", 'th': "ศิลปะ 6(1)(a) GDPR (ความยินยอม)", 'tr': "Sanat. 6(1)(a) GDPR (Rıza)", 'uk': "ст. 6(1)(a) GDPR (Згода)" , 'vi': "Điều. 6(1)(a) GDPR (Sự đồng ý)", 'zh': "GDPR 第6条第1款(a)项（同意）", 'zh-TW': "GDPR 第6條第1款(a)項（同意）" },
+        recipient: 'Intercom R&D Unlimited Company, Irland / Intercom, Inc., USA',
+        transferSafeguard: { de: 'EU-US Data Privacy Framework', en: 'EU-US Data Privacy Framework', fr: 'EU-US Data Privacy Framework', es: 'EU-US Data Privacy Framework', it: 'EU-US Data Privacy Framework', nl: 'EU-US Data Privacy Framework', pl: 'EU-US Data Privacy Framework', pt: 'EU-US Data Privacy Framework', da: 'EU-US Data Privacy Framework' , 'ar': "إطار خصوصية البيانات بين الاتحاد الأوروبي والولايات المتحدة", 'bg': "Рамка за поверителност на данните между ЕС и САЩ", 'bs': "EU-US Data Privacy Framework", 'ca': "Marc de privadesa de dades UE-EUA", 'cs': "Rámec ochrany osobních údajů mezi EU a USA", 'el': "Πλαίσιο απορρήτου δεδομένων ΕΕ-ΗΠΑ", 'eu': "EB-AEB Datuen Pribatutasun Esparrua", 'fi': "EU:n ja Yhdysvaltojen välinen tietosuojakehys", 'gl': "Marco de privacidade de datos UE-EUA", 'he': "מסגרת פרטיות נתונים של האיחוד האירופי-ארה\"ב", 'hi': "ईयू-यूएस डेटा गोपनीयता ढांचा", 'hr': "EU-SAD okvir za zaštitu privatnosti podataka", 'hu': "EU-USA adatvédelmi keretrendszer", 'id': "Kerangka Privasi Data UE-AS", 'ja': "EU-US データプライバシーフレームワーク", 'lt': "ES ir JAV duomenų privatumo sistema", 'mr': "EU-US डेटा गोपनीयता फ्रेमवर्क", 'nb': "EU-US Data Privacy Framework", 'ro': "Cadrul UE-SUA privind confidențialitatea datelor", 'ru': "Рамочная программа конфиденциальности данных ЕС-США", 'sk': "Rámec ochrany osobných údajov medzi EÚ a USA", 'sl': "EU-ZDA okvir zasebnosti podatkov", 'sr': "Оквир приватности података ЕУ-САД", 'sv': "EU-US Data Privacy Framework", 'th': "กรอบความเป็นส่วนตัวของข้อมูลในสหภาพยุโรปและสหรัฐอเมริกา", 'tr': "AB-ABD Veri Gizliliği Çerçevesi", 'uk': "Конфіденційність даних між ЄС і США" , 'vi': "Khung bảo mật dữ liệu EU-Hoa Kỳ", 'zh': "欧盟-美国数据隐私框架", 'zh-TW': "歐盟－美國數據隱私框架" }
+      },
+      hubspot: {
+        name: 'HubSpot',
+        patterns: ['hubspot.com', 'hs-scripts.com', 'hsforms.com'],
+        cookies: ['__hssc', '__hssrc', '__hstc', 'hubspotutk'],
+        description: { de: 'Marketing & CRM Tools', en: 'Marketing & CRM tools', fr: 'Outils marketing et CRM', es: 'Herramientas de marketing y CRM', it: 'Strumenti di marketing e CRM', nl: 'Marketing- en CRM-tools', pl: 'Narzędzia marketingowe i CRM', pt: 'Ferramentas de marketing e CRM', da: 'Marketing- og CRM-værktøjer' , 'ar': "أدوات التسويق وإدارة علاقات العملاء", 'bg': "Инструменти за маркетинг и CRM", 'bs': "Marketing & CRM alati", 'ca': "Eines de màrqueting i CRM", 'cs': "Marketing & CRM nástroje", 'el': "Εργαλεία μάρκετινγκ και CRM", 'eu': "Marketing eta CRM tresnak", 'fi': "Markkinointi- ja CRM-työkalut", 'gl': "Ferramentas de mercadotecnia e CRM", 'he': "כלי שיווק ו-CRM", 'hi': "मार्केटिंग और सीआरएम उपकरण", 'hr': "Marketinški i CRM alati", 'hu': "Marketing és CRM eszközök", 'id': "Alat pemasaran & CRM", 'ja': "マーケティングおよびCRMツール", 'lt': "Rinkodaros ir CRM įrankiai", 'mr': "विपणन आणि CRM साधने", 'nb': "Markedsføring og CRM-verktøy", 'ro': "Instrumente de marketing și CRM", 'ru': "Инструменты маркетинга и CRM", 'sk': "Marketing & CRM nástroje", 'sl': "Orodja za marketing in CRM", 'sr': "Маркетинг & ЦРМ алати", 'sv': "Marknadsförings- och CRM-verktyg", 'th': "เครื่องมือการตลาดและ CRM", 'tr': "Pazarlama ve CRM araçları", 'uk': "Інструменти маркетингу та CRM" , 'vi': "Công cụ tiếp thị & CRM", 'zh': "营销与客户关系管理工具", 'zh-TW': "行銷與客戶關係管理工具" },
+        duration: { de: '30 Minuten (__hssc), Session (__hssrc), 13 Monate (__hstc, hubspotutk)', en: '30 minutes (__hssc), Session (__hssrc), 13 months (__hstc, hubspotutk)', fr: '30 minutes (__hssc), Session (__hssrc), 13 mois (__hstc, hubspotutk)', es: '30 minutos (__hssc), Sesión (__hssrc), 13 meses (__hstc, hubspotutk)', it: '30 minuti (__hssc), Sessione (__hssrc), 13 mesi (__hstc, hubspotutk)', nl: '30 minuten (__hssc), Sessie (__hssrc), 13 maanden (__hstc, hubspotutk)', pl: '30 minut (__hssc), Sesja (__hssrc), 13 miesięcy (__hstc, hubspotutk)', pt: '30 minutos (__hssc), Sessão (__hssrc), 13 meses (__hstc, hubspotutk)', da: '30 minutter (__hssc), Session (__hssrc), 13 måneder (__hstc, hubspotutk)' , 'ar': "30 دقيقة (__hssc)، الجلسة (__hssrc)، 13 شهرًا (__hstc، hubspotutk)", 'bg': "30 минути (__hssc), сесия (__hssrc), 13 месеца (__hstc, hubspotutk)", 'bs': "30 minuta (__hssc), sesija (__hssrc), 13 mjeseci (__hstc, hubspotutk)", 'ca': "30 minuts (__hssc), sessió (__hssrc), 13 mesos (__hstc, hubspotutk)", 'cs': "30 minut (__hssc), relace (__hssrc), 13 měsíců (__hstc, hubspotutk)", 'el': "30 λεπτά (__hssc), Συνεδρία (__hssrc), 13 μήνες (__hstc, hubspotutk)", 'eu': "30 minutu (__hssc), Saioa (__hssrc), 13 hilabete (__hstc, hubspotutk)", 'fi': "30 minuuttia (__hssc), istunto (__hssrc), 13 kuukautta (__hstc, hubspotutk)", 'gl': "30 minutos (__hssc), sesión (__hssrc), 13 meses (__hstc, hubspotutk)", 'he': "30 דקות (__hssc), הפעלה (__hssrc), 13 חודשים (__hstc, hubspotutk)", 'hi': "30 मिनट (__hssc), सत्र (__hssrc), 13 महीने (__hstc, hubspotutk)", 'hr': "30 minuta (__hssc), sesija (__hssrc), 13 mjeseci (__hstc, hubspotutk)", 'hu': "30 perc (__hssc), munkamenet (__hssrc), 13 hónap (__hstc, hubspotutk)", 'id': "30 menit (__hssc), Sesi (__hssrc), 13 bulan (__hstc, hubspotutk)", 'ja': "30 分 (__hssc)、セッション (__hssrc)、13 か月 (__hstc、hubspotutk)", 'lt': "30 minučių (__hssc), sesija (__hssrc), 13 mėnesių (__hstc, hubspotutk)", 'mr': "30 मिनिटे (__hssc), सत्र (__hssrc), 13 महिने (__hstc, hubspotutk)", 'nb': "30 minutter (__hssc), økt (__hssrc), 13 måneder (__hstc, hubspotutk)", 'ro': "30 de minute (__hssc), Sesiune (__hssrc), 13 luni (__hstc, hubspotutk)", 'ru': "30 минут (__hssc), сессия (__hssrc), 13 месяцев (__hstc, Hubspotutk)", 'sk': "30 minút (__hssc), relácia (__hssrc), 13 mesiacov (__hstc, hubspotutk)", 'sl': "30 minut (__hssc), seja (__hssrc), 13 mesecev (__hstc, hubspotutk)", 'sr': "30 минута (__хссц), сесија (__хссрц), 13 месеци (__хстц, хубспотутк)", 'sv': "30 minuter (__hssc), Session (__hssrc), 13 månader (__hstc, hubspotutk)", 'th': "30 นาที (__hssc), เซสชั่น (__hssrc), 13 เดือน (__hstc, hubspotutk)", 'tr': "30 dakika (__hssc), Oturum (__hssrc), 13 ay (__hstc, hubspotutk)", 'uk': "30 хвилин (__hssc), сеанс (__hssrc), 13 місяців (__hstc, hubspotutk)" , 'vi': "30 phút (__hssc), Phiên (__hssrc), 13 tháng (__hstc, hubspotutk)", 'zh': "30 分钟 (__hssc)，会话 (__hssrc)，13 个月 (__hstc, hubspotutk)", 'zh-TW': "30 分鐘 (__hssc)、會話 (__hssrc)、13 個月 (__hstc, hubspotutk)" },
+        purpose: { de: 'Formulare, Chat und Marketing-Automatisierung', en: 'Forms, chat and marketing automation', fr: 'Formulaires, chat et automatisation marketing', es: 'Formularios, chat y automatización de marketing', it: 'Moduli, chat e automazione del marketing', nl: 'Formulieren, chat en marketingautomatisering', pl: 'Formularze, czat i automatyzacja marketingu', pt: 'Formulários, chat e automação de marketing', da: 'Formularer, chat og marketingautomatisering' , 'ar': "النماذج والدردشة وأتمتة التسويق", 'bg': "Формуляри, чат и автоматизация на маркетинга", 'bs': "Obrasci, chat i automatizacija marketinga", 'ca': "Automatització de formularis, xat i màrqueting", 'cs': "Formuláře, chat a automatizace marketingu", 'el': "Φόρμες, συνομιλία και αυτοματοποίηση μάρκετινγκ", 'eu': "Inprimakiak, txata eta marketin automatizazioa", 'fi': "Lomakkeet, chat ja markkinoinnin automaatio", 'gl': "Formularios, chat e automatización de mercadotecnia", 'he': "טפסים, צ'אט ואוטומציה שיווקית", 'hi': "फॉर्म, चैट और मार्केटिंग स्वचालन", 'hr': "Obrasci, chat i automatizacija marketinga", 'hu': "Űrlapok, chat és marketing automatizálás", 'id': "Formulir, obrolan, dan otomatisasi pemasaran", 'ja': "フォーム、チャット、マーケティングオートメーション", 'lt': "Formos, pokalbių ir rinkodaros automatizavimas", 'mr': "फॉर्म, चॅट आणि मार्केटिंग ऑटोमेशन", 'nb': "Skjemaer, chat og markedsføringsautomatisering", 'ro': "Formulare, chat și automatizare de marketing", 'ru': "Формы, чат и автоматизация маркетинга", 'sk': "Formuláre, chat a automatizácia marketingu", 'sl': "Obrazci, klepet in avtomatizacija trženja", 'sr': "Обрасци, ћаскање и аутоматизација маркетинга", 'sv': "Formulär, chatt och marknadsföringsautomation", 'th': "แบบฟอร์ม การแชท และการตลาดอัตโนมัติ", 'tr': "Formlar, sohbet ve pazarlama otomasyonu", 'uk': "Форми, чат і автоматизація маркетингу" , 'vi': "Biểu mẫu, trò chuyện và tự động hóa tiếp thị", 'zh': "表单、聊天和营销自动化", 'zh-TW': "表單、聊天和行銷自動化" },
+        legalBasis: { de: 'Art. 6 Abs. 1 lit. a DSGVO (Einwilligung)', en: 'Art. 6(1)(a) GDPR (Consent)', fr: 'Art. 6(1)(a) RGPD (Consentement)', es: 'Art. 6(1)(a) RGPD (Consentimiento)', it: 'Art. 6(1)(a) GDPR (Consenso)', nl: 'Art. 6(1)(a) AVG (Toestemming)', pl: 'Art. 6(1)(a) RODO (Zgoda)', pt: 'Art. 6(1)(a) RGPD (Consentimento)', da: 'Art. 6(1)(a) GDPR (Samtykke)' , 'ar': "فن. 6(1)(أ) اللائحة العامة لحماية البيانات (الموافقة)", 'bg': "Чл. 6(1)(a) GDPR (Съгласие)", 'bs': "Art. 6(1)(a) GDPR (Saglasnost)", 'ca': "Art. 6(1)(a) GDPR (consentiment)", 'cs': "umění. 6(1)(a) GDPR (Souhlas)", 'el': "Τέχνη. 6(1)(α) GDPR (Συναίνεση)", 'eu': "art. 6(1)(a) GDPR (baimena)", 'fi': "Art. 6(1)(a) GDPR (suostumus)", 'gl': "Art. 6(1)(a) GDPR (Consentimento)", 'he': "אמנות. 6(1)(א) GDPR (הסכמה)", 'hi': "कला. 6(1)(ए) जीडीपीआर (सहमति)", 'hr': "čl. 6(1)(a) GDPR (pristanak)", 'hu': "Art. GDPR 6. cikk (1) bekezdés a) pont (beleegyezés)", 'id': "Seni. 6(1)(a) GDPR (Persetujuan)", 'ja': "アート。 6(1)(a) GDPR (同意)", 'lt': "Art. BDAR 6 straipsnio 1 dalies a punktas (sutikimas)", 'mr': "कला. 6(1)(a) GDPR (संमती)", 'nb': "Art. 6(1)(a) GDPR (samtykke)", 'ro': "art. 6(1)(a) GDPR (Consimțământ)", 'ru': "Искусство. 6(1)(a) GDPR (Согласие)", 'sk': "čl. 6(1)(a) GDPR (Súhlas)", 'sl': "Art. 6(1)(a) GDPR (soglasje)", 'sr': "чл. 6(1)(а) ГДПР (сагласност)", 'sv': "Art. 6(1)(a) GDPR (samtycke)", 'th': "ศิลปะ 6(1)(a) GDPR (ความยินยอม)", 'tr': "Sanat. 6(1)(a) GDPR (Rıza)", 'uk': "ст. 6(1)(a) GDPR (Згода)" , 'vi': "Điều. 6(1)(a) GDPR (Sự đồng ý)", 'zh': "GDPR 第6条第1款(a)项（同意）", 'zh-TW': "GDPR 第6條第1款(a)項（同意）" },
+        recipient: 'HubSpot, Inc., USA',
+        transferSafeguard: { de: 'EU-US Data Privacy Framework', en: 'EU-US Data Privacy Framework', fr: 'EU-US Data Privacy Framework', es: 'EU-US Data Privacy Framework', it: 'EU-US Data Privacy Framework', nl: 'EU-US Data Privacy Framework', pl: 'EU-US Data Privacy Framework', pt: 'EU-US Data Privacy Framework', da: 'EU-US Data Privacy Framework' , 'ar': "إطار خصوصية البيانات بين الاتحاد الأوروبي والولايات المتحدة", 'bg': "Рамка за поверителност на данните между ЕС и САЩ", 'bs': "EU-US Data Privacy Framework", 'ca': "Marc de privadesa de dades UE-EUA", 'cs': "Rámec ochrany osobních údajů mezi EU a USA", 'el': "Πλαίσιο απορρήτου δεδομένων ΕΕ-ΗΠΑ", 'eu': "EB-AEB Datuen Pribatutasun Esparrua", 'fi': "EU:n ja Yhdysvaltojen välinen tietosuojakehys", 'gl': "Marco de privacidade de datos UE-EUA", 'he': "מסגרת פרטיות נתונים של האיחוד האירופי-ארה\"ב", 'hi': "ईयू-यूएस डेटा गोपनीयता ढांचा", 'hr': "EU-SAD okvir za zaštitu privatnosti podataka", 'hu': "EU-USA adatvédelmi keretrendszer", 'id': "Kerangka Privasi Data UE-AS", 'ja': "EU-US データプライバシーフレームワーク", 'lt': "ES ir JAV duomenų privatumo sistema", 'mr': "EU-US डेटा गोपनीयता फ्रेमवर्क", 'nb': "EU-US Data Privacy Framework", 'ro': "Cadrul UE-SUA privind confidențialitatea datelor", 'ru': "Рамочная программа конфиденциальности данных ЕС-США", 'sk': "Rámec ochrany osobných údajov medzi EÚ a USA", 'sl': "EU-ZDA okvir zasebnosti podatkov", 'sr': "Оквир приватности података ЕУ-САД", 'sv': "EU-US Data Privacy Framework", 'th': "กรอบความเป็นส่วนตัวของข้อมูลในสหภาพยุโรปและสหรัฐอเมริกา", 'tr': "AB-ABD Veri Gizliliği Çerçevesi", 'uk': "Конфіденційність даних між ЄС і США" , 'vi': "Khung bảo mật dữ liệu EU-Hoa Kỳ", 'zh': "欧盟-美国数据隐私框架", 'zh-TW': "歐盟－美國數據隱私框架" }
+      },
+      zendesk: {
+        name: 'Zendesk',
+        patterns: ['zendesk.com', 'zdassets.com'],
+        cookies: ['__zlcmid'],
+        description: { de: 'Kundenservice & Support', en: 'Customer service & support', fr: 'Service client et support', es: 'Servicio al cliente y soporte', it: 'Servizio clienti e supporto', nl: 'Klantenservice en support', pl: 'Obsługa klienta i wsparcie', pt: 'Serviço ao cliente e suporte', da: 'Kundeservice og support' , 'ar': "خدمة العملاء والدعم", 'bg': "Обслужване на клиенти и поддръжка", 'bs': "Korisnički servis i podrška", 'ca': "Atenció i assistència al client", 'cs': "Zákaznický servis a podpora", 'el': "Εξυπηρέτηση και υποστήριξη πελατών", 'eu': "Bezeroarentzako arreta eta laguntza", 'fi': "Asiakaspalvelu ja tuki", 'gl': "Atención e asistencia ao cliente", 'he': "שירות לקוחות ותמיכה", 'hi': "ग्राहक सेवा एवं सहायता", 'hr': "Služba za korisnike i podrška", 'hu': "Ügyfélszolgálat és támogatás", 'id': "Layanan & dukungan pelanggan", 'ja': "カスタマーサービスとサポート", 'lt': "Klientų aptarnavimas ir palaikymas", 'mr': "ग्राहक सेवा आणि समर्थन", 'nb': "Kundeservice og support", 'ro': "Serviciu clienți și asistență", 'ru': "Обслуживание и поддержка клиентов", 'sk': "Zákaznícky servis a podpora", 'sl': "Storitve za stranke in podpora", 'sr': "Кориснички сервис и подршка", 'sv': "Kundtjänst & support", 'th': "การบริการลูกค้าและการสนับสนุน", 'tr': "Müşteri hizmetleri ve desteği", 'uk': "Обслуговування та підтримка клієнтів" , 'vi': "Dịch vụ khách hàng và hỗ trợ", 'zh': "客户服务与支持", 'zh-TW': "客戶服務與支援" },
+        duration: { de: '1 Jahr', en: '1 year', fr: '1 an', es: '1 año', it: '1 anno', nl: '1 jaar', pl: '1 rok', pt: '1 ano', da: '1 år' , 'ar': "1 سنة", 'bg': "1 година", 'bs': "1 godina", 'ca': "1 any", 'cs': "1 rok", 'el': "1 έτος", 'eu': "1 urte", 'fi': "1 vuosi", 'gl': "1 ano", 'he': "שנה אחת", 'hi': "1 वर्ष", 'hr': "1 godina", 'hu': "1 év", 'id': "1 tahun", 'ja': "1年", 'lt': "1 metai", 'mr': "1 वर्ष", 'nb': "1 år", 'ro': "1 an", 'ru': "1 год", 'sk': "1 rok", 'sl': "1 leto", 'sr': "1 година", 'sv': "1 år", 'th': "1 ปี", 'tr': "1 yıl", 'uk': "1 рік" , 'vi': "1 năm", 'zh': "1年", 'zh-TW': "1年" },
+        purpose: { de: 'Bereitstellung des Support-Chat und Ticket-Systems', en: 'Providing support chat and ticket system', fr: 'Mise à disposition du chat de support et du système de tickets', es: 'Provisión del chat de soporte y sistema de tickets', it: 'Fornitura del chat di supporto e sistema di ticket', nl: 'Aanbieden van support chat en ticket systeem', pl: 'Udostępnienie czatu wsparcia i systemu zgłoszeń', pt: 'Disponibilização do chat de suporte e sistema de tickets', da: 'Levering af support-chat og billetsystem' , 'ar': "توفير دعم الدردشة ونظام التذاكر", 'bg': "Осигуряване на чат за поддръжка и тикет система", 'bs': "Pružanje podrške za chat i tiket sistem", 'ca': "Proporcionar suport de xat i sistema d'entrades", 'cs': "Poskytování podpory chatu a systému vstupenek", 'el': "Παροχή υποστήριξης συστήματος συνομιλίας και εισιτηρίων", 'eu': "Laguntza txat eta txartel-sistema eskaintzea", 'fi': "Tukikeskustelu- ja lippujärjestelmän tarjoaminen", 'gl': "Ofrecendo soporte de chat e sistema de tickets", 'he': "מתן תמיכה צ'אט ומערכת כרטיסים", 'hi': "सहायता चैट और टिकट प्रणाली प्रदान करना", 'hr': "Pružanje chata podrške i sustava ulaznica", 'hu': "Támogatási chat és jegyrendszer biztosítása", 'id': "Memberikan dukungan sistem chat dan tiket", 'ja': "サポートチャットとチケットシステムの提供", 'lt': "Palaikymo pokalbių ir bilietų sistemos teikimas", 'mr': "समर्थन चॅट आणि तिकीट प्रणाली प्रदान करणे", 'nb': "Gir support chat og billettsystem", 'ro': "Furnizarea de asistență chat și sistem de bilete", 'ru': "Предоставление чата поддержки и системы заявок", 'sk': "Poskytovanie podpory systému chatu a lístkov", 'sl': "Zagotavljanje podpornega klepeta in sistema vstopnic", 'sr': "Пружање подршке за ћаскање и систем тикета", 'sv': "Tillhandahåller supportchatt och biljettsystem", 'th': "ให้การสนับสนุนระบบแชทและตั๋ว", 'tr': "Destek sohbeti ve ticket sisteminin sağlanması", 'uk': "Надання чату підтримки та системи тикетів" , 'vi': "Cung cấp hệ thống trò chuyện và phiếu hỗ trợ", 'zh': "提供支持聊天和工单系统", 'zh-TW': "提供支援聊天和工單系統" },
+        legalBasis: { de: 'Art. 6 Abs. 1 lit. a DSGVO (Einwilligung) oder lit. b (Vertragserfüllung)', en: 'Art. 6(1)(a) GDPR (Consent) or (b) (Contract performance)', fr: 'Art. 6(1)(a) RGPD (Consentement) ou (b) (Exécution du contrat)', es: 'Art. 6(1)(a) RGPD (Consentimiento) o (b) (Ejecución del contrato)', it: 'Art. 6(1)(a) GDPR (Consenso) o (b) (Esecuzione del contratto)', nl: 'Art. 6(1)(a) AVG (Toestemming) of (b) (Contractuitvoering)', pl: 'Art. 6(1)(a) RODO (Zgoda) lub (b) (Wykonanie umowy)', pt: 'Art. 6(1)(a) RGPD (Consentimento) ou (b) (Execução do contrato)', da: 'Art. 6(1)(a) GDPR (Samtykke) eller (b) (Kontraktopfyldelse)' , 'ar': "فن. 6(1)(أ) اللائحة العامة لحماية البيانات (الموافقة) أو (ب) (تنفيذ العقد)", 'bg': "Чл. 6(1)(a) GDPR (Съгласие) или (b) (Изпълнение на договора)", 'bs': "Art. 6(1)(a) GDPR (saglasnost) ili (b) (izvršenje ugovora)", 'ca': "Art. 6(1)(a) GDPR (consentiment) o (b) (execució del contracte)", 'cs': "umění. 6(1)(a) GDPR (Souhlas) nebo (b) (Plnění smlouvy)", 'el': "Τέχνη. 6(1)(α) GDPR (Συναίνεση) ή (β) (Εκτέλεση σύμβασης)", 'eu': "art. 6(1)(a) GDPR (Adostasuna) edo (b) (Kontratuaren betetzea)", 'fi': "Art. 6(1)(a) GDPR (suostumus) tai (b) (Sopimuksen toteuttaminen)", 'gl': "Art. 6(1)(a) GDPR (Consentimento) ou (b) (Execución do contrato)", 'he': "אמנות. 6(1)(א) GDPR (הסכמה) או (ב) (ביצוע חוזה)", 'hi': "कला. 6(1)(ए) जीडीपीआर (सहमति) या (बी) (अनुबंध प्रदर्शन)", 'hr': "čl. 6(1)(a) GDPR (Pristanak) ili (b) (Izvedba ugovora)", 'hu': "Art. 6(1)(a) GDPR (beleegyezés) vagy (b) (szerződés teljesítése)", 'id': "Seni. 6(1)(a) GDPR (Persetujuan) atau (b) (Kinerja kontrak)", 'ja': "アート。 6(1)(a) GDPR (同意) または (b) (契約履行)", 'lt': "Art. BDAR 6 straipsnio 1 dalies a punktas (sutikimas) arba b punktas (sutarties vykdymas)", 'mr': "कला. 6(1)(a) GDPR (संमती) किंवा (b) (कराराची कामगिरी)", 'nb': "Art. 6(1)(a) GDPR (samtykke) eller (b) (kontraktsutførelse)", 'ro': "art. 6(1)(a) GDPR (Consimțământ) sau (b) (Executarea contractului)", 'ru': "Искусство. 6(1)(a) GDPR (Согласие) или (b) (Исполнение Договора)", 'sk': "čl. 6(1)(a) GDPR (Súhlas) alebo (b) (Plnenie zmluvy)", 'sl': "Art. 6(1)(a) GDPR (Soglasje) ali (b) (Izvajanje pogodbe)", 'sr': "чл. 6(1)(а) ГДПР (сагласност) или (б) (извршење уговора)", 'sv': "Art. 6(1)(a) GDPR (samtycke) eller (b) (kontraktsutförande)", 'th': "ศิลปะ 6(1)(a) GDPR (ความยินยอม) หรือ (b) (ผลการปฏิบัติงานของสัญญา)", 'tr': "Sanat. 6(1)(a) GDPR (Rıza) veya (b) (Sözleşmenin ifası)", 'uk': "ст. 6(1)(a) GDPR (Згода) або (b) (Виконання контракту)" , 'vi': "Nghệ thuật. 6(1)(a) GDPR (Sự đồng ý) hoặc (b) (Thực hiện hợp đồng)", 'zh': "GDPR第6条第1款(a)（同意）或(b)（合同履行）", 'zh-TW': "第6條第1款(a) GDPR（同意）或(b)（履行合約）" },
+        recipient: 'Zendesk, Inc., USA',
+        transferSafeguard: { de: 'EU-US Data Privacy Framework', en: 'EU-US Data Privacy Framework', fr: 'EU-US Data Privacy Framework', es: 'EU-US Data Privacy Framework', it: 'EU-US Data Privacy Framework', nl: 'EU-US Data Privacy Framework', pl: 'EU-US Data Privacy Framework', pt: 'EU-US Data Privacy Framework', da: 'EU-US Data Privacy Framework' , 'ar': "إطار خصوصية البيانات بين الاتحاد الأوروبي والولايات المتحدة", 'bg': "Рамка за поверителност на данните между ЕС и САЩ", 'bs': "EU-US Data Privacy Framework", 'ca': "Marc de privadesa de dades UE-EUA", 'cs': "Rámec ochrany osobních údajů mezi EU a USA", 'el': "Πλαίσιο απορρήτου δεδομένων ΕΕ-ΗΠΑ", 'eu': "EB-AEB Datuen Pribatutasun Esparrua", 'fi': "EU:n ja Yhdysvaltojen välinen tietosuojakehys", 'gl': "Marco de privacidade de datos UE-EUA", 'he': "מסגרת פרטיות נתונים של האיחוד האירופי-ארה\"ב", 'hi': "ईयू-यूएस डेटा गोपनीयता ढांचा", 'hr': "EU-SAD okvir za zaštitu privatnosti podataka", 'hu': "EU-USA adatvédelmi keretrendszer", 'id': "Kerangka Privasi Data UE-AS", 'ja': "EU-US データプライバシーフレームワーク", 'lt': "ES ir JAV duomenų privatumo sistema", 'mr': "EU-US डेटा गोपनीयता फ्रेमवर्क", 'nb': "EU-US Data Privacy Framework", 'ro': "Cadrul UE-SUA privind confidențialitatea datelor", 'ru': "Рамочная программа конфиденциальности данных ЕС-США", 'sk': "Rámec ochrany osobných údajov medzi EÚ a USA", 'sl': "EU-ZDA okvir zasebnosti podatkov", 'sr': "Оквир приватности података ЕУ-САД", 'sv': "EU-US Data Privacy Framework", 'th': "กรอบความเป็นส่วนตัวของข้อมูลในสหภาพยุโรปและสหรัฐอเมริกา", 'tr': "AB-ABD Veri Gizliliği Çerçevesi", 'uk': "Конфіденційність даних між ЄС і США" , 'vi': "Khung bảo mật dữ liệu EU-Hoa Kỳ", 'zh': "欧盟-美国数据隐私框架", 'zh-TW': "歐盟－美國數據隱私框架" }
+      }
+    }
+  };
+
+  // ==========================================================================
+  // BOT DETECTION ENGINE
+  // ==========================================================================
+
+  class BotDetector {
+    constructor() {
+      this._isBot = null;
+      this._signals = {};
+    }
+
+    /**
+     * Detect if current visitor is a bot
+     * Uses multiple signals: user-agent, navigator properties, behavioral patterns
+     */
+    detect() {
+      if (this._isBot !== null) return this._isBot;
+
+      const signals = {};
+      let botScore = 0;
+
+      // 1. User-Agent check (most reliable)
+      const ua = (navigator.userAgent || '').toLowerCase();
+      const botPatterns = [
+        'bot', 'spider', 'crawl', 'scrape', 'lighthouse',
+        'pagespeed', 'gtmetrix', 'pingdom', 'uptimerobot',
+        'headless', 'phantom', 'selenium', 'puppeteer',
+        'playwright', 'webdriver', 'chrome-lighthouse'
+      ];
+      signals.userAgentBot = botPatterns.some(p => ua.includes(p));
+      if (signals.userAgentBot) botScore += 50;
+
+      // 2. Navigator.webdriver (true for automated browsers)
+      signals.webdriver = navigator.webdriver === true;
+      if (signals.webdriver) botScore += 40;
+
+      // 3. Missing/suspicious navigator properties
+      signals.noLanguages = !navigator.languages || navigator.languages.length === 0;
+      if (signals.noLanguages) botScore += 20;
+
+      signals.noPlugins = !navigator.plugins || navigator.plugins.length === 0;
+      if (signals.noPlugins) botScore += 10;
+
+      // 4. Automation tool detection
+      signals.automationKeys = !!(
+        window._phantom ||
+        window.__nightmare ||
+        window.callPhantom ||
+        window._selenium ||
+        window.awesomium ||
+        document.__selenium_unwrapped ||
+        document.__webdriver_evaluate ||
+        document.__driver_evaluate
+      );
+      if (signals.automationKeys) botScore += 50;
+
+      // 5. Chrome-specific headless detection
+      if (window.chrome) {
+        signals.missingChrome = !window.chrome.runtime;
+        if (signals.missingChrome) botScore += 15;
+      }
+
+      // 6. Screen/window anomalies (headless often has 0x0 or 800x600)
+      signals.suspiciousScreen =
+        (screen.width === 0 && screen.height === 0) ||
+        (screen.width === 800 && screen.height === 600 && !ua.includes('mobile'));
+      if (signals.suspiciousScreen) botScore += 20;
+
+      // Threshold: 30+ = likely bot
+      this._isBot = botScore >= 30;
+      this._signals = signals;
+      this._score = botScore;
+
+      return this._isBot;
+    }
+
+    /**
+     * Get detailed detection info for debugging/logging
+     */
+    getInfo() {
+      return {
+        isBot: this._isBot,
+        score: this._score,
+        signals: this._signals
+      };
+    }
+  }
+
+  const botDetector = new BotDetector();
+
+  // ==========================================================================
+  // EMBED PATTERNS FOR IFRAME BLOCKING
+  // ==========================================================================
+
+  const EMBED_PATTERNS = {
+    marketing: [
+      { pattern: 'youtube.com/embed', name: 'YouTube', icon: '📺' },
+      { pattern: 'youtube-nocookie.com/embed', name: 'YouTube', icon: '📺' },
+      { pattern: 'player.vimeo.com', name: 'Vimeo', icon: '🎬' },
+      { pattern: 'dailymotion.com/embed', name: 'Dailymotion', icon: '🎬' },
+      { pattern: 'facebook.com/plugins', name: 'Facebook', icon: '📘' },
+      { pattern: 'platform.twitter.com', name: 'Twitter/X', icon: '🐦' },
+      { pattern: 'tiktok.com/embed', name: 'TikTok', icon: '🎵' },
+      { pattern: 'instagram.com/embed', name: 'Instagram', icon: '📷' },
+      { pattern: 'linkedin.com/embed', name: 'LinkedIn', icon: '💼' },
+      { pattern: 'pinterest.com/pin', name: 'Pinterest', icon: '📌' },
+      { pattern: 'spotify.com/embed', name: 'Spotify', icon: '🎧' },
+      { pattern: 'soundcloud.com/player', name: 'SoundCloud', icon: '🔊' },
+      { pattern: 'twitch.tv/embed', name: 'Twitch', icon: '🎮' }
+    ],
+    functional: [
+      { pattern: 'maps.google.com', name: 'Google Maps', icon: '🗺️' },
+      { pattern: 'google.com/maps/embed', name: 'Google Maps', icon: '🗺️' },
+      { pattern: 'openstreetmap.org', name: 'OpenStreetMap', icon: '🗺️' },
+      { pattern: 'recaptcha', name: 'reCAPTCHA', icon: '🔒' },
+      // Microsoft Office / OneDrive Embeds
+      { pattern: '1drv.ms', name: 'Microsoft OneDrive', icon: '📊' },
+      { pattern: 'onedrive.live.com', name: 'Microsoft OneDrive', icon: '📊' },
+      { pattern: 'office.com', name: 'Microsoft Office', icon: '📊' },
+      { pattern: 'sharepoint.com', name: 'Microsoft SharePoint', icon: '📊' },
+      { pattern: 'live.com/embed', name: 'Microsoft Embed', icon: '📊' },
+      // Google Docs / Sheets / Slides
+      { pattern: 'docs.google.com/spreadsheets', name: 'Google Sheets', icon: '📊' },
+      { pattern: 'docs.google.com/document', name: 'Google Docs', icon: '📄' },
+      { pattern: 'docs.google.com/presentation', name: 'Google Slides', icon: '📊' },
+      { pattern: 'docs.google.com/forms', name: 'Google Forms', icon: '📝' },
+      // Government / Data Embeds
+      { pattern: 'fred.stlouisfed.org', name: 'FRED Economic Data', icon: '📈' },
+      // Scheduling / Forms / Productivity
+      { pattern: 'calendly.com', name: 'Calendly', icon: '📅' },
+      { pattern: 'typeform.com', name: 'Typeform', icon: '📝' },
+      { pattern: 'airtable.com/embed', name: 'Airtable', icon: '📊' },
+      { pattern: 'notion.site', name: 'Notion', icon: '📝' },
+      { pattern: 'canva.com/design', name: 'Canva', icon: '🎨' },
+      { pattern: 'figma.com/embed', name: 'Figma', icon: '🎨' },
+      { pattern: 'miro.com/app', name: 'Miro', icon: '📋' },
+      { pattern: 'loom.com/embed', name: 'Loom', icon: '🎥' }
+    ],
+    analytics: [
+      { pattern: 'hotjar.com', name: 'Hotjar', icon: '🔥' },
+      { pattern: 'mouseflow.com', name: 'Mouseflow', icon: '🖱️' }
+    ]
+  };
+
+  // ==========================================================================
+  // IFRAME BLOCKING ENGINE
+  // ==========================================================================
+
+  class IframeBlockingEngine {
+    constructor() {
+      this.blockedIframes = [];
+      this.observer = null;
+      this.placeholderStyles = this._createStyles();
+      this.customEmbedPatterns = []; // { pattern, name, category, icon }
+    }
+
+    /**
+     * Add custom service patterns for iframe blocking.
+     * @param {Array} customServices - Services with isCustom=true from config
+     */
+    addCustomPatterns(customServices) {
+      if (!Array.isArray(customServices)) return;
+      for (const svc of customServices) {
+        if (!svc.blockingPatterns || !Array.isArray(svc.blockingPatterns)) continue;
+        for (const pattern of svc.blockingPatterns) {
+          if (pattern && typeof pattern === 'string') {
+            this.customEmbedPatterns.push({
+              pattern: pattern.toLowerCase(),
+              name: svc.name || 'Custom Service',
+              category: (svc.category || 'marketing').toLowerCase(),
+              icon: '🔧',
+            });
+          }
+        }
+      }
+    }
+
+    _createStyles() {
+      const styleId = 'biscotti-iframe-styles';
+      if (document.getElementById(styleId)) return;
+
+      const style = document.createElement('style');
+      style.id = styleId;
+      style.textContent = `
+        .biscotti-placeholder {
+          display: flex;
+          flex-direction: column;
+          align-items: center;
+          justify-content: center;
+          background: linear-gradient(135deg, #1a1a2e 0%, #16213e 100%);
+          border: 2px dashed #9B6B3C;
+          border-radius: 12px;
+          padding: 32px;
+          text-align: center;
+          font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+          color: #fff;
+          min-height: 200px;
+          box-sizing: border-box;
+        }
+        .biscotti-placeholder-icon {
+          font-size: 48px;
+          margin-bottom: 16px;
+        }
+        .biscotti-placeholder-title {
+          font-size: 18px;
+          font-weight: 600;
+          margin-bottom: 8px;
+          color: #9B6B3C;
+        }
+        .biscotti-placeholder-text {
+          font-size: 14px;
+          color: #b0b0b0;
+          margin-bottom: 20px;
+          max-width: 300px;
+        }
+        .biscotti-placeholder-btn {
+          background: linear-gradient(135deg, #9B6B3C 0%, #8B5A2B 100%);
+          color: #fff;
+          border: none;
+          padding: 12px 24px;
+          border-radius: 8px;
+          font-size: 14px;
+          font-weight: 600;
+          cursor: pointer;
+          transition: transform 0.2s, box-shadow 0.2s;
+          margin-bottom: 12px;
+        }
+        .biscotti-placeholder-btn:hover {
+          transform: translateY(-2px);
+          box-shadow: 0 4px 12px rgba(212, 165, 116, 0.4);
+        }
+        .biscotti-placeholder-checkbox {
+          display: flex;
+          align-items: center;
+          gap: 8px;
+          font-size: 12px;
+          color: #595959;
+          cursor: pointer;
+        }
+        .biscotti-placeholder-checkbox input {
+          cursor: pointer;
+        }
+        .biscotti-placeholder-privacy {
+          font-size: 11px;
+          color: #595959;
+          margin-top: 12px;
+        }
+        .biscotti-placeholder-privacy a {
+          color: #9B6B3C;
+          text-decoration: none;
+        }
+      `;
+      document.head.appendChild(style);
+    }
+
+    getEmbedInfo(src) {
+      if (!src) return null;
+      const srcLower = src.toLowerCase();
+
+      for (const [category, patterns] of Object.entries(EMBED_PATTERNS)) {
+        for (const info of patterns) {
+          if (srcLower.includes(info.pattern.toLowerCase())) {
+            return { ...info, category };
+          }
+        }
+      }
+
+      // Check custom embed patterns
+      for (const info of this.customEmbedPatterns) {
+        if (srcLower.includes(info.pattern)) {
+          return { ...info };
+        }
+      }
+
+      return null;
+    }
+
+    shouldBlock(iframe, consentState) {
+      const src = iframe.getAttribute('src') || iframe.getAttribute('data-src') || '';
+      const embedInfo = this.getEmbedInfo(src);
+
+      if (!embedInfo) return false;
+      if (iframe.hasAttribute('data-biscotti-blocked')) return false;
+
+      return !consentState.isGranted(embedInfo.category);
+    }
+
+    blockIframe(iframe, consentState) {
+      const src = iframe.getAttribute('src') || iframe.getAttribute('data-src') || '';
+      const embedInfo = this.getEmbedInfo(src);
+
+      if (!embedInfo) return false;
+      if (!this.shouldBlock(iframe, consentState)) return false;
+
+      // Store original attributes
+      iframe.setAttribute('data-biscotti-blocked', 'true');
+      iframe.setAttribute('data-biscotti-src', src);
+      iframe.setAttribute('data-biscotti-category', embedInfo.category);
+
+      // Create placeholder
+      const placeholder = this._createPlaceholder(iframe, embedInfo, src);
+
+      // Replace iframe with placeholder
+      iframe.style.display = 'none';
+      iframe.parentNode.insertBefore(placeholder, iframe);
+
+      this.blockedIframes.push({
+        iframe,
+        placeholder,
+        src,
+        embedInfo
+      });
+
+      return true;
+    }
+
+    _createPlaceholder(iframe, embedInfo, originalSrc) {
+      const width = iframe.getAttribute('width') || iframe.style.width || '100%';
+      const height = iframe.getAttribute('height') || iframe.style.height || '315px';
+
+      const placeholder = document.createElement('div');
+      placeholder.className = 'biscotti-placeholder';
+      placeholder.style.width = typeof width === 'number' ? `${width}px` : width;
+      placeholder.style.height = typeof height === 'number' ? `${height}px` : height;
+
+      const lang = document.documentElement.lang || navigator.language.split('-')[0] || 'en';
+      const categoryName = embedInfo.name || 'marketing';
+      const t = {"title":{"en":"{name} content blocked","de":"{name} Inhalt blockiert","fr":"Contenu {name} bloqué","es":"Contenido de {name} bloqueado","it":"Contenuto {name} bloccato","nl":"{name} inhoud geblokkeerd","pl":"Treść {name} zablokowana","pt":"Conteúdo do {name} bloqueado","da":"{name} indhold blokeret","ar":"محتوى {name} محظور","bg":"Съдържанието на {name} е блокирано","bs":"{name} sadržaj blokiran","ca":"Contingut de {name} bloquejat","cs":"Obsah {name} zablokován","el":"Το περιεχόμενο {name} αποκλείστηκε","eu":"{name} edukia blokeatuta","fi":"{name} sisältö estetty","gl":"Contido de {name} bloqueado","he":"תוכן {name} נחסם","hi":"{name} सामग्री अवरुद्ध","hr":"{name} sadržaj blokiran","hu":"{name} tartalom blokkolva","id":"Konten {name} diblokir","ja":"{name} コンテンツがブロックされました","lt":"{name} turinys užblokuotas","mr":"{name} सामग्री अवरोधित केली","nb":"{name} innhold blokkert","ro":"Conținutul {name} blocat","ru":"Контент {name} заблокирован","sk":"Obsah {name} bol zablokovaný","sl":"{name} vsebina blokirana","sr":"{name} садржај блокиран","sv":"{name} innehåll blockerat","th":"เนื้อหา {name} ถูกบล็อก","tr":"{name} içeriği engellendi","uk":"Вміст {name} заблоковано","vi":"Nội dung {name} bị chặn","zh":"{name} 内容已被屏蔽","zh-TW":"{name} 內容已被封鎖"},"text":{"en":"This content requires {categoryName} cookies, which you have rejected.","de":"Dieser Inhalt erfordert {categoryName}-Cookies, die Sie abgelehnt haben.","fr":"Ce contenu nécessite des cookies {categoryName}, que vous avez refusés.","es":"Este contenido requiere cookies de {categoryName}, que usted ha rechazado.","it":"Questo contenuto richiede i cookie {categoryName}, che hai rifiutato.","nl":"Deze inhoud vereist {categoryName} cookies, die u heeft afgewezen.","pl":"Ta treść wymaga plików cookie {categoryName}, które odrzuciłeś.","pt":"Este conteúdo requer cookies de {categoryName}, que você rejeitou.","da":"Dette indhold kræver {categoryName} cookies, som du har afvist.","ar":"يتطلب هذا المحتوى ملفات تعريف ارتباط {categoryName} ، والتي رفضتها.","bg":"Това съдържание изисква {categoryName} бисквитки, които сте отхвърлили.","bs":"Ovaj sadržaj zahtijeva {categoryName} kolačiće, koje ste odbili.","ca":"Aquest contingut requereix galetes de {categoryName}, que heu rebutjat.","cs":"Tento obsah vyžaduje soubory cookie {categoryName}, které jste odmítli.","el":"Αυτό το περιεχόμενο απαιτεί cookies {categoryName}, τα οποία έχετε απορρίψει.","eu":"Eduki honek {categoryName} cookieak behar ditu, eta zuk baztertu egin dituzu.","fi":"Tämä sisältö edellyttää {categoryName}-evästeitä, jotka olet hylännyt.","gl":"Este contido require cookies de {categoryName}, que rexeitou.","he":"תוכן זה דורש קובצי cookie מסוג {categoryName}, שדחית.","hi":"इस सामग्री के लिए {categoryName} कुकीज़ की आवश्यकता है, जिसे आपने अस्वीकार कर दिया है।","hr":"Ovaj sadržaj zahtijeva {categoryName} kolačiće, koje ste odbili.","hu":"Ez a tartalom {categoryName} sütiket igényel, amelyeket elutasított.","id":"Konten ini memerlukan cookie {categoryName}, yang telah Anda tolak.","ja":"このコンテンツには{categoryName} Cookieが必要ですが、あなたは拒否しています。","lt":"Šiam turiniui reikalingi {categoryName} slapukai, kuriuos atmetėte.","mr":"या सामग्रीसाठी {categoryName} कुकीज आवश्यक आहेत, ज्या तुम्ही नाकारल्या आहेत.","nb":"Dette innholdet krever {categoryName}-informasjonskapsler, som du har avvist.","ro":"Acest conținut necesită cookie-uri {categoryName}, pe care le-ați respins.","ru":"Для этого контента требуются файлы cookie {categoryName}, которые вы отклонили.","sk":"Tento obsah vyžaduje súbory cookie {categoryName}, ktoré ste odmietli.","sl":"Ta vsebina zahteva piškotke {categoryName}, ki ste jih zavrnili.","sr":"Овај садржај захтева {categoryName} колачиће, које сте одбили.","sv":"Detta innehåll kräver {categoryName}-cookies, som du har avvisat.","th":"เนื้อหานี้ต้องการคุกกี้ {categoryName} ซึ่งคุณได้ปฏิเสธไป","tr":"Bu içerik, reddettiğiniz {categoryName} çerezlerini gerektirir.","uk":"Для цього вмісту потрібні файли cookie {categoryName}, які ви відхилили.","vi":"Nội dung này yêu cầu cookie {categoryName}, mà bạn đã từ chối.","zh":"此内容需要 {categoryName} Cookie，您已拒绝。","zh-TW":"此內容需要 {categoryName} Cookie，您已拒絕。"},"btn":{"en":"Load {name} once","de":"{name} einmalig laden","fr":"Charger {name} une fois","es":"Cargar {name} una vez","it":"Carica {name} una volta","nl":"{name} eenmalig laden","pl":"Skorzystaj z {name} jednorazowo","pt":"Carregar {name} uma vez","da":"Indlæs {name} én gang","ar":"تحميل {name} مرة واحدة","bg":"Заредете {name} веднъж","bs":"Učitaj {name} jednom","ca":"Carrega {name} una vegada","cs":"Načíst {name} jednou","el":"Φόρτωση {name} μία φορά","eu":"Kargatu {name} behin","fi":"Lataa {name} kerran","gl":"Cargar {name} unha vez","he":"טען את {name} פעם אחת","hi":"{name} एक बार लोड करें","hr":"Učitaj {name} jednom","hu":"{name} betöltése egyszer","id":"Muat {name} sekali","ja":"{name} を一度だけロードする","lt":"Įkelti {name} vieną kartą","mr":"{name} एकदा लोड करा","nb":"Last inn {name} én gang","ro":"Încărcați {name} o dată","ru":"Загрузить {name} один раз","sk":"Načítať {name} raz","sl":"Naloži {name} enkrat","sr":"Учитај {name} једном","sv":"Ladda {name} en gång","th":"โหลด {name} หนึ่งครั้ง","tr":"{name} bir kez yükle","uk":"Завантажити {name} один раз","vi":"Tải {name} một lần","zh":"加载 {name} 一次","zh-TW":"載入 {name} 一次"},"checkbox":{"en":"Always allow {categoryName} cookies","de":"{categoryName}-Cookies immer erlauben","fr":"Toujours autoriser les cookies {categoryName}","es":"Permitir siempre cookies de {categoryName}","it":"Consenti sempre i cookie {categoryName}","nl":"{categoryName} cookies altijd toestaan","pl":"Zawsze pozwalaj na pliki cookie {categoryName}","pt":"Sempre permitir cookies de {categoryName}","da":"Tillad altid {categoryName} cookies","ar":"السماح دائمًا بملفات تعريف ارتباط {categoryName}","bg":"Винаги разрешавай {categoryName} бисквитки","bs":"Uvijek dozvoli {categoryName} kolačiće","ca":"Permet sempre galetes de {categoryName}","cs":"Vždy povolit soubory cookie {categoryName}","el":"Να επιτρέπονται πάντα τα cookies {categoryName}","eu":"Beti onartu {categoryName} cookieak","fi":"Salli aina {categoryName}-evästeet","gl":"Permitir sempre cookies de {categoryName}","he":"אפשר תמיד קובצי cookie מסוג {categoryName}","hi":"हमेशा {categoryName} कुकीज़ की अनुमति दें","hr":"Uvijek dopusti {categoryName} kolačiće","hu":"Mindig engedélyezze a(z) {categoryName} sütiket","id":"Selalu izinkan cookie {categoryName}","ja":"常に{categoryName} Cookieを許可する","lt":"Visada leisti {categoryName} slapukus","mr":"नेहमी {categoryName} कुकीज अनुमती द्या","nb":"Alltid tillat {categoryName}-informasjonskapsler","ro":"Permite întotdeauna cookie-urile {categoryName}","ru":"Всегда разрешать файлы cookie {categoryName}","sk":"Vždy povoliť súbory cookie {categoryName}","sl":"Vedno dovoli piškotke {categoryName}","sr":"Увек дозволи {categoryName} колачиће","sv":"Tillåt alltid {categoryName}-cookies","th":"อนุญาตคุกกี้ {categoryName} เสมอ","tr":"Her zaman {categoryName} çerezlerine izin ver","uk":"Завжди дозволяти файли cookie {categoryName}","vi":"Luôn cho phép cookie {categoryName}","zh":"始终允许 {categoryName} Cookie","zh-TW":"始終允許 {categoryName} Cookie"},"privacy":{"en":"Change cookie settings","de":"Cookie-Einstellungen ändern","fr":"Modifier les paramètres des cookies","es":"Cambiar configuración de cookies","it":"Modifica impostazioni cookie","nl":"Cookie-instellingen wijzigen","pl":"Zmień ustawienia plików cookie","pt":"Alterar configurações de cookies","da":"Skift cookie-indstillinger","ar":"تغيير إعدادات ملفات تعريف الارتباط","bg":"Промяна на настройките за бисквитки","bs":"Promijeni postavke kolačića","ca":"Canvia la configuració de les galetes","cs":"Změnit nastavení souborů cookie","el":"Αλλαγή ρυθμίσεων cookies","eu":"Aldatu cookie ezarpenak","fi":"Muuta evästeasetuksia","gl":"Cambiar a configuración das cookies","he":"שנה הגדרות קובצי cookie","hi":"कुकी सेटिंग्स बदलें","hr":"Promijeni postavke kolačića","hu":"Sütibeállítások módosítása","id":"Ubah pengaturan cookie","ja":"Cookieの設定を変更する","lt":"Keisti slapukų nustatymus","mr":"कुकी सेटिंग्ज बदला","nb":"Endre informasjonskapselinnstillinger","ro":"Schimbă setările cookie-urilor","ru":"Изменить настройки файлов cookie","sk":"Zmeniť nastavenia súborov cookie","sl":"Spremeni nastavitve piškotkov","sr":"Промени подешавања колачића","sv":"Ändra cookie-inställningar","th":"เปลี่ยนการตั้งค่าคุกกี้","tr":"Çerez ayarlarını değiştir","uk":"Змінити налаштування файлів cookie","vi":"Thay đổi cài đặt cookie","zh":"更改Cookie设置","zh-TW":"更改Cookie設定"}};
+      const tTitle = (t.title[lang] || t.title['en']).replace('{name}', embedInfo.name);
+      const tText = (t.text[lang] || t.text['en']).replace('{categoryName}', categoryName);
+      const tBtn = (t.btn[lang] || t.btn['en']).replace('{name}', embedInfo.name);
+      const tCheckbox = (t.checkbox[lang] || t.checkbox['en']).replace('{categoryName}', categoryName);
+      const tPrivacy = t.privacy[lang] || t.privacy['en'];
+
+      placeholder.innerHTML = `
+        <div class="biscotti-placeholder-icon">${embedInfo.icon}</div>
+        <div class="biscotti-placeholder-title">${tTitle}</div>
+        <div class="biscotti-placeholder-text">
+          ${tText}
+        </div>
+        <button class="biscotti-placeholder-btn" data-action="load-once">
+          ${tBtn}
+        </button>
+        <label class="biscotti-placeholder-checkbox">
+          <input type="checkbox" data-action="remember">
+          ${tCheckbox}
+        </label>
+        <div class="biscotti-placeholder-privacy">
+          <a href="#" data-action="settings">${tPrivacy}</a>
+        </div>
+      `;
+
+      // Event listeners
+      placeholder.querySelector('[data-action="load-once"]').addEventListener('click', () => {
+        this._loadEmbed(iframe, placeholder, originalSrc, false);
+      });
+
+      const checkbox = placeholder.querySelector('[data-action="remember"]');
+      checkbox.addEventListener('change', (e) => {
+        if (e.target.checked) {
+          this._loadEmbed(iframe, placeholder, originalSrc, true, embedInfo.category);
+        }
+      });
+
+      placeholder.querySelector('[data-action="settings"]').addEventListener('click', (e) => {
+        e.preventDefault();
+        if (window.Biscotti && window.Biscotti._instance) {
+          window.Biscotti._instance.showBanner();
+        }
+      });
+
+      return placeholder;
+    }
+
+    _loadEmbed(iframe, placeholder, src, remember, category = null) {
+      // Load the iframe
+      iframe.setAttribute('src', src);
+      iframe.style.display = '';
+      placeholder.remove();
+
+      // If remember is checked, update consent
+      if (remember && category && window.Biscotti && window.Biscotti._instance) {
+        const instance = window.Biscotti._instance;
+        instance.consentState.categories[category] = true;
+        instance._saveConsent();
+        instance._applyConsent();
+      }
+
+      // Remove from blocked list
+      this.blockedIframes = this.blockedIframes.filter(item => item.iframe !== iframe);
+    }
+
+    unblockCategory(category) {
+      const toUnblock = this.blockedIframes.filter(item =>
+        item.embedInfo.category === category
+      );
+
+      toUnblock.forEach(item => {
+        item.iframe.setAttribute('src', item.src);
+        item.iframe.style.display = '';
+        item.placeholder.remove();
+      });
+
+      this.blockedIframes = this.blockedIframes.filter(item =>
+        item.embedInfo.category !== category
+      );
+    }
+
+    startObserving(consentState) {
+      if (this.observer) return;
+
+      this.observer = new MutationObserver((mutations) => {
+        mutations.forEach(mutation => {
+          mutation.addedNodes.forEach(node => {
+            if (node.nodeName === 'IFRAME') {
+              this.blockIframe(node, consentState);
+            }
+            // Also check children
+            if (node.querySelectorAll) {
+              node.querySelectorAll('iframe').forEach(iframe => {
+                this.blockIframe(iframe, consentState);
+              });
+            }
+          });
+        });
+      });
+
+      this.observer.observe(document.documentElement, {
+        childList: true,
+        subtree: true
+      });
+    }
+
+    stopObserving() {
+      if (this.observer) {
+        this.observer.disconnect();
+        this.observer = null;
+      }
+    }
+
+    blockExistingIframes(consentState) {
+      document.querySelectorAll('iframe:not([data-biscotti-blocked])').forEach(iframe => {
+        this.blockIframe(iframe, consentState);
+      });
+    }
+  }
+
+  // ==========================================================================
+  // CROSS-FRAME CONSENT TUNNELING (Sub-Domain & Iframe Solution)
+  // ==========================================================================
+
+  const CrossFrameConsent = {
+    initialized: false,
+    origin: window.location.origin,
+
+    /**
+     * Initialize cross-frame communication
+     * Sends consent state to all iframes and listens for requests
+     */
+    init() {
+      if (this.initialized) return;
+
+      // Listen for consent requests from iframes
+      window.addEventListener('message', (event) => {
+        this._handleMessage(event);
+      });
+
+      this.initialized = true;
+    },
+
+    /**
+     * Handle incoming PostMessage
+     */
+    _handleMessage(event) {
+      // Validate message structure
+      if (!event.data || typeof event.data !== 'object') return;
+      if (event.data.type !== 'biscotti:request-consent') return;
+
+      // Respond with current consent state
+      const instance = window.Biscotti && window.Biscotti._instance;
+      if (instance) {
+        event.source.postMessage({
+          type: 'biscotti:consent-state',
+          consent: instance.consentState.toJSON(),
+          origin: this.origin
+        }, '*'); // Use '*' for cross-origin, but validate on receive
+      }
+    },
+
+    /**
+     * Broadcast consent update to all iframes
+     */
+    broadcast(consentState) {
+      const message = {
+        type: 'biscotti:consent-update',
+        consent: consentState.toJSON(),
+        origin: this.origin,
+        timestamp: Date.now()
+      };
+
+      // Send to all iframes on the page
+      const iframes = document.querySelectorAll('iframe');
+      iframes.forEach(iframe => {
+        try {
+          if (iframe.contentWindow) {
+            iframe.contentWindow.postMessage(message, '*');
+          }
+        } catch (e) {
+          // Cross-origin iframe, that's expected
+        }
+      });
+
+      // Also send to parent if we're in an iframe
+      if (window.parent !== window) {
+        try {
+          window.parent.postMessage(message, '*');
+        } catch (e) {
+          // Cross-origin parent
+        }
+      }
+    },
+
+    /**
+     * Request consent state from parent frame (for embedded widgets)
+     */
+    requestFromParent() {
+      if (window.parent === window) return;
+
+      window.parent.postMessage({
+        type: 'biscotti:request-consent',
+        origin: this.origin
+      }, '*');
+    },
+
+    /**
+     * Listener for child frames to receive consent updates
+     */
+    onConsentReceived(callback) {
+      window.addEventListener('message', (event) => {
+        if (!event.data || typeof event.data !== 'object') return;
+
+        if (event.data.type === 'biscotti:consent-state' ||
+          event.data.type === 'biscotti:consent-update') {
+          callback(event.data.consent);
+        }
+      });
+    }
+  };
+
+  // ==========================================================================
+  // CROSS-DOMAIN API (Server-Side Consent Sync)
+  // ==========================================================================
+
+  const CrossDomainAPI = {
+    apiUrl: null,
+    websiteId: null,
+    visitorToken: null,
+
+    /**
+     * Initialize cross-domain API with configuration
+     */
+    init(config) {
+      this.apiUrl = config.apiUrl || 'https://api.biscotti-cmp.com';
+      this.websiteId = config.websiteId;
+      this.visitorToken = this._getOrCreateVisitorToken();
+    },
+
+    /**
+     * Get or create a stable visitor token for cross-domain identification
+     */
+    _getOrCreateVisitorToken() {
+      const storageKey = 'biscotti_visitor_token';
+      let token = null;
+
+      try {
+        token = localStorage.getItem(storageKey);
+      } catch (e) {
+        // localStorage not available
+      }
+
+      if (!token) {
+        // Generate a stable token based on available browser fingerprint data
+        const fingerprint = [
+          navigator.userAgent,
+          navigator.language,
+          screen.width + 'x' + screen.height,
+          new Date().getTimezoneOffset(),
+          Math.random().toString(36).substring(2)
+        ].join('|');
+
+        // Simple hash function
+        token = this._hash(fingerprint);
+
+        try {
+          localStorage.setItem(storageKey, token);
+        } catch (e) {
+          // localStorage not available
+        }
+      }
+
+      return token;
+    },
+
+    /**
+     * Simple hash function for fingerprint
+     */
+    _hash(str) {
+      let hash = 0;
+      for (let i = 0; i < str.length; i++) {
+        const char = str.charCodeAt(i);
+        hash = ((hash << 5) - hash) + char;
+        hash = hash & hash; // Convert to 32bit integer
+      }
+      return Math.abs(hash).toString(36) + Date.now().toString(36);
+    },
+
+    /**
+     * Check for existing shared consent (called on page load)
+     */
+    async checkExistingConsent() {
+      if (!this.websiteId || !this.visitorToken) {
+        return null;
+      }
+
+      try {
+        const response = await fetch(
+          `${this.apiUrl}/api/v1/cross-domain/check?websiteId=${this.websiteId}&token=${this.visitorToken}`,
+          { method: 'GET', headers: { 'Accept': 'application/json' } }
+        );
+
+        if (response.ok) {
+          const data = await response.json();
+          if (data.found && data.consent) {
+            console.log('[Biscotti] Cross-domain consent found');
+            return data.consent;
+          }
+        }
+      } catch (error) {
+        console.warn('[Biscotti] Cross-domain check failed:', error.message);
+      }
+
+      return null;
+    },
+
+    /**
+     * Sync consent to server (called after user makes a choice)
+     */
+    async syncConsent(consent, tcfString = null, geoLocation = null) {
+      if (!this.websiteId || !this.visitorToken) {
+        return false;
+      }
+
+      try {
+        const response = await fetch(`${this.apiUrl}/api/v1/cross-domain/sync`, {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+            'Accept': 'application/json'
+          },
+          body: JSON.stringify({
+            websiteId: this.websiteId,
+            visitorToken: this.visitorToken,
+            consent,
+            tcfString,
+            geoLocation
+          })
+        });
+
+        if (response.ok) {
+          const data = await response.json();
+          console.log('[Biscotti] Cross-domain consent synced');
+          return data.synced === true;
+        }
+      } catch (error) {
+        console.warn('[Biscotti] Cross-domain sync failed:', error.message);
+      }
+
+      return false;
+    },
+
+    /**
+     * Get visitor token for consent logging
+     */
+    getVisitorToken() {
+      return this.visitorToken;
+    }
+  };
+
+  // ==========================================================================
+  // SRI & CSP SECURITY HARDENING
+  // ==========================================================================
+
+  const SecurityHardening = {
+    /**
+     * Generate recommended Content Security Policy headers
+     */
+    getRecommendedCSP() {
+      return {
+        'default-src': "'self'",
+        'script-src': "'self' https://api.biscotti-cmp.com",
+        'style-src': "'self' 'unsafe-inline'", // Needed for banner styles
+        'img-src': "'self' data: blob:",
+        'connect-src': "'self' https://api.biscotti-cmp.com",
+        'frame-ancestors': "'self'",
+        'form-action': "'self'"
+      };
+    },
+
+    /**
+     * Generate CSP meta tag
+     */
+    generateCSPMeta() {
+      const csp = this.getRecommendedCSP();
+      const content = Object.entries(csp)
+        .map(([key, value]) => `${key} ${value}`)
+        .join('; ');
+
+      return `<meta http-equiv="Content-Security-Policy" content="${content}">`;
+    },
+
+    /**
+     * Calculate SRI hash for script integrity
+     */
+    async calculateSRI(scriptContent) {
+      const encoder = new TextEncoder();
+      const data = encoder.encode(scriptContent);
+      const hashBuffer = await crypto.subtle.digest('SHA-384', data);
+      const hashArray = Array.from(new Uint8Array(hashBuffer));
+      const hashBase64 = btoa(String.fromCharCode.apply(null, hashArray));
+      return `sha384-${hashBase64}`;
+    },
+
+    /**
+     * Verify script integrity before execution
+     */
+    async verifyIntegrity(script, expectedHash) {
+      if (!expectedHash) return true;
+
+      try {
+        const response = await fetch(script.src);
+        const content = await response.text();
+        const actualHash = await this.calculateSRI(content);
+        return actualHash === expectedHash;
+      } catch (e) {
+        console.error('[Biscotti] Integrity check failed:', e);
+        return false;
+      }
+    }
+  };
+
+  // ==========================================================================
+  // CONSENT STATE MANAGEMENT
+  // ==========================================================================
+
+  class ConsentState {
+    constructor() {
+      this.categories = {
+        essential: true,  // Always true, cannot be disabled
+        functional: false,
+        analytics: false,
+        marketing: false
+      };
+      // Per-provider consent: null = inherit from category, true/false = explicit override
+      this.providers = {};
+      this.timestamp = null;
+      this.version = VERSION;
+      this.tcfString = null;
+      
+      // TCF Granular States
+      this.tcfPurposes = {};
+      this.tcfPurposeLIs = {};
+      this.tcfVendors = {};
+      this.tcfVendorLIs = {};
+      this.tcfSpecialFeatures = {};
+
+      // Google Additional Consent (AC String) — Req 3.7
+      this.acString = null;
+      this.atpConsents = {};
+    }
+
+    static fromJSON(json) {
+      const state = new ConsentState();
+      if (json) {
+        state.categories = { ...state.categories, ...json.categories };
+        state.categories.essential = true; // Force essential
+        state.providers = json.providers || {};
+        state.timestamp = json.timestamp;
+        state.version = json.version || VERSION;
+        state.tcfString = json.tcfString;
+        
+        state.tcfPurposes = json.tcfPurposes || {};
+        state.tcfPurposeLIs = json.tcfPurposeLIs || {};
+        state.tcfVendors = json.tcfVendors || {};
+        state.tcfVendorLIs = json.tcfVendorLIs || {};
+        state.tcfSpecialFeatures = json.tcfSpecialFeatures || {};
+
+        // Google Additional Consent (AC String) — Req 3.7
+        state.acString = json.acString || null;
+        state.atpConsents = json.atpConsents || {};
+      }
+      return state;
+    }
+
+    toJSON() {
+      return {
+        categories: this.categories,
+        providers: this.providers,
+        timestamp: this.timestamp,
+        version: this.version,
+        tcfString: this.tcfString,
+        tcfPurposes: this.tcfPurposes,
+        tcfPurposeLIs: this.tcfPurposeLIs,
+        tcfVendors: this.tcfVendors,
+        tcfVendorLIs: this.tcfVendorLIs,
+        tcfSpecialFeatures: this.tcfSpecialFeatures,
+        acString: this.acString,
+        atpConsents: this.atpConsents
+      };
+    }
+
+    isGranted(category) {
+      return this.categories[category] === true;
+    }
+
+    // Get category for a provider ID
+    getProviderCategory(providerId) {
+      for (const [category, providers] of Object.entries(PROVIDER_DATABASE)) {
+        if (providerId in providers) {
+          return category;
+        }
+      }
+      return null;
+    }
+
+    // Check if a specific provider is granted
+    // Returns explicit provider setting if set, otherwise inherits from category
+    isProviderGranted(providerId) {
+      // Explicit provider setting takes precedence
+      if (this.providers[providerId] !== undefined) {
+        return this.providers[providerId] === true;
+      }
+      // Otherwise inherit from category
+      const category = this.getProviderCategory(providerId);
+      return category ? this.categories[category] === true : false;
+    }
+
+    // Set or clear provider consent
+    setProvider(providerId, granted) {
+      if (granted === null || granted === undefined) {
+        // Clear explicit setting (inherit from category)
+        delete this.providers[providerId];
+      } else {
+        this.providers[providerId] = granted === true;
+      }
+      this.timestamp = new Date().toISOString();
+    }
+
+    // Get all providers with their current consent state
+    getProviderStates() {
+      const states = {};
+      for (const [category, providers] of Object.entries(PROVIDER_DATABASE)) {
+        for (const providerId of Object.keys(providers)) {
+          states[providerId] = {
+            granted: this.isProviderGranted(providerId),
+            explicit: this.providers[providerId] !== undefined,
+            category: category
+          };
+        }
+      }
+      return states;
+    }
+
+    grant(categories) {
+      if (Array.isArray(categories)) {
+        categories.forEach(cat => {
+          if (cat in this.categories) {
+            this.categories[cat] = true;
+          }
+        });
+      } else if (categories === 'all') {
+        Object.keys(this.categories).forEach(cat => {
+          this.categories[cat] = true;
+        });
+      }
+      this.timestamp = new Date().toISOString();
+    }
+
+    revoke(categories) {
+      if (Array.isArray(categories)) {
+        categories.forEach(cat => {
+          if (cat !== 'essential' && cat in this.categories) {
+            this.categories[cat] = false;
+          }
+        });
+      } else if (categories === 'all') {
+        Object.keys(this.categories).forEach(cat => {
+          if (cat !== 'essential') {
+            this.categories[cat] = false;
+          }
+        });
+      }
+      this.timestamp = new Date().toISOString();
+    }
+
+    hasUserChoice() {
+      return this.timestamp !== null;
+    }
+  }
+
+  // ==========================================================================
+  // STORAGE UTILITIES
+  // ==========================================================================
+
+  const Storage = {
+    setCookie(name, value, days) {
+      const expires = new Date();
+      expires.setTime(expires.getTime() + (days * 24 * 60 * 60 * 1000));
+      const cookie = `${name}=${encodeURIComponent(value)};expires=${expires.toUTCString()};path=/;SameSite=Lax`;
+      document.cookie = cookie;
+    },
+
+    getCookie(name) {
+      const nameEQ = name + '=';
+      const cookies = document.cookie.split(';');
+      for (let i = 0; i < cookies.length; i++) {
+        let c = cookies[i].trim();
+        if (c.indexOf(nameEQ) === 0) {
+          return decodeURIComponent(c.substring(nameEQ.length));
+        }
+      }
+      return null;
+    },
+
+    deleteCookie(name) {
+      document.cookie = `${name}=;expires=Thu, 01 Jan 1970 00:00:00 GMT;path=/`;
+    },
+
+    setLocal(key, value) {
+      try {
+        localStorage.setItem(key, JSON.stringify(value));
+      } catch (e) {
+        console.warn('[Biscotti] localStorage not available:', e);
+      }
+    },
+
+    getLocal(key) {
+      try {
+        const item = localStorage.getItem(key);
+        if (!item) return null;
+        try {
+          return JSON.parse(item);
+        } catch (parseErr) {
+          // Raw string value (e.g. visitor token stored without JSON.stringify)
+          return item;
+        }
+      } catch (e) {
+        console.warn('[Biscotti] localStorage not available:', e);
+        return null;
+      }
+    },
+
+    removeLocal(key) {
+      try {
+        localStorage.removeItem(key);
+      } catch (e) {
+        console.warn('[Biscotti] localStorage not available:', e);
+      }
+    }
+  };
+
+  // ==========================================================================
+  // GOOGLE CONSENT MODE V2
+  // ==========================================================================
+
+  const GoogleConsentMode = {
+    initialized: false,
+
+    init() {
+      if (this.initialized) return;
+
+      // Initialize gtag if not exists
+      window.dataLayer = window.dataLayer || [];
+      window.gtag = window.gtag || function () {
+        window.dataLayer.push(arguments);
+      };
+
+      // Only set consent default if the page hasn't already set one.
+      // Sites like the marketing page set their own gtag('consent','default',...)
+      // BEFORE loading the CMP. Sending a second default resets the
+      // wait_for_update timer and can cause GA to miss the update call.
+      // We detect an existing default by checking if dataLayer already
+      // contains a consent-default entry pushed by the site's own code.
+      const alreadyHasDefault = window.dataLayer.some(
+        entry => entry && entry[0] === 'consent' && entry[1] === 'default'
+      );
+
+      if (!alreadyHasDefault) {
+        window.gtag('consent', 'default', {
+          'ad_storage': 'denied',
+          'ad_user_data': 'denied',
+          'ad_personalization': 'denied',
+          'analytics_storage': 'denied',
+          'functionality_storage': 'denied',
+          'personalization_storage': 'denied',
+          'security_storage': 'granted', // Always granted for security
+          'wait_for_update': 500
+        });
+      }
+
+      this.initialized = true;
+    },
+
+    update(consentState) {
+      if (!window.gtag) return;
+
+      const grantedValue = (category) =>
+        consentState.isGranted(category) ? 'granted' : 'denied';
+
+      window.gtag('consent', 'update', {
+        'ad_storage': grantedValue('marketing'),
+        'ad_user_data': grantedValue('marketing'),
+        'ad_personalization': grantedValue('marketing'),
+        'analytics_storage': grantedValue('analytics'),
+        'functionality_storage': grantedValue('functional'),
+        'personalization_storage': grantedValue('functional')
+      });
+
+      // Microsoft Advertising UET consent update
+      if (window.uetq) {
+        try {
+          window.uetq.push('consent', 'update', {
+            'ad_storage': grantedValue('marketing')
+          });
+        } catch (e) { /* UET consent update is non-critical */ }
+      }
+    }
+  };
+
+  // ==========================================================================
+  // GLOBAL PRIVACY CONTROL (GPC) - CCPA/CPRA COMPLIANCE
+  // ==========================================================================
+
+  const GlobalPrivacyControl = {
+    /**
+     * Check if user has GPC/DNT enabled
+     * If true, auto-reject marketing/analytics without showing banner
+     */
+    isEnabled() {
+      // Check GPC header (modern browsers)
+      if (navigator.globalPrivacyControl === true) {
+        return true;
+      }
+      // Fallback to DNT (older browsers)
+      if (navigator.doNotTrack === '1' || navigator.doNotTrack === 'yes') {
+        return true;
+      }
+      // Check msDoNotTrack for IE11
+      if (navigator.msDoNotTrack === '1') {
+        return true;
+      }
+      return false;
+    },
+
+    /**
+     * Get GPC-compliant default consent state
+     */
+    getDefaultState() {
+      const state = new ConsentState();
+      if (this.isEnabled()) {
+        // GPC active: deny everything except essential
+        state.categories.essential = true;
+        state.categories.functional = false;
+        state.categories.analytics = false;
+        state.categories.marketing = false;
+        state.timestamp = new Date().toISOString();
+        state.gpcApplied = true;
+      }
+      return state;
+    }
+  };
+
+  // ==========================================================================
+  // FLOATING SETTINGS BUTTON (Widerrufbarkeit / Easy Revoke)
+  // ==========================================================================
+
+  class FloatingSettingsButton {
+    constructor(onClick, config) {
+      this.onClick = onClick;
+      this.config = config || {};
+      this.button = null;
+    }
+
+    /**
+     * Set icon based on theme.floatingButtonIcon
+     */
+    setIcon(iconId) {
+      if (!this.button) return;
+      const theme = this.config?.theme || this.config?.banner?.theme || {};
+      if (iconId === 'custom' && theme.customFloatingIcon) {
+        this.button.innerHTML = `<img src="${theme.customFloatingIcon}" alt="" style="width:28px;height:28px;object-fit:contain;">`;
+        this.button.setAttribute('data-icon', '');
+        return;
+      }
+      const icons = {
+        'cookie': '🍪',
+        'shield': '🛡️',
+        'settings': '⚙️',
+        'lock': '🔒'
+      };
+      this.button.setAttribute('data-icon', icons[iconId] || icons['cookie']);
+      this.button.innerHTML = '';
+    }
+
+    // Language-aware label helper (reads page language dynamically)
+    _getLabel(key) {
+      const SUPPORTED = ['de', 'en', 'fr', 'es', 'it', 'nl', 'pl', 'pt', 'da', 'ar', 'bg', 'bs', 'ca', 'cs', 'el', 'eu', 'fi', 'gl', 'he', 'hi', 'hr', 'hu', 'id', 'ja', 'lt', 'mr', 'nb', 'ro', 'ru', 'sk', 'sl', 'sr', 'sv', 'th', 'tr', 'uk', 'vi', 'zh', 'zh-TW'];
+      const htmlLang = document.documentElement.lang?.split('-')[0]?.toLowerCase();
+      const lang = (htmlLang && SUPPORTED.includes(htmlLang)) ? htmlLang : 'en';
+      const labels = {
+        'openSettings': {
+          de: 'Cookie-Einstellungen öffnen', en: 'Open cookie settings',
+          fr: 'Ouvrir les paramètres', es: 'Abrir configuración',
+          it: 'Apri impostazioni', nl: 'Cookie-instellingen openen',
+          pl: 'Otwórz ustawienia', pt: 'Abrir configurações', da: 'Åbn indstillinger',
+          ar: 'فتح إعدادات ملفات تعريف الارتباط',
+          bg: 'Отвори настройките за бисквитки',
+          bs: 'Otvori postavke kolačića',
+          ca: 'Obrir la configuració de les galetes',
+          cs: 'Otevřít nastavení cookies',
+          el: 'Άνοιγμα ρυθμίσεων cookies',
+          eu: 'Ireki cookie-en ezarpenak',
+          fi: 'Avaa evästeasetukset',
+          gl: 'Abrir a configuración de cookies',
+          he: 'פתיחת הגדרות עוגיות',
+          hi: 'कुकी सेटिंग्स खोलें',
+          hr: 'Otvori postavke kolačića',
+          hu: 'Cookie beállítások megnyitása',
+          id: 'Buka pengaturan cookie',
+          ja: 'Cookie設定を開く',
+          lt: 'Atverti slapukų nustatymus',
+          mr: 'कुकी सेटिंग्ज उघडा',
+          nb: 'Åpne cookie-innstillinger',
+          ro: 'Deschide setările cookie-urilor',
+          ru: 'Открыть настройки cookie',
+          sk: 'Otvoriť nastavenia cookies',
+          sl: 'Odpri nastavitve piškotkov',
+          sr: 'Otvori podešavanja kolačića',
+          sv: 'Öppna cookie-inställningar',
+          th: 'เปิดการตั้งค่าคุกกี้',
+          tr: 'Çerez ayarlarını aç',
+          uk: 'Відкрити налаштування файлів cookie',
+          vi: 'Mở cài đặt cookie',
+          zh: '打开 Cookie 设置',
+          'zh-TW': '開啟 Cookie 設定'
+        },
+        'changeSettings': {
+          de: 'Cookie-Einstellungen ändern', en: 'Change cookie settings',
+          fr: 'Modifier les paramètres', es: 'Cambiar configuración',
+          it: 'Modifica impostazioni', nl: 'Cookie-instellingen wijzigen',
+          pl: 'Zmień ustawienia', pt: 'Alterar configurações', da: 'Skift indstillinger',
+          ar: 'تغيير إعدادات ملفات تعريف الارتباط',
+          bg: 'Промени настройките за бисквитки',
+          bs: 'Promijeni postavke kolačića',
+          ca: 'Canviar la configuració de les galetes',
+          cs: 'Změnit nastavení cookies',
+          el: 'Αλλαγή ρυθμίσεων cookies',
+          eu: 'Aldatu cookie-en ezarpenak',
+          fi: 'Muuta evästeasetuksia',
+          gl: 'Cambiar a configuración de cookies',
+          he: 'שינוי הגדרות עוגיות',
+          hi: 'कुकी सेटिंग्स बदलें',
+          hr: 'Promijeni postavke kolačića',
+          hu: 'Cookie beállítások módosítása',
+          id: 'Ubah pengaturan cookie',
+          ja: 'Cookie設定を変更',
+          lt: 'Keisti slapukų nustatymus',
+          mr: 'कुकी सेटिंग्ज बदला',
+          nb: 'Endre cookie-innstillinger',
+          ro: 'Modifică setările cookie-urilor',
+          ru: 'Изменить настройки cookie',
+          sk: 'Zmeniť nastavenia cookies',
+          sl: 'Spremeni nastavitve piškotkov',
+          sr: 'Promeni podešavanja kolačića',
+          sv: 'Ändra cookie-inställningar',
+          th: 'เปลี่ยนการตั้งค่าคุกกี้',
+          tr: 'Çerez ayarlarını değiştir',
+          uk: 'Змінити налаштування файлів cookie',
+          vi: 'Thay đổi cài đặt cookie',
+          zh: '更改 Cookie 设置',
+          'zh-TW': '變更 Cookie 設定'
+        },
+        'gpcAriaLabel': {
+          de: 'GPC aktiv - Cookie-Einstellungen öffnen', en: 'GPC active - Open cookie settings',
+          fr: 'GPC actif - Ouvrir les paramètres', es: 'GPC activo - Abrir configuración',
+          it: 'GPC attivo - Apri impostazioni', nl: 'GPC actief - Cookie-instellingen openen',
+          pl: 'GPC aktywne - Otwórz ustawienia', pt: 'GPC ativo - Abrir configurações', da: 'GPC aktiv - Åbn indstillinger',
+          ar: 'تفعيل GPC - فتح إعدادات ملفات تعريف الارتباط',
+          bg: 'GPC е активен - Отвори настройките за бисквитки',
+          bs: 'GPC aktivan - Otvori postavke kolačića',
+          ca: 'GPC actiu - Obre la configuració de les galetes',
+          cs: 'GPC aktivní - Otevřít nastavení cookies',
+          el: 'GPC ενεργό - Άνοιγμα ρυθμίσεων cookies',
+          eu: 'GPC aktibo - Ireki cookie-en ezarpenak',
+          fi: 'GPC aktiivinen - Avaa evästeasetukset',
+          gl: 'GPC activo - Abrir a configuración de cookies',
+          he: 'GPC פעיל - פתיחת הגדרות עוגיות',
+          hi: 'GPC सक्रिय - कुकी सेटिंग्स खोलें',
+          hr: 'GPC aktivan - Otvori postavke kolačića',
+          hu: 'GPC aktív - Cookie beállítások megnyitása',
+          id: 'GPC aktif - Buka pengaturan cookie',
+          ja: 'GPCが有効 - Cookie設定を開く',
+          lt: 'GPC aktyvus - Atverti slapukų nustatymus',
+          mr: 'GPC सक्रिय - कुकी सेटिंग्ज उघडा',
+          nb: 'GPC aktiv - Åpne cookie-innstillinger',
+          ro: 'GPC activ - Deschide setările cookie-urilor',
+          ru: 'GPC активен - Открыть настройки cookie',
+          sk: 'GPC aktívne - Otvoriť nastavenia cookies',
+          sl: 'GPC aktiven - Odpri nastavitve piškotkov',
+          sr: 'GPC aktivan - Otvori podešavanja kolačića',
+          sv: 'GPC aktiv - Öppna cookie-inställningar',
+          th: 'GPC ทำงาน - เปิดการตั้งค่าคุกกี้',
+          tr: 'GPC etkin - Çerez ayarlarını aç',
+          uk: 'GPC активовано - Відкрити налаштування файлів cookie',
+          vi: 'GPC đang hoạt động - Mở cài đặt cookie',
+          zh: 'GPC 已激活 - 打开 Cookie 设置',
+          'zh-TW': 'GPC 已啟用 - 開啟 Cookie 設定'
+        },
+        'gpcTooltip': {
+          de: 'GPC aktiv - Tracking automatisch abgelehnt', en: 'GPC active - Tracking automatically rejected',
+          fr: 'GPC actif - Suivi automatiquement refusé', es: 'GPC activo - Seguimiento rechazado automáticamente',
+          it: 'GPC attivo - Tracciamento rifiutato', nl: 'GPC actief - Tracking automatisch geweigerd',
+          pl: 'GPC aktywne - Śledzenie automatycznie odrzucone', pt: 'GPC ativo - Rastreamento rejeitado', da: 'GPC aktiv - Sporing automatisk afvist',
+          ar: 'تفعيل GPC - تم الرفض التلقائي للتتبع',
+          bg: 'GPC е активен - Проследяването е автоматично отказано',
+          bs: 'GPC aktivan - Praćenje automatski odbijeno',
+          ca: 'GPC actiu - El seguiment s\'ha rebutjat automàticament',
+          cs: 'GPC aktivní - Sledování automaticky odmítnuto',
+          el: 'GPC ενεργό - Η παρακολούθηση απορρίπτεται αυτόματα',
+          eu: 'GPC aktibo - Jarraipena automatikoki baztertua',
+          fi: 'GPC aktiivinen - Seuranta automaattisesti estetty',
+          gl: 'GPC activo - Rastrexo rexeitado automaticamente',
+          he: 'GPC פעיל - מעקב נדחה אוטומטית',
+          hi: 'GPC सक्रिय - ट्रैकिंग स्वचालित रूप से अस्वीकृत',
+          hr: 'GPC aktivan - Praćenje automatski odbijeno',
+          hu: 'GPC aktív - A követés automatikusan elutasítva',
+          id: 'GPC aktif - Pelacakan otomatis ditolak',
+          ja: 'GPCが有効 - トラッキングは自動的に拒否されました',
+          lt: 'GPC aktyvus - Sekimas automatiškai atmestas',
+          mr: 'GPC सक्रिय - ट्रॅकिंग आपोआप नाकारले जाते',
+          nb: 'GPC aktiv - Sporing automatisk avvist',
+          ro: 'GPC activ - Urmărirea respinsă automat',
+          ru: 'GPC активен - Отслеживание автоматически отклонено',
+          sk: 'GPC aktívne - Sledovanie automaticky zamietnuté',
+          sl: 'GPC aktiven - Sledenje je samodejno zavrnjeno',
+          sr: 'GPC aktivan - Praćenje automatski odbijeno',
+          sv: 'GPC aktiv - Spårning automatiskt avvisad',
+          th: 'GPC ทำงาน - การติดตามถูกปฏิเสธโดยอัตโนมัติ',
+          tr: 'GPC etkin - İzleme otomatik olarak reddedildi',
+          uk: 'GPC активовано - Відстеження автоматично відхилено',
+          vi: 'GPC đang hoạt động - Theo dõi tự động bị từ chối',
+          zh: 'GPC 已激活 - 跟踪已自动拒绝',
+          'zh-TW': 'GPC 已啟用 - 追蹤已自動拒絕'
+        }
+      };
+      return labels[key]?.[lang] || labels[key]?.['en'] || key;
+    }
+
+    create() {
+      if (this.button) return;
+      // NEVER create if showFloatingButton is explicitly disabled in config or theme
+      const _theme = this.config?.theme || this.config?.banner?.theme || {};
+      if (this.config?.showFloatingButton === false || _theme.showFloatingButton === false) return;
+
+      const styleId = 'biscotti-floating-styles';
+      if (!document.getElementById(styleId)) {
+        const style = document.createElement('style');
+        style.id = styleId;
+        style.textContent = `
+          #biscotti-settings-btn {
+            position: fixed !important;
+            bottom: 20px !important;
+            left: 20px !important;
+            width: 48px !important;
+            height: 48px !important;
+            min-width: 48px !important;
+            max-width: 48px !important;
+            min-height: 48px !important;
+            max-height: 48px !important;
+            padding: 0 !important;
+            margin: 0 !important;
+            border-radius: 50% !important;
+            background: linear-gradient(135deg, #9B6B3C 0%, #8B5A2B 100%) !important;
+            border: none !important;
+            cursor: pointer;
+            box-shadow: 0 4px 16px rgba(0,0,0,0.2);
+            z-index: 999998;
+            display: flex !important;
+            align-items: center !important;
+            justify-content: center !important;
+            font-size: 24px;
+            line-height: 1 !important;
+            box-sizing: border-box !important;
+            transition: transform 0.2s, box-shadow 0.2s;
+          }
+          #biscotti-settings-btn::before {
+            content: attr(data-icon);
+          }
+          #biscotti-settings-btn:hover {
+            transform: scale(1.1);
+            box-shadow: 0 6px 24px rgba(0,0,0,0.3);
+          }
+          #biscotti-settings-btn:focus {
+            outline: 3px solid #fff;
+            outline-offset: 2px;
+          }
+          #biscotti-settings-btn-tooltip {
+            position: fixed;
+            bottom: 76px;
+            left: 20px;
+            background: #1a1a2e;
+            color: #fff;
+            padding: 8px 12px;
+            border-radius: 8px;
+            font-size: 13px;
+            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+            box-shadow: 0 4px 16px rgba(0,0,0,0.2);
+            opacity: 0;
+            visibility: hidden;
+            transition: opacity 0.2s, visibility 0.2s;
+            z-index: 999997;
+            white-space: nowrap;
+          }
+          #biscotti-settings-btn:hover + #biscotti-settings-btn-tooltip,
+          #biscotti-settings-btn:focus + #biscotti-settings-btn-tooltip {
+            opacity: 1;
+            visibility: visible;
+          }
+        `;
+        document.head.appendChild(style);
+      }
+
+      this.button = document.createElement('button');
+      this.button.id = 'biscotti-settings-btn';
+      this.button.setAttribute('aria-label', this._getLabel('openSettings'));
+      this.button.setAttribute('title', this._getLabel('openSettings'));
+      // Use theme.floatingButtonIcon if available
+      const theme = this.config?.theme || this.config?.banner?.theme || {};
+      const floatIcon = theme.floatingButtonIcon || 'cookie';
+      if (floatIcon === 'custom' && theme.customFloatingIcon) {
+        this.button.innerHTML = `<img src="${theme.customFloatingIcon}" alt="" style="width:28px;height:28px;object-fit:contain;">`;
+        this.button.setAttribute('data-icon', '');
+      } else {
+        const floatIcons = { 'cookie': '🍪', 'shield': '🛡️', 'settings': '⚙️', 'lock': '🔒' };
+        this.button.setAttribute('data-icon', floatIcons[floatIcon] || '🍪');
+      }
+      this.button.addEventListener('click', () => this.onClick());
+
+      const tooltip = document.createElement('div');
+      tooltip.id = 'biscotti-settings-btn-tooltip';
+      tooltip.textContent = this._getLabel('changeSettings');
+
+      document.body.appendChild(this.button);
+      document.body.appendChild(tooltip);
+    }
+
+    hide() {
+      if (this.button) this.button.style.display = 'none';
+    }
+
+    show() {
+      if (this.button) this.button.style.display = 'flex';
+    }
+
+    destroy() {
+      if (this.button) {
+        this.button.remove();
+        const tooltip = document.getElementById('biscotti-settings-btn-tooltip');
+        if (tooltip) tooltip.remove();
+        this.button = null;
+      }
+    }
+
+    /**
+     * Show GPC indicator on the floating button
+     * Adds a small shield icon to indicate privacy protection is active
+     */
+    setGpcIndicator(enabled) {
+      if (!this.button) return;
+      
+      if (enabled) {
+        this.button.setAttribute('data-icon', '🛡️');
+        this.button.setAttribute('aria-label', this._getLabel('gpcAriaLabel'));
+        const tooltip = document.getElementById('biscotti-settings-btn-tooltip');
+        if (tooltip) {
+          tooltip.textContent = this._getLabel('gpcTooltip');
+        }
+      }
+    }
+  }
+
+  // ==========================================================================
+  // BANNER UI (Consent Banner with Category Toggles)
+  // ==========================================================================
+
+  // RTL languages for accessibility dir attribute
+  const A11Y_RTL_LANGS = ['ar', 'he', 'fa', 'ur'];
+
+  // TargetSizeEnforcer CSS (inlined from src/client/accessibility/TargetSizeEnforcer.css)
+  const TARGET_SIZE_CSS = `
+    #biscotti-banner {
+      --biscotti-target-min: 24px;
+      --biscotti-target-large: 44px;
+      --biscotti-target-toggle-width: 44px;
+      --biscotti-target-toggle-height: 24px;
+      --biscotti-target-spacing: 8px;
+    }
+    #biscotti-banner button,
+    #biscotti-banner a[href],
+    #biscotti-banner [role="switch"],
+    #biscotti-banner [role="button"],
+    #biscotti-banner input,
+    #biscotti-banner select {
+      min-width: var(--biscotti-target-min);
+      min-height: var(--biscotti-target-min);
+    }
+    #biscotti-banner [role="switch"] {
+      min-width: var(--biscotti-target-toggle-width);
+      min-height: var(--biscotti-target-toggle-height);
+    }
+    #biscotti-banner a[href] {
+      min-height: var(--biscotti-target-min);
+      padding-top: 4px;
+      padding-bottom: 4px;
+      display: inline-flex;
+      align-items: center;
+    }
+  `;
+
+  class BannerUI {
+    constructor(engine, i18n = null) {
+      this.engine = engine;
+      this.i18n = i18n;
+      this.container = null;
+      this.settingsOpen = false;
+      // Effective language from API (GeoIP-based or configured)
+      this.language = engine.config.effectiveLanguage || engine.config.language || 'en';
+      this.categoryStates = {
+        essential: true,
+        functional: false,
+        analytics: false,
+        marketing: false
+      };
+      // Store only services actually detected on the page
+      this.detectedServices = null;
+
+      // Accessibility modules
+      this._focusTrap = null;
+      this._ariaManager = null;
+      this._liveAnnouncer = null;
+      this._reducedMotionHandler = new ReducedMotionHandler();
+    }
+
+    // Get translation with fallback - uses detected/configured language
+    // Priority: 1. Custom texts from server (config.banner.texts) 
+    //           2. Built-in translations for the language
+    //           3. German fallback
+    
+    // Localize a value that may be a multilingual object {de: '...', en: '...', 'vi': ".. .", 'zh': "...", 'zh-TW': "..." } or a plain string
+    _l(val) {
+      if (!val) return '';
+      if (typeof val === 'string') return val;
+      if (typeof val === 'object') {
+        return val[this.language] || val['en'] || val['de'] || Object.values(val)[0] || '';
+      }
+      return String(val);
+    }
+
+    t(key) {
+      const lang = this.language;
+      
+      // TCF banner keys that MUST use IAB-standard translations, never custom texts
+      const tcfProtectedKeys = ['banner.title', 'banner.text', 'banner.accept', 'banner.reject'];
+      const isTCF = !!this.engine?.config?.tcfEnabled;
+      
+      // When TCF is active, protected keys MUST come from built-in translations (IAB standard)
+      // Skip customTexts entirely for these keys
+      if (!(isTCF && tcfProtectedKeys.includes(key))) {
+        // Check for custom texts from the server (user-defined in dashboard)
+        const customTexts = this.engine?.config?.banner?.texts;
+        if (customTexts) {
+          const keyPart = key.replace('banner.', ''); // 'banner.title' -> 'title'
+          const val = customTexts[keyPart];
+          if (val) {
+            // If the value is a multilingual object {de: '...', en: '...', 'vi': ".. .", 'zh': "...", 'zh-TW': "..." }, pick by language
+            if (typeof val === 'object') {
+              const resolved = val[lang] || val['en'] || val['de'] || Object.values(val)[0];
+              if (resolved) return resolved;
+            }
+            // Plain string: only use if the banner's configured language matches current display language
+            // This prevents German server texts from showing on Swedish/English/etc. pages
+            // Old check used _apiEffectiveLanguage which is almost always null, causing German texts
+            // to leak into all languages. Now we use bannerLanguage from the config instead.
+            if (typeof val === 'string') {
+              const bannerLang = this.engine?.config?.bannerLanguage;
+              const apiLang = this.engine?.config?._apiEffectiveLanguage;
+              const textLang = bannerLang || apiLang;
+              if (textLang && textLang === lang) {
+                return val;
+              }
+              // If we can't determine the text language, DON'T use it — fall through to built-in translations
+            }
+          }
+        }
+      }
+      
+      // Full translations for all supported languages
+      const translations = {
+        de: {
+          'banner.title': 'Wir respektieren Ihre Privatsphäre',
+          'banner.text': 'Wir verwenden Cookies und ähnliche Technologien auf unserer Website. Einige sind technisch notwendig für den Betrieb der Seite. Mit Ihrer Einwilligung nutzen wir zudem Cookies, um die Nutzung unserer Website statistisch zu erfassen sowie um Inhalte und Werbung zu personalisieren.',
+          'banner.accept': 'Alle akzeptieren',
+          'banner.reject': 'Alle ablehnen',
+          'banner.withdrawAll': 'Alle widerrufen',
+          'banner.settings': 'Einstellungen',
+          'banner.ok': 'OK',
+          'banner.close': 'Schließen',
+          'banner.doNotSell': 'Meine Daten nicht verkaufen oder teilen',
+          'banner.managePrivacy': 'Datenschutz-Optionen',
+          'banner.save': 'Auswahl speichern',
+          'categories.essential': 'Essenziell',
+          'categories.essentialDesc': 'Erforderlich für die Grundfunktionen der Website.',
+          'categories.functional': 'Funktional',
+          'categories.functionalDesc': 'Ermöglichen erweiterte Funktionen und Personalisierung.',
+          'categories.analytics': 'Statistik',
+          'categories.analyticsDesc': 'Helfen uns, die Nutzung unserer Website zu verstehen.',
+          'categories.marketing': 'Marketing',
+          'categories.marketingDesc': 'Werden für Werbezwecke und Tracking verwendet.',
+          'categories.ai': 'KI-Dienste',
+          'categories.aiDesc': 'Chatbots, Empfehlungssysteme und KI-generierte Inhalte. Gemäß EU AI Act.',
+          'categories.aiNotice': '🤖 Diese Funktion wird von einer KI unterstützt.',
+          'categories.alwaysActive': 'Immer aktiv',
+          'details.provider': 'Anbieter:',
+          'details.location': 'Sitz:',
+          'details.duration': 'Speicherdauer:',
+          'details.purpose': 'Zweck:',
+          'details.legalBasis': 'Rechtsgrundlage:',
+          'details.privacy': 'Datenschutz:',
+          'details.privacyLink': 'Datenschutzerklärung',
+          'details.transfer': 'Drittlandtransfer:',
+          'details.notSpecified': 'Nicht angegeben',
+          'details.consentId': 'Zustimmungs-ID:',
+          'details.lookupTitle': 'Consent-Daten abrufen',
+          'details.details': 'Details',
+          'services.biscottiDesc': 'Speichert Ihre Cookie-Einwilligungspräferenzen',
+          'services.biscottiPurpose': 'Speicherung der Einwilligungsentscheidung gemäß DSGVO Art. 7',
+          'services.wordpressDesc': 'Technisch notwendig für Website-Funktionen',
+          'services.wordpressPurpose': 'Session-Verwaltung, Login-Status, Benutzereinstellungen',
+          'tcf.storageDisclosure': 'Wir und unsere Partner speichern und/oder greifen auf Informationen auf Ihrem Gerät zu (z. B. Cookies) und verarbeiten personenbezogene Daten.',
+          'tcf.dataExamples': 'Dabei können z. B. IP-Adressen, Nutzungs-IDs, Surfverhalten und Gerätekennungen verarbeitet werden.',
+          'tcf.purposeSummary': 'Die Datenverarbeitung dient u. a. der Anzeigenpersonalisierung, Inhaltsmessung und Zielgruppenanalyse.',
+          'tcf.vendorCount': 'Wir und {count} Partner können diese Daten verarbeiten - Liste anzeigen',
+
+          'tcf.vendorCountSingular': 'Wir und 1 Partner können diese Daten verarbeiten - Liste anzeigen',
+          'tcf.consentScope': 'Ihre Einwilligung gilt nur für diese Website.',
+          'tcf.withdrawInfo': 'Sie können Ihre Einwilligung jederzeit über die Einstellungen widerrufen oder ändern.',
+          'tcf.vendorsPerPurpose': '{count} Partner',
+          'tcf.iabPartnerSingular': '1 IAB-zertifizierter Partner',
+          'tcf.iabPartnerPlural': '{count} IAB-zertifizierte Partner',
+          'tcf.nonIabPartnerSingular': '1 weiteren Partner',
+          'tcf.nonIabPartnerPlural': '{count} weitere Partner',
+          'tcf.partnerCountPrefix': 'Wir und',
+          'tcf.partnerCountConjunction': 'sowie',
+          'tcf.partnerCountSuffix': 'können diese Daten verarbeiten.',
+          'tcf.cmpStorage': 'Biscotti CMP speichert Ihre Einwilligungsentscheidung im lokalen Speicher Ihres Browsers (bis zu 180 Tage).',
+          'tcf.maxStorage': 'Max. Speicherdauer:',
+          'tcf.days': 'Tage',
+          'tcf.usesNonCookieAccess': 'Verwendet auch Nicht-Cookie-Speicher',
+          'tcf.storageInfo': 'Speicherinformationen',
+          'tcf.specialFeaturesDisclosure': 'Einige Partner verwenden spezielle Funktionen wie Standortdaten oder aktives Scannen von Geräteeigenschaften zur Identifikation.',
+          'tcf.liDisclosure': 'Einige Partner verarbeiten Ihre Daten auf Grundlage eines berechtigten Interesses, dem Sie widersprechen können.',
+          'tcf.liLinkText': 'Berechtigte Interessen verwalten',
+          'tcf.purposeNames': 'Zwecke: {names}.'
+        },
+        en: {
+          'banner.title': 'We respect your privacy',
+          'banner.text': 'We use cookies and similar technologies on our website. Some are technically necessary for the operation of the site. With your consent, we also use cookies to statistically analyse the use of our website and to personalise content and advertising.',
+          'banner.accept': 'Accept all',
+          'banner.reject': 'Reject all',
+          'banner.withdrawAll': 'Withdraw all',
+          'banner.settings': 'Settings',
+          'banner.ok': 'OK',
+          'banner.close': 'Close',
+          'banner.doNotSell': 'Do not sell or share my personal information',
+          'banner.managePrivacy': 'Manage privacy options',
+          'banner.save': 'Save preferences',
+          'categories.essential': 'Essential',
+          'categories.essentialDesc': 'Required for basic website functionality.',
+          'categories.functional': 'Functional',
+          'categories.functionalDesc': 'Enable enhanced functionality and personalisation.',
+          'categories.analytics': 'Analytics',
+          'categories.analyticsDesc': 'Help us understand how our website is used.',
+          'categories.marketing': 'Marketing',
+          'categories.marketingDesc': 'Used for advertising and cross-site tracking.',
+          'categories.ai': 'AI Services',
+          'categories.aiDesc': 'Chatbots, recommendation systems, and AI-generated content. EU AI Act compliant.',
+          'categories.aiNotice': '🤖 This feature is powered by AI.',
+          'categories.alwaysActive': 'Always active',
+          'details.provider': 'Provider:',
+          'details.location': 'Location:',
+          'details.duration': 'Storage duration:',
+          'details.purpose': 'Purpose:',
+          'details.legalBasis': 'Legal basis:',
+          'details.privacy': 'Privacy:',
+          'details.privacyLink': 'Privacy Policy',
+          'details.transfer': 'Data transfer:',
+          'details.notSpecified': 'Not specified',
+          'details.consentId': 'Consent ID:',
+          'details.lookupTitle': 'Look up your consent data',
+          'details.details': 'Details',
+          'services.biscottiDesc': 'Stores your cookie consent preferences',
+          'services.biscottiPurpose': 'Storage of consent decision as required by GDPR Art. 7',
+          'services.wordpressDesc': 'Technically necessary for website functionality',
+          'services.wordpressPurpose': 'Session management, login status, user settings',
+          'tcf.storageDisclosure': 'We and our partners store and/or access information on your device (e.g. cookies) and process personal data.',
+          'tcf.dataExamples': 'This may include IP addresses, usage identifiers, browsing behaviour, and device identifiers.',
+          'tcf.purposeSummary': 'Data processing serves purposes such as ad personalisation, content measurement, and audience insights.',
+          'tcf.vendorCount': 'We and {count} partners may process your data — View list',
+
+          'tcf.vendorCountSingular': 'We and 1 partner may process your data — View list',
+          'tcf.consentScope': 'Your consent applies to this website only.',
+          'tcf.withdrawInfo': 'You can change or withdraw your consent at any time via Settings.',
+          'tcf.vendorsPerPurpose': '{count} vendors',
+          'tcf.iabPartnerSingular': '1 IAB-certified partner',
+          'tcf.iabPartnerPlural': '{count} IAB-certified partners',
+          'tcf.nonIabPartnerSingular': '1 additional partner',
+          'tcf.nonIabPartnerPlural': '{count} additional partners',
+          'tcf.partnerCountPrefix': 'We and',
+          'tcf.partnerCountConjunction': 'as well as',
+          'tcf.partnerCountSuffix': 'may process this data.',
+          'tcf.cmpStorage': 'Biscotti CMP stores your consent choice in your browser\'s local storage (up to 180 days).',
+          'tcf.maxStorage': 'Max. storage duration:',
+          'tcf.days': 'days',
+          'tcf.usesNonCookieAccess': 'Also uses non-cookie storage',
+          'tcf.storageInfo': 'Storage info',
+          'tcf.specialFeaturesDisclosure': 'Some partners use special features such as precise geolocation data or active scanning of device characteristics for identification.',
+          'tcf.liDisclosure': 'Some partners process your data on the basis of legitimate interest, which you have the right to object to.',
+          'tcf.liLinkText': 'Manage legitimate interests',
+          'tcf.purposeNames': 'Purposes: {names}.'
+        },
+        fr: {
+          'banner.title': 'Nous respectons votre vie privée',
+          'banner.text': 'Nous utilisons des cookies et des technologies similaires sur notre site. Certains sont techniquement nécessaires. Avec votre consentement, nous utilisons également des cookies pour analyser l\'utilisation de notre site et personnaliser le contenu.',
+          'banner.accept': 'Tout accepter',
+          'banner.reject': 'Tout refuser',
+          'banner.withdrawAll': 'Tout retirer',
+          'banner.settings': 'Paramètres',
+          'banner.ok': 'OK',
+          'banner.close': 'Fermer',
+          'banner.doNotSell': 'Ne pas vendre ni partager mes informations personnelles',
+          'banner.managePrivacy': 'Gérer mes choix de confidentialité',
+          'banner.save': 'Enregistrer',
+          'categories.essential': 'Essentiels',
+          'categories.essentialDesc': 'Nécessaires au fonctionnement du site.',
+          'categories.functional': 'Fonctionnels',
+          'categories.functionalDesc': 'Permettent des fonctionnalités améliorées.',
+          'categories.analytics': 'Statistiques',
+          'categories.analyticsDesc': 'Nous aident à comprendre l\'utilisation du site.',
+          'categories.marketing': 'Marketing',
+          'categories.marketingDesc': 'Utilisés pour la publicité et le suivi.',
+          'categories.ai': 'Services IA',
+          'categories.aiDesc': 'Chatbots, systèmes de recommandation et contenus générés par IA. Conforme au règlement IA.',
+          'categories.aiNotice': '🤖 Cette fonction est alimentée par l\'IA.',
+          'categories.alwaysActive': 'Toujours actif',
+          'details.provider': 'Fournisseur :',
+          'details.location': 'Siège :',
+          'details.duration': 'Durée de stockage :',
+          'details.purpose': 'Finalité :',
+          'details.legalBasis': 'Base juridique :',
+          'details.privacy': 'Confidentialité :',
+          'details.privacyLink': 'Politique de confidentialité',
+          'details.transfer': 'Transfert de données :',
+          'details.notSpecified': 'Non spécifié',
+          'details.consentId': 'ID de consentement :',
+          'details.lookupTitle': 'Recherche de consentement',
+          'details.details': 'Détails',
+          'services.biscottiDesc': 'Enregistre vos préférences de cookies',
+          'services.biscottiPurpose': 'Stockage de la décision de consentement selon le RGPD Art. 7',
+          'services.wordpressDesc': 'Techniquement nécessaire au fonctionnement du site',
+          'services.wordpressPurpose': 'Gestion de session, statut de connexion, paramètres utilisateur',
+          'tcf.storageDisclosure': 'Nous et nos partenaires stockons et/ou accédons à des informations sur votre appareil (par ex. des cookies) et traitons des données personnelles.',
+          'tcf.dataExamples': 'Cela peut inclure les adresses IP, les identifiants d\'utilisation, le comportement de navigation et les identifiants d\'appareils.',
+          'tcf.purposeSummary': 'Le traitement des données sert à la personnalisation des annonces, la mesure du contenu et l\'analyse d\'audience.',
+          'tcf.vendorCount': 'Nous et {count} partenaires pouvons traiter vos données — Voir la liste',
+
+          'tcf.vendorCountSingular': 'Nous et 1 partenaire pouvons traiter vos données — Voir la liste',
+          'tcf.consentScope': 'Votre consentement s\'applique uniquement à ce site web.',
+          'tcf.withdrawInfo': 'Vous pouvez modifier ou retirer votre consentement à tout moment via les Paramètres.',
+          'tcf.vendorsPerPurpose': '{count} partenaires',
+          'tcf.iabPartnerSingular': '1 partenaire certifié IAB',
+          'tcf.iabPartnerPlural': '{count} partenaires certifiés IAB',
+          'tcf.nonIabPartnerSingular': '1 partenaire supplémentaire',
+          'tcf.nonIabPartnerPlural': '{count} partenaires supplémentaires',
+          'tcf.partnerCountPrefix': 'Nous et',
+          'tcf.partnerCountConjunction': 'ainsi que',
+          'tcf.partnerCountSuffix': 'pouvons traiter ces données.',
+          'tcf.cmpStorage': 'Biscotti CMP stocke votre choix de consentement dans le stockage local de votre navigateur (jusqu\'à 180 jours).',
+          'tcf.maxStorage': 'Durée de stockage max. :',
+          'tcf.days': 'jours',
+          'tcf.usesNonCookieAccess': 'Utilise également un stockage non-cookie',
+          'tcf.storageInfo': 'Infos stockage',
+          'tcf.specialFeaturesDisclosure': 'Certains partenaires utilisent des fonctionnalités spéciales telles que la géolocalisation précise ou le scan actif des caractéristiques de l\'appareil pour l\'identification.',
+          'tcf.liDisclosure': 'Certains partenaires traitent vos données sur la base d\'un intérêt légitime, auquel vous avez le droit de vous opposer.',
+          'tcf.liLinkText': 'Gérer les intérêts légitimes',
+          'tcf.purposeNames': 'Finalités : {names}.'
+        },
+        es: {
+          'banner.title': 'Respetamos su privacidad',
+          'banner.text': 'Utilizamos cookies y tecnologías similares en nuestro sitio web. Algunas son técnicamente necesarias. Con su consentimiento, también utilizamos cookies para analizar el uso de nuestro sitio y personalizar contenido.',
+          'banner.accept': 'Aceptar todo',
+          'banner.reject': 'Rechazar todo',
+          'banner.withdrawAll': 'Retirar todo',
+          'banner.settings': 'Configuración',
+          'banner.ok': 'OK',
+          'banner.doNotSell': 'No vender ni compartir mi información personal',
+          'banner.managePrivacy': 'Gestionar opciones de privacidad',
+          'banner.save': 'Guardar preferencias',
+          'categories.essential': 'Esenciales',
+          'categories.essentialDesc': 'Necesarias para el funcionamiento básico.',
+          'categories.functional': 'Funcionales',
+          'categories.functionalDesc': 'Permiten funciones mejoradas.',
+          'categories.analytics': 'Estadísticas',
+          'categories.analyticsDesc': 'Nos ayudan a entender el uso del sitio.',
+          'categories.marketing': 'Marketing',
+          'categories.marketingDesc': 'Utilizadas para publicidad.',
+          'categories.ai': 'Servicios de IA',
+          'categories.aiDesc': 'Chatbots, sistemas de recomendación y contenido generado por IA. Cumple con la Ley de IA de la UE.',
+          'categories.aiNotice': '🤖 Esta función está impulsada por IA.',
+          'categories.alwaysActive': 'Siempre activo',
+          'details.provider': 'Proveedor:',
+          'details.location': 'Sede:',
+          'details.duration': 'Duración:',
+          'details.purpose': 'Finalidad:',
+          'details.legalBasis': 'Base legal:',
+          'details.privacy': 'Privacidad:',
+          'details.privacyLink': 'Política de privacidad',
+          'details.transfer': 'Transferencia de datos:',
+          'details.notSpecified': 'No especificado',
+          'details.consentId': 'ID de consentimiento:',
+          'details.details': 'Detalles',
+          'services.biscottiDesc': 'Almacena sus preferencias de cookies',
+          'services.biscottiPurpose': 'Almacenamiento de la decisión de consentimiento según RGPD Art. 7',
+          'services.wordpressDesc': 'Técnicamente necesario para el funcionamiento del sitio',
+          'services.wordpressPurpose': 'Gestión de sesión, estado de inicio de sesión, configuración del usuario',
+          'tcf.storageDisclosure': 'Nosotros y nuestros socios almacenamos y/o accedemos a información en su dispositivo (p. ej., cookies) y procesamos datos personales.',
+          'tcf.dataExamples': 'Esto puede incluir direcciones IP, identificadores de uso, comportamiento de navegación e identificadores de dispositivos.',
+          'tcf.purposeSummary': 'El procesamiento de datos sirve para la personalización de anuncios, medición de contenido y análisis de audiencias.',
+          'tcf.vendorCount': 'Nosotros y {count} socios pueden procesar sus datos — Ver lista',
+
+          'tcf.vendorCountSingular': 'Nosotros y 1 socio pueden procesar sus datos — Ver lista',
+          'tcf.consentScope': 'Su consentimiento se aplica solo a este sitio web.',
+          'tcf.withdrawInfo': 'Puede cambiar o retirar su consentimiento en cualquier momento a través de Configuración.',
+          'tcf.vendorsPerPurpose': '{count} socios',
+          'tcf.iabPartnerSingular': '1 socio certificado IAB',
+          'tcf.iabPartnerPlural': '{count} socios certificados IAB',
+          'tcf.nonIabPartnerSingular': '1 socio adicional',
+          'tcf.nonIabPartnerPlural': '{count} socios adicionales',
+          'tcf.partnerCountPrefix': 'Nosotros y',
+          'tcf.partnerCountConjunction': 'así como',
+          'tcf.partnerCountSuffix': 'podemos procesar estos datos.',
+          'tcf.cmpStorage': 'Biscotti CMP almacena su elección de consentimiento en el almacenamiento local de su navegador (hasta 180 días).',
+          'tcf.maxStorage': 'Duración máx. de almacenamiento:',
+          'tcf.days': 'días',
+          'tcf.usesNonCookieAccess': 'También utiliza almacenamiento sin cookies',
+          'tcf.storageInfo': 'Info almacenamiento',
+          'tcf.specialFeaturesDisclosure': 'Algunos socios utilizan funciones especiales como datos de geolocalización precisa o escaneo activo de características del dispositivo para identificación.',
+          'tcf.liDisclosure': 'Algunos socios procesan sus datos sobre la base de un interés legítimo, al que usted tiene derecho a oponerse.',
+          'tcf.liLinkText': 'Gestionar intereses legítimos',
+          'tcf.purposeNames': 'Fines: {names}.'
+        },
+        it: {
+          'banner.title': 'Rispettiamo la tua privacy',
+          'banner.text': 'Utilizziamo cookie e tecnologie simili sul nostro sito. Alcuni sono tecnicamente necessari. Con il tuo consenso, utilizziamo anche cookie per analizzare l\'utilizzo del sito e personalizzare i contenuti.',
+          'banner.accept': 'Accetta tutto',
+          'banner.reject': 'Rifiuta tutto',
+          'banner.withdrawAll': 'Revoca tutto',
+          'banner.settings': 'Impostazioni',
+          'banner.ok': 'OK',
+          'banner.close': 'Chiudi',
+          'banner.doNotSell': 'Non vendere o condividere le mie informazioni personali',
+          'banner.managePrivacy': 'Gestisci scelte sulla privacy',
+          'banner.save': 'Salva preferenze',
+          'categories.essential': 'Essenziali',
+          'categories.essentialDesc': 'Necessari per le funzionalità di base.',
+          'categories.functional': 'Funzionali',
+          'categories.functionalDesc': 'Consentono funzionalità avanzate.',
+          'categories.analytics': 'Statistiche',
+          'categories.analyticsDesc': 'Ci aiutano a capire l\'utilizzo del sito.',
+          'categories.marketing': 'Marketing',
+          'categories.marketingDesc': 'Utilizzati per la pubblicità.',
+          'categories.ai': 'Servizi IA',
+          'categories.aiDesc': 'Chatbot, sistemi di raccomandazione e contenuti generati da IA. Conforme al regolamento UE sull\'IA.',
+          'categories.aiNotice': '🤖 Questa funzione è alimentata dall\'IA.',
+          'categories.alwaysActive': 'Sempre attivo',
+          'details.provider': 'Fornitore:',
+          'details.location': 'Sede:',
+          'details.duration': 'Durata di archiviazione:',
+          'details.purpose': 'Finalità:',
+          'details.legalBasis': 'Base giuridica:',
+          'details.privacy': 'Privacy:',
+          'details.privacyLink': 'Informativa sulla privacy',
+          'details.transfer': 'Trasferimento dati:',
+          'details.notSpecified': 'Non specificato',
+          'details.consentId': 'ID consenso:',
+          'details.lookupTitle': 'Ricerca consenso',
+          'details.details': 'Dettagli',
+          'services.biscottiDesc': 'Memorizza le preferenze sui cookie',
+          'services.biscottiPurpose': 'Salvataggio della decisione sul consenso ai sensi del GDPR Art. 7',
+          'services.wordpressDesc': 'Tecnicamente necessario per il funzionamento del sito',
+          'services.wordpressPurpose': 'Gestione sessione, stato di accesso, impostazioni utente',
+          'tcf.storageDisclosure': 'Noi e i nostri partner memorizziamo e/o accediamo a informazioni sul tuo dispositivo (ad es. cookie) e trattiamo dati personali.',
+          'tcf.dataExamples': 'Questo può includere indirizzi IP, identificatori di utilizzo, comportamento di navigazione e identificatori del dispositivo.',
+          'tcf.purposeSummary': 'Il trattamento dei dati serve per la personalizzazione degli annunci, la misurazione dei contenuti e l\'analisi del pubblico.',
+          'tcf.vendorCount': 'Noi e {count} partner possiamo trattare i tuoi dati — Visualizza elenco',
+
+          'tcf.vendorCountSingular': 'Noi e 1 partner possiamo trattare i tuoi dati — Visualizza elenco',
+          'tcf.consentScope': 'Il tuo consenso si applica solo a questo sito web.',
+          'tcf.withdrawInfo': 'Puoi modificare o revocare il tuo consenso in qualsiasi momento tramite le Impostazioni.',
+          'tcf.vendorsPerPurpose': '{count} partner',
+          'tcf.iabPartnerSingular': '1 partner certificato IAB',
+          'tcf.iabPartnerPlural': '{count} partner certificati IAB',
+          'tcf.nonIabPartnerSingular': '1 partner aggiuntivo',
+          'tcf.nonIabPartnerPlural': '{count} partner aggiuntivi',
+          'tcf.partnerCountPrefix': 'Noi e',
+          'tcf.partnerCountConjunction': 'nonché',
+          'tcf.partnerCountSuffix': 'possiamo trattare questi dati.',
+          'tcf.cmpStorage': 'Biscotti CMP memorizza la tua scelta di consenso nella memoria locale del tuo browser (fino a 180 giorni).',
+          'tcf.maxStorage': 'Durata max. di archiviazione:',
+          'tcf.days': 'giorni',
+          'tcf.usesNonCookieAccess': 'Utilizza anche archiviazione non-cookie',
+          'tcf.storageInfo': 'Info archiviazione',
+          'tcf.specialFeaturesDisclosure': 'Alcuni partner utilizzano funzionalità speciali come dati di geolocalizzazione precisa o scansione attiva delle caratteristiche del dispositivo per l\'identificazione.',
+          'tcf.liDisclosure': 'Alcuni partner trattano i tuoi dati sulla base di un interesse legittimo, al quale hai il diritto di opporti.',
+          'tcf.liLinkText': 'Gestisci interessi legittimi',
+          'tcf.purposeNames': 'Finalità: {names}.'
+        },
+        nl: {
+          'banner.title': 'Wij respecteren uw privacy',
+          'banner.text': 'Wij gebruiken cookies en vergelijkbare technologieën op onze website. Sommige zijn technisch noodzakelijk. Met uw toestemming gebruiken we ook cookies om het gebruik van onze website te analyseren en inhoud te personaliseren.',
+          'banner.accept': 'Alles accepteren',
+          'banner.reject': 'Alles weigeren',
+          'banner.withdrawAll': 'Alles intrekken',
+          'banner.settings': 'Instellingen',
+          'banner.ok': 'OK',
+          'banner.close': 'Sluiten',
+          'banner.doNotSell': 'Verkoop of deel mijn persoonlijke gegevens niet',
+          'banner.managePrivacy': 'Privacykeuzes beheren',
+          'banner.save': 'Voorkeuren opslaan',
+          'categories.essential': 'Noodzakelijk',
+          'categories.essentialDesc': 'Nodig voor basisfunctionaliteit.',
+          'categories.functional': 'Functioneel',
+          'categories.functionalDesc': 'Maken verbeterde functionaliteit mogelijk.',
+          'categories.analytics': 'Statistieken',
+          'categories.analyticsDesc': 'Helpen ons het gebruik te begrijpen.',
+          'categories.marketing': 'Marketing',
+          'categories.marketingDesc': 'Gebruikt voor advertenties.',
+          'categories.ai': 'AI-diensten',
+          'categories.aiDesc': 'Chatbots, aanbevelingssystemen en AI-gegenereerde inhoud. Voldoet aan de EU AI-wet.',
+          'categories.aiNotice': '🤖 Deze functie wordt aangestuurd door AI.',
+          'categories.alwaysActive': 'Altijd actief',
+          'details.provider': 'Aanbieder:',
+          'details.location': 'Vestiging:',
+          'details.duration': 'Opslagduur:',
+          'details.purpose': 'Doel:',
+          'details.legalBasis': 'Rechtsgrondslag:',
+          'details.privacy': 'Privacy:',
+          'details.privacyLink': 'Privacyverklaring',
+          'details.transfer': 'Gegevensoverdracht:',
+          'details.notSpecified': 'Niet gespecificeerd',
+          'details.consentId': 'Toestemmings-ID:',
+          'details.lookupTitle': 'Toestemming opzoeken',
+          'details.details': 'Details',
+          'services.biscottiDesc': 'Slaat uw cookievoorkeuren op',
+          'services.biscottiPurpose': 'Opslag van de toestemmingsbeslissing conform AVG Art. 7',
+          'services.wordpressDesc': 'Technisch noodzakelijk voor websitefunctionaliteit',
+          'services.wordpressPurpose': 'Sessiebeheer, inlogstatus, gebruikersinstellingen',
+          'tcf.storageDisclosure': 'Wij en onze partners slaan informatie op en/of hebben toegang tot informatie op uw apparaat (bijv. cookies) en verwerken persoonsgegevens.',
+          'tcf.dataExamples': 'Dit kan IP-adressen, gebruiks-ID\'s, surfgedrag en apparaat-ID\'s omvatten.',
+          'tcf.purposeSummary': 'De gegevensverwerking dient voor advertentiepersonalisatie, inhoudsmeting en doelgroepanalyse.',
+          'tcf.vendorCount': 'Wij en {count} partners kunnen uw gegevens verwerken — Lijst bekijken',
+
+          'tcf.vendorCountSingular': 'Wij en 1 partner kunnen uw gegevens verwerken — Lijst bekijken',
+          'tcf.consentScope': 'Uw toestemming geldt alleen voor deze website.',
+          'tcf.withdrawInfo': 'U kunt uw toestemming op elk moment wijzigen of intrekken via Instellingen.',
+          'tcf.vendorsPerPurpose': '{count} partners',
+          'tcf.iabPartnerSingular': '1 IAB-gecertificeerde partner',
+          'tcf.iabPartnerPlural': '{count} IAB-gecertificeerde partners',
+          'tcf.nonIabPartnerSingular': '1 extra partner',
+          'tcf.nonIabPartnerPlural': '{count} extra partners',
+          'tcf.partnerCountPrefix': 'Wij en',
+          'tcf.partnerCountConjunction': 'evenals',
+          'tcf.partnerCountSuffix': 'kunnen deze gegevens verwerken.',
+          'tcf.cmpStorage': 'Biscotti CMP slaat uw toestemmingskeuze op in de lokale opslag van uw browser (tot 180 dagen).',
+          'tcf.maxStorage': 'Max. opslagduur:',
+          'tcf.days': 'dagen',
+          'tcf.usesNonCookieAccess': 'Gebruikt ook niet-cookie opslag',
+          'tcf.storageInfo': 'Opslaginfo',
+          'tcf.specialFeaturesDisclosure': 'Sommige partners gebruiken speciale functies zoals nauwkeurige geolocatiegegevens of actief scannen van apparaatkenmerken voor identificatie.',
+          'tcf.liDisclosure': 'Sommige partners verwerken uw gegevens op basis van een gerechtvaardigd belang, waartegen u het recht heeft bezwaar te maken.',
+          'tcf.liLinkText': 'Gerechtvaardigde belangen beheren',
+          'tcf.purposeNames': 'Doeleinden: {names}.'
+        },
+        pl: {
+          'banner.title': 'Szanujemy Twoją prywatność',
+          'banner.text': 'Używamy plików cookie i podobnych technologii na naszej stronie. Niektóre są technicznie niezbędne. Za Twoją zgodą używamy również plików cookie do analizy korzystania ze strony i personalizacji treści.',
+          'banner.accept': 'Zaakceptuj wszystko',
+          'banner.reject': 'Odrzuć wszystko',
+          'banner.withdrawAll': 'Wycofaj wszystko',
+          'banner.settings': 'Ustawienia',
+          'banner.ok': 'OK',
+          'banner.close': 'Zamknij',
+          'banner.doNotSell': 'Nie sprzedawaj ani nie udostępniaj moich danych osobowych',
+          'banner.managePrivacy': 'Zarządzaj opcjami prywatności',
+          'banner.save': 'Zapisz preferencje',
+          'categories.essential': 'Niezbędne',
+          'categories.essentialDesc': 'Wymagane do podstawowego działania.',
+          'categories.functional': 'Funkcjonalne',
+          'categories.functionalDesc': 'Umożliwiają rozszerzone funkcje.',
+          'categories.analytics': 'Statystyki',
+          'categories.analyticsDesc': 'Pomagają nam zrozumieć użytkowanie.',
+          'categories.marketing': 'Marketing',
+          'categories.marketingDesc': 'Używane do reklam.',
+          'categories.ai': 'Usługi AI',
+          'categories.aiDesc': 'Chatboty, systemy rekomendacji i treści generowane przez AI. Zgodne z rozporządzeniem UE o AI.',
+          'categories.aiNotice': '🤖 Ta funkcja jest wspierana przez AI.',
+          'categories.alwaysActive': 'Zawsze aktywne',
+          'details.provider': 'Dostawca:',
+          'details.location': 'Siedziba:',
+          'details.duration': 'Czas przechowywania:',
+          'details.purpose': 'Cel:',
+          'details.legalBasis': 'Podstawa prawna:',
+          'details.privacy': 'Prywatność:',
+          'details.privacyLink': 'Polityka prywatności',
+          'details.transfer': 'Transfer danych:',
+          'details.notSpecified': 'Nie określono',
+          'details.consentId': 'ID zgody:',
+          'details.lookupTitle': 'Wyszukiwanie zgody',
+          'details.details': 'Szczegóły',
+          'services.biscottiDesc': 'Przechowuje preferencje dotyczące plików cookie',
+          'services.biscottiPurpose': 'Przechowywanie decyzji o zgodzie zgodnie z RODO Art. 7',
+          'services.wordpressDesc': 'Technicznie niezbędne do funkcjonowania strony',
+          'services.wordpressPurpose': 'Zarządzanie sesją, status logowania, ustawienia użytkownika',
+          'tcf.storageDisclosure': 'My i nasi partnerzy przechowujemy i/lub uzyskujemy dostęp do informacji na Twoim urządzeniu (np. pliki cookie) i przetwarzamy dane osobowe.',
+          'tcf.dataExamples': 'Może to obejmować adresy IP, identyfikatory użytkowania, zachowania przeglądania i identyfikatory urządzeń.',
+          'tcf.purposeSummary': 'Przetwarzanie danych służy personalizacji reklam, pomiarowi treści i analizie odbiorców.',
+          'tcf.vendorCount': 'My i {count} partnerów możemy przetwarzać Twoje dane — Pokaż listę',
+
+          'tcf.vendorCountSingular': 'My i 1 partner możemy przetwarzać Twoje dane — Pokaż listę',
+          'tcf.consentScope': 'Twoja zgoda dotyczy tylko tej strony internetowej.',
+          'tcf.withdrawInfo': 'Możesz zmienić lub wycofać swoją zgodę w dowolnym momencie w Ustawieniach.',
+          'tcf.vendorsPerPurpose': '{count} partnerów',
+          'tcf.iabPartnerSingular': '1 partner certyfikowany IAB',
+          'tcf.iabPartnerPlural': '{count} partnerów certyfikowanych IAB',
+          'tcf.nonIabPartnerSingular': '1 dodatkowy partner',
+          'tcf.nonIabPartnerPlural': '{count} dodatkowych partnerów',
+          'tcf.partnerCountPrefix': 'My i',
+          'tcf.partnerCountConjunction': 'oraz',
+          'tcf.partnerCountSuffix': 'możemy przetwarzać te dane.',
+          'tcf.cmpStorage': 'Biscotti CMP przechowuje Twoją decyzję o zgodzie w lokalnej pamięci przeglądarki (do 180 dni).',
+          'tcf.maxStorage': 'Maks. czas przechowywania:',
+          'tcf.days': 'dni',
+          'tcf.usesNonCookieAccess': 'Wykorzystuje również pamięć bez plików cookie',
+          'tcf.storageInfo': 'Info o pamięci',
+          'tcf.specialFeaturesDisclosure': 'Niektórzy partnerzy korzystają ze specjalnych funkcji, takich jak precyzyjne dane geolokalizacyjne lub aktywne skanowanie cech urządzenia w celu identyfikacji.',
+          'tcf.liDisclosure': 'Niektórzy partnerzy przetwarzają Twoje dane na podstawie uzasadnionego interesu, któremu masz prawo się sprzeciwić.',
+          'tcf.liLinkText': 'Zarządzaj uzasadnionymi interesami',
+          'tcf.purposeNames': 'Cele: {names}.'
+        },
+        pt: {
+          'banner.title': 'Respeitamos a sua privacidade',
+          'banner.text': 'Utilizamos cookies e tecnologias semelhantes no nosso website. Alguns são tecnicamente necessários. Com o seu consentimento, também utilizamos cookies para analisar a utilização do nosso website e personalizar conteúdos.',
+          'banner.accept': 'Aceitar tudo',
+          'banner.reject': 'Rejeitar tudo',
+          'banner.withdrawAll': 'Retirar tudo',
+          'banner.settings': 'Definições',
+          'banner.ok': 'OK',
+          'banner.close': 'Fechar',
+          'banner.doNotSell': 'Não vender nem partilhar as minhas informações pessoais',
+          'banner.managePrivacy': 'Gerir opções de privacidade',
+          'banner.save': 'Guardar preferências',
+          'categories.essential': 'Essenciais',
+          'categories.essentialDesc': 'Necessários para o funcionamento básico.',
+          'categories.functional': 'Funcionais',
+          'categories.functionalDesc': 'Permitem funcionalidades melhoradas.',
+          'categories.analytics': 'Estatísticas',
+          'categories.analyticsDesc': 'Ajudam-nos a compreender a utilização do site.',
+          'categories.marketing': 'Marketing',
+          'categories.marketingDesc': 'Utilizados para publicidade.',
+          'categories.ai': 'Serviços de IA',
+          'categories.aiDesc': 'Chatbots, sistemas de recomendação e conteúdos gerados por IA. Em conformidade com o Regulamento da IA da UE.',
+          'categories.aiNotice': '🤖 Esta funcionalidade é alimentada por IA.',
+          'categories.alwaysActive': 'Sempre ativo',
+          'details.provider': 'Fornecedor:',
+          'details.location': 'Sede:',
+          'details.duration': 'Duração de armazenamento:',
+          'details.purpose': 'Finalidade:',
+          'details.legalBasis': 'Base legal:',
+          'details.privacy': 'Privacidade:',
+          'details.privacyLink': 'Política de privacidade',
+          'details.transfer': 'Transferência de dados:',
+          'details.notSpecified': 'Não especificado',
+          'details.consentId': 'ID de consentimento:',
+          'details.lookupTitle': 'Pesquisa de consentimento',
+          'details.details': 'Detalhes',
+          'services.biscottiDesc': 'Armazena as suas preferências de cookies',
+          'services.biscottiPurpose': 'Armazenamento da decisão de consentimento conforme RGPD Art. 7',
+          'services.wordpressDesc': 'Tecnicamente necessário para o funcionamento do website',
+          'services.wordpressPurpose': 'Gestão de sessão, estado de login, configurações do utilizador',
+          'tcf.storageDisclosure': 'Nós e os nossos parceiros armazenamos e/ou acedemos a informações no seu dispositivo (por ex., cookies) e processamos dados pessoais.',
+          'tcf.dataExamples': 'Isto pode incluir endereços IP, identificadores de utilização, comportamento de navegação e identificadores de dispositivos.',
+          'tcf.purposeSummary': 'O processamento de dados serve para a personalização de anúncios, medição de conteúdo e análise de audiências.',
+          'tcf.vendorCount': 'Nós e {count} parceiros podemos processar os seus dados — Ver lista',
+
+          'tcf.vendorCountSingular': 'Nós e 1 parceiro podemos processar os seus dados — Ver lista',
+          'tcf.consentScope': 'O seu consentimento aplica-se apenas a este website.',
+          'tcf.withdrawInfo': 'Pode alterar ou retirar o seu consentimento a qualquer momento através das Definições.',
+          'tcf.vendorsPerPurpose': '{count} parceiros',
+          'tcf.iabPartnerSingular': '1 parceiro certificado IAB',
+          'tcf.iabPartnerPlural': '{count} parceiros certificados IAB',
+          'tcf.nonIabPartnerSingular': '1 parceiro adicional',
+          'tcf.nonIabPartnerPlural': '{count} parceiros adicionais',
+          'tcf.partnerCountPrefix': 'Nós e',
+          'tcf.partnerCountConjunction': 'bem como',
+          'tcf.partnerCountSuffix': 'podemos processar estes dados.',
+          'tcf.cmpStorage': 'O Biscotti CMP armazena a sua escolha de consentimento no armazenamento local do seu navegador (até 180 dias).',
+          'tcf.maxStorage': 'Duração máx. de armazenamento:',
+          'tcf.days': 'dias',
+          'tcf.usesNonCookieAccess': 'Também utiliza armazenamento sem cookies',
+          'tcf.storageInfo': 'Info armazenamento',
+          'tcf.specialFeaturesDisclosure': 'Alguns parceiros utilizam funcionalidades especiais como dados de geolocalização precisa ou análise ativa das características do dispositivo para identificação.',
+          'tcf.liDisclosure': 'Alguns parceiros processam os seus dados com base num interesse legítimo, ao qual tem o direito de se opor.',
+          'tcf.liLinkText': 'Gerir interesses legítimos',
+          'tcf.purposeNames': 'Finalidades: {names}.'
+        },
+        da: {
+          'banner.title': 'Vi respekterer dit privatliv',
+          'banner.text': 'Vi bruger cookies og lignende teknologier på vores hjemmeside. Nogle er teknisk nødvendige. Med dit samtykke bruger vi også cookies til at analysere brugen af vores hjemmeside og personalisere indhold.',
+          'banner.accept': 'Accepter alle',
+          'banner.reject': 'Afvis alle',
+          'banner.withdrawAll': 'Tilbagekald alle',
+          'banner.settings': 'Indstillinger',
+          'banner.ok': 'OK',
+          'banner.close': 'Luk',
+          'banner.doNotSell': 'Sælg eller del ikke mine personlige oplysninger',
+          'banner.managePrivacy': 'Administrer privatlivsvalg',
+          'banner.save': 'Gem præferencer',
+          'categories.essential': 'Nødvendige',
+          'categories.essentialDesc': 'Kræves til grundlæggende funktionalitet.',
+          'categories.functional': 'Funktionelle',
+          'categories.functionalDesc': 'Muliggør forbedret funktionalitet.',
+          'categories.analytics': 'Statistik',
+          'categories.analyticsDesc': 'Hjælper os med at forstå brugen af siden.',
+          'categories.marketing': 'Marketing',
+          'categories.marketingDesc': 'Bruges til reklame.',
+          'categories.ai': 'AI-tjenester',
+          'categories.aiDesc': 'Chatbots, anbefalingssystemer og AI-genereret indhold. I overensstemmelse med EU AI-forordningen.',
+          'categories.aiNotice': '🤖 Denne funktion drives af AI.',
+          'categories.alwaysActive': 'Altid aktiv',
+          'details.provider': 'Udbyder:',
+          'details.location': 'Hjemsted:',
+          'details.duration': 'Opbevaringsvarighed:',
+          'details.purpose': 'Formål:',
+          'details.legalBasis': 'Retsgrundlag:',
+          'details.privacy': 'Databeskyttelse:',
+          'details.privacyLink': 'Privatlivspolitik',
+          'details.transfer': 'Dataoverførsel:',
+          'details.notSpecified': 'Ikke angivet',
+          'details.consentId': 'Samtykke-ID:',
+          'details.lookupTitle': 'Samtykke-opslag',
+          'details.details': 'Detaljer',
+          'services.biscottiDesc': 'Gemmer dine cookiepræferencer',
+          'services.biscottiPurpose': 'Lagring af samtykkeafgørelsen ifølge GDPR Art. 7',
+          'services.wordpressDesc': 'Teknisk nødvendigt for hjemmesidens funktionalitet',
+          'services.wordpressPurpose': 'Sessionsstyring, loginstatus, brugerindstillinger',
+          'tcf.storageDisclosure': 'Vi og vores partnere lagrer og/eller tilgår oplysninger på din enhed (f.eks. cookies) og behandler personoplysninger.',
+          'tcf.dataExamples': 'Dette kan omfatte IP-adresser, brugs-ID\'er, browsingadfærd og enheds-ID\'er.',
+          'tcf.purposeSummary': 'Databehandlingen tjener til annoncetilpasning, indholdsmåling og målgruppeanalyse.',
+          'tcf.vendorCount': 'Vi og {count} partnere kan behandle dine data — Vis liste',
+
+          'tcf.vendorCountSingular': 'Vi og 1 partner kan behandle dine data — Vis liste',
+          'tcf.consentScope': 'Dit samtykke gælder kun for denne hjemmeside.',
+          'tcf.withdrawInfo': 'Du kan ændre eller tilbagetrække dit samtykke når som helst via Indstillinger.',
+          'tcf.vendorsPerPurpose': '{count} partnere',
+          'tcf.iabPartnerSingular': '1 IAB-certificeret partner',
+          'tcf.iabPartnerPlural': '{count} IAB-certificerede partnere',
+          'tcf.nonIabPartnerSingular': '1 yderligere partner',
+          'tcf.nonIabPartnerPlural': '{count} yderligere partnere',
+          'tcf.partnerCountPrefix': 'Vi og',
+          'tcf.partnerCountConjunction': 'samt',
+          'tcf.partnerCountSuffix': 'kan behandle disse data.',
+          'tcf.cmpStorage': 'Biscotti CMP gemmer dit samtykkevalg i din browsers lokale lager (op til 180 dage).',
+          'tcf.maxStorage': 'Maks. lagringsvarighed:',
+          'tcf.days': 'dage',
+          'tcf.usesNonCookieAccess': 'Bruger også ikke-cookie-lagring',
+          'tcf.storageInfo': 'Lageroplysninger',
+          'tcf.specialFeaturesDisclosure': 'Nogle partnere bruger specielle funktioner som præcise geolokaliseringsdata eller aktiv scanning af enhedsegenskaber til identifikation.',
+          'tcf.liDisclosure': 'Nogle partnere behandler dine data på grundlag af en legitim interesse, som du har ret til at gøre indsigelse mod.',
+          'tcf.liLinkText': 'Administrer legitime interesser',
+          'tcf.purposeNames': 'Formål: {names}.'
+        },
+        // ---- 30 new languages ----
+        ar: {
+          'banner.title': 'نحن نحترم خصوصيتك',
+          'banner.text': 'نحن نستخدم ملفات تعريف الارتباط وتقنيات مماثلة على موقعنا. بعضها ضروري تقنيًا لتشغيل الموقع. بموافقتك، نستخدم أيضًا ملفات تعريف الارتباط لتحليل استخدام موقعنا إحصائيًا ولتخصيص المحتوى والإعلانات.',
+          'banner.accept': 'قبول الكل',
+          'banner.reject': 'رفض الكل',
+          'banner.withdrawAll': 'سحب الكل',
+          'banner.settings': 'الإعدادات',
+          'banner.ok': 'موافق',
+          'banner.doNotSell': 'لا تبيع أو تشارك معلوماتي الشخصية',
+          'banner.managePrivacy': 'إدارة خيارات الخصوصية',
+          'banner.save': 'حفظ التفضيلات',
+          'categories.essential': 'ضروري',
+          'categories.essentialDesc': 'مطلوب لوظائف الموقع الأساسية.',
+          'categories.functional': 'وظيفي',
+          'categories.functionalDesc': 'تمكين وظائف محسنة وتخصيص.',
+          'categories.analytics': 'تحليلات',
+          'categories.analyticsDesc': 'ساعدنا في فهم كيفية استخدام موقعنا.',
+          'categories.marketing': 'تسويق',
+          'categories.marketingDesc': 'يستخدم للإعلان وتتبع المواقع.',
+          'categories.ai': 'خدمات الذكاء الاصطناعي',
+          'categories.aiDesc': 'روبوتات الدردشة وأنظمة التوصية والمحتوى الذي تم إنشاؤه بواسطة الذكاء الاصطناعي. متوافق مع قانون الاتحاد الأوروبي للذكاء الاصطناعي EU AI Act.',
+          'categories.aiNotice': '🤖 هذه الميزة مدعومة بالذكاء الاصطناعي.',
+          'categories.alwaysActive': 'نشط دائمًا',
+          'details.provider': 'المزود:',
+          'details.location': 'الموقع:',
+          'details.duration': 'مدة التخزين:',
+          'details.purpose': 'الغرض:',
+          'details.legalBasis': 'الأساس القانوني:',
+          'details.privacy': 'الخصوصية:',
+          'details.privacyLink': 'سياسة الخصوصية',
+          'details.transfer': 'نقل البيانات:',
+          'details.notSpecified': 'غير محدد',
+          'details.consentId': 'معرف الموافقة: ID:',
+          'details.details': 'التفاصيل',
+          'services.biscottiDesc': 'يخزن تفضيلات الموافقة على ملفات تعريف الارتباط الخاصة بك',
+          'services.biscottiPurpose': 'تخزين قرار الموافقة كما هو مطلوب بموجب المادة 7 من اللائحة العامة لحماية البيانات GDPR',
+          'services.wordpressDesc': 'ضروري تقنيًا لوظائف الموقع',
+          'services.wordpressPurpose': 'إدارة الجلسة، حالة تسجيل الدخول، إعدادات المستخدم',
+          'tcf.storageDisclosure': 'نحن وشركاؤنا نخزن و/أو نصل إلى معلومات على جهازك (مثل ملفات تعريف الارتباط) ونعالج بيانات شخصية.',
+          'tcf.dataExamples': 'قد يشمل ذلك عناوين IP ومعرفات الاستخدام وسلوك التصفح ومعرفات الجهاز.',
+          'tcf.purposeSummary': 'تخدم معالجة البيانات أغراضًا مثل تخصيص الإعلانات وقياس المحتوى وتحليل الجمهور.',
+          'tcf.vendorCount': 'نحن و{count} شريك قد نعالج بياناتك — عرض القائمة',
+
+          'tcf.vendorCountSingular': 'نحن وشريك واحد قد نعالج بياناتك — عرض القائمة',
+          'tcf.consentScope': 'موافقتك تنطبق على هذا الموقع فقط.',
+          'tcf.withdrawInfo': 'يمكنك تغيير أو سحب موافقتك في أي وقت عبر الإعدادات.',
+          'tcf.vendorsPerPurpose': '{count} شركاء',
+          'tcf.iabPartnerSingular': '1 شريك معتمد من IAB',
+          'tcf.iabPartnerPlural': '{count} شركاء معتمدين من IAB',
+          'tcf.nonIabPartnerSingular': '1 مزود إضافي',
+          'tcf.nonIabPartnerPlural': '{count} مزودين إضافيين',
+          'tcf.partnerCountPrefix': 'نحن و',
+          'tcf.partnerCountConjunction': 'بالإضافة إلى',
+          'tcf.partnerCountSuffix': 'يمكننا معالجة هذه البيانات.',
+          'tcf.cmpStorage': 'يخزن Biscotti CMP خيار موافقتك في التخزين المحلي لمتصفحك (حتى 180 يومًا).',
+          'tcf.maxStorage': 'الحد الأقصى لمدة التخزين:',
+          'tcf.days': 'أيام',
+          'tcf.usesNonCookieAccess': 'يستخدم أيضًا تخزينًا غير ملفات تعريف الارتباط',
+          'tcf.storageInfo': 'معلومات التخزين',
+          'tcf.specialFeaturesDisclosure': 'يستخدم بعض الشركاء ميزات خاصة مثل بيانات تحديد الموقع الجغرافي الدقيقة أو المسح النشط لخصائص الجهاز من أجل التعرف عليها.',
+          'tcf.liDisclosure': 'يقوم بعض الشركاء بمعالجة بياناتك استنادًا إلى المصلحة المشروعة، ويحق لك الاعتراض على ذلك.',
+          'tcf.liLinkText': 'إدارة المصالح المشروعة',
+          'tcf.purposeNames': 'الأغراض: {names}.'
+        },
+        bg: {
+          'banner.title': 'Ние уважаваме вашата поверителност',
+          'banner.text': 'Използваме бисквитки и подобни технологии на нашия уебсайт. Някои са технически необходими за функционирането на сайта. С вашето съгласие използваме също бисквитки, за да анализираме статистически използването на нашия уебсайт и да персонализираме съдържанието и рекламите.',
+          'banner.accept': 'Приемам всички',
+          'banner.reject': 'Отхвърли всички',
+          'banner.withdrawAll': 'Оттегляне на всички',
+          'banner.settings': 'Настройки',
+          'banner.ok': 'OK',
+          'banner.close': 'Затвори',
+          'banner.doNotSell': 'Не продавайте и не споделяйте личните ми данни',
+          'banner.managePrivacy': 'Управление на настройките за поверителност',
+          'banner.save': 'Запазване на предпочитанията',
+          'categories.essential': 'Необходими',
+          'categories.essentialDesc': 'Необходими за основната функционалност на уебсайта.',
+          'categories.functional': 'Функционални',
+          'categories.functionalDesc': 'Активиране на разширена функционалност и персонализация.',
+          'categories.analytics': 'Аналитични',
+          'categories.analyticsDesc': 'Помагат ни да разберем как се използва нашият уебсайт.',
+          'categories.marketing': 'Маркетингови',
+          'categories.marketingDesc': 'Използват се за реклама и проследяване в различни сайтове.',
+          'categories.ai': 'AI Услуги',
+          'categories.aiDesc': 'Чатботове, системи за препоръки и AI-генерирано съдържание. Съвместими с EU AI Act.',
+          'categories.aiNotice': '🤖 Тази функция се поддържа от AI.',
+          'categories.alwaysActive': 'Винаги активно',
+          'details.provider': 'Доставчик:',
+          'details.location': 'Местоположение:',
+          'details.duration': 'Продължителност на съхранение:',
+          'details.purpose': 'Цел:',
+          'details.legalBasis': 'Правно основание:',
+          'details.privacy': 'Поверителност:',
+          'details.privacyLink': 'Политика за поверителност',
+          'details.transfer': 'Трансфер на данни:',
+          'details.notSpecified': 'Не е посочено',
+          'details.consentId': 'ID на съгласие:',
+          'details.lookupTitle': 'Търсене на съгласие',
+          'details.details': 'Детайли',
+          'services.biscottiDesc': 'Съхранява вашите предпочитания за съгласие за бисквитки',
+          'services.biscottiPurpose': 'Съхранение на решението за съгласие, както се изисква от GDPR чл. 7',
+          'services.wordpressDesc': 'Технически необходими за функционалността на уебсайта',
+          'services.wordpressPurpose': 'Управление на сесии, статус на влизане, потребителски настройки',
+          'tcf.storageDisclosure': 'Ние и нашите партньори съхраняваме и/или осъществяваме достъп до информация на вашето устройство (напр. бисквитки) и обработваме лични данни.',
+          'tcf.dataExamples': 'Това може да включва IP адреси, идентификатори за използване, поведение при сърфиране и идентификатори на устройства.',
+          'tcf.purposeSummary': 'Обработката на данни служи за цели като персонализиране на реклами, измерване на съдържание и анализ на аудиторията.',
+          'tcf.vendorCount': 'Ние и {count} партньора можем да обработваме вашите данни — Покажи списъка',
+
+          'tcf.vendorCountSingular': 'Ние и 1 партньор можем да обработваме вашите данни — Покажи списъка',
+          'tcf.consentScope': 'Вашето съгласие се отнася само за този уебсайт.',
+          'tcf.withdrawInfo': 'Можете да промените или оттеглите съгласието си по всяко време чрез Настройки.',
+          'tcf.vendorsPerPurpose': '{count} партньора',
+          'tcf.iabPartnerSingular': '1 IAB-сертифициран партньор',
+          'tcf.iabPartnerPlural': '{count} IAB-сертифицирани партньора',
+          'tcf.nonIabPartnerSingular': '1 допълнителен доставчик',
+          'tcf.nonIabPartnerPlural': '{count} допълнителни доставчика',
+          'tcf.partnerCountPrefix': 'Ние и',
+          'tcf.partnerCountConjunction': 'както и',
+          'tcf.partnerCountSuffix': 'можем да обработваме тези данни.',
+          'tcf.cmpStorage': 'Biscotti CMP съхранява вашия избор за съгласие в локалното хранилище на браузъра ви (до 180 дни).',
+          'tcf.maxStorage': 'Макс. продължителност на съхранение:',
+          'tcf.days': 'дни',
+          'tcf.usesNonCookieAccess': 'Използва и не-бисквитково хранилище',
+          'tcf.storageInfo': 'Информация за съхранение',
+          'tcf.specialFeaturesDisclosure': 'Някои партньори използват специални функции като точни данни за географското местоположение или активно сканиране на характеристиките на устройството с цел идентификация.',
+          'tcf.liDisclosure': 'Някои партньори обработват Вашите данни въз основа на законен интерес, срещу което имате право да възразите.',
+          'tcf.liLinkText': 'Управление на законни интереси',
+          'tcf.purposeNames': 'Цели: {names}.'
+        },
+        bs: {
+          'banner.title': 'Poštujemo vašu privatnost',
+          'banner.text': 'Koristimo kolačiće i slične tehnologije na našoj web stranici. Neki su tehnički neophodni za rad stranice. Uz vašu saglasnost, također koristimo kolačiće za statističku analizu korištenja naše web stranice i za personalizaciju sadržaja i oglašavanja.',
+          'banner.accept': 'Prihvati sve',
+          'banner.reject': 'Odbij sve',
+          'banner.withdrawAll': 'Povuci sve',
+          'banner.settings': 'Postavke',
+          'banner.ok': 'OK',
+          'banner.close': 'Zatvori',
+          'banner.doNotSell': 'Ne prodajite niti dijelite moje lične podatke',
+          'banner.managePrivacy': 'Upravljanje postavkama privatnosti',
+          'banner.save': 'Spremi postavke',
+          'categories.essential': 'Neophodni',
+          'categories.essentialDesc': 'Potrebni za osnovnu funkcionalnost web stranice.',
+          'categories.functional': 'Funkcionalni',
+          'categories.functionalDesc': 'Omogućuju poboljšanu funkcionalnost i personalizaciju.',
+          'categories.analytics': 'Analitika',
+          'categories.analyticsDesc': 'Pomažu nam da razumijemo kako se koristi naša web stranica.',
+          'categories.marketing': 'Marketing',
+          'categories.marketingDesc': 'Koriste se za oglašavanje i praćenje na različitim stranicama.',
+          'categories.ai': 'AI Usluge',
+          'categories.aiDesc': 'Chatbotovi, sistemi preporuka i AI-generisani sadržaj. U skladu sa EU AI Act.',
+          'categories.aiNotice': '🤖 Ovu funkciju pokreće AI.',
+          'categories.alwaysActive': 'Uvijek aktivno',
+          'details.provider': 'Pružatelj:',
+          'details.location': 'Lokacija:',
+          'details.duration': 'Trajanje pohrane:',
+          'details.purpose': 'Svrha:',
+          'details.legalBasis': 'Pravna osnova:',
+          'details.privacy': 'Privatnost:',
+          'details.privacyLink': 'Politika privatnosti',
+          'details.transfer': 'Prijenos podataka:',
+          'details.notSpecified': 'Nije specificirano',
+          'details.consentId': 'ID: Saglasnosti:',
+          'details.lookupTitle': 'Pretraga saglasnosti',
+          'details.details': 'Detalji',
+          'services.biscottiDesc': 'Pohranjuje vaše postavke pristanka na kolačiće',
+          'services.biscottiPurpose': 'Pohrana odluke o pristanku kao što zahtijeva GDPR Član 7',
+          'services.wordpressDesc': 'Tehnički neophodni za funkcionalnost web stranice',
+          'services.wordpressPurpose': 'Upravljanje sesijama, status prijave, korisničke postavke',
+          'tcf.storageDisclosure': 'Mi i naši partneri pohranjujemo i/ili pristupamo informacijama na vašem uređaju (npr. kolačiće) i obrađujemo lične podatke.',
+          'tcf.dataExamples': 'To može uključivati IP adrese, identifikatore korištenja, ponašanje pri pregledavanju i identifikatore uređaja.',
+          'tcf.purposeSummary': 'Obrada podataka služi u svrhe kao što su personalizacija oglasa, mjerenje sadržaja i analiza publike.',
+          'tcf.vendorCount': 'Mi i {count} partnera možemo obrađivati vaše podatke — Prikaži listu',
+
+          'tcf.vendorCountSingular': 'Mi i 1 partner možemo obrađivati vaše podatke — Prikaži listu',
+          'tcf.consentScope': 'Vaš pristanak se odnosi samo na ovu web stranicu.',
+          'tcf.withdrawInfo': 'Možete promijeniti ili povući svoj pristanak u bilo koje vrijeme putem Postavki.',
+          'tcf.vendorsPerPurpose': '{count} partnera',
+          'tcf.iabPartnerSingular': '1 IAB-certificirani partner',
+          'tcf.iabPartnerPlural': '{count} IAB-certificiranih partnera',
+          'tcf.nonIabPartnerSingular': '1 dodatni pružalac',
+          'tcf.nonIabPartnerPlural': '{count} dodatnih pružalaca',
+          'tcf.partnerCountPrefix': 'Mi i',
+          'tcf.partnerCountConjunction': 'kao i',
+          'tcf.partnerCountSuffix': 'možemo obrađivati ove podatke.',
+          'tcf.cmpStorage': 'Biscotti CMP pohranjuje vaš izbor pristanka u lokalnoj pohrani vašeg preglednika (do 180 dana).',
+          'tcf.maxStorage': 'Maks. trajanje pohrane:',
+          'tcf.days': 'dana',
+          'tcf.usesNonCookieAccess': 'Također koristi pohranu bez kolačića',
+          'tcf.storageInfo': 'Informacije o pohrani',
+          'tcf.specialFeaturesDisclosure': 'Some partners use special features such as precise geolocation data or active scanning of device characteristics for identification.',
+          'tcf.liDisclosure': 'Some partners process your data on the basis of legitimate interest, which you have the right to object to.',
+          'tcf.liLinkText': 'Manage legitimate interests',
+          'tcf.purposeNames': 'Purposes: {names}.'
+        },
+        ca: {
+          'banner.title': 'Respectem la teva privadesa',
+          'banner.text': 'Utilitzem cookies i tecnologies similars al nostre lloc web. Algunes són tècnicament necessàries per al funcionament del lloc. Amb el teu consentiment, també utilitzem cookies per analitzar estadísticament l\'ús del nostre lloc web i per personalitzar el contingut i la publicitat.',
+          'banner.accept': 'Acceptar-ho tot',
+          'banner.reject': 'Rebutjar-ho tot',
+          'banner.withdrawAll': 'Retirar tot',
+          'banner.settings': 'Configuració',
+          'banner.ok': 'D\'acord',
+          'banner.close': 'Tanca',
+          'banner.doNotSell': 'No vengueu ni compartiu la meva informació personal',
+          'banner.managePrivacy': 'Gestionar opcions de privadesa',
+          'banner.save': 'Guardar preferències',
+          'categories.essential': 'Essencials',
+          'categories.essentialDesc': 'Necessàries per a la funcionalitat bàsica del lloc web.',
+          'categories.functional': 'Funcionals',
+          'categories.functionalDesc': 'Habiliten funcionalitats millorades i personalització.',
+          'categories.analytics': 'Analítiques',
+          'categories.analyticsDesc': 'Ens ajuden a entendre com s\'utilitza el nostre lloc web.',
+          'categories.marketing': 'Màrqueting',
+          'categories.marketingDesc': 'S\'utilitzen per a la publicitat i el seguiment entre llocs.',
+          'categories.ai': 'Serveis d\'IA',
+          'categories.aiDesc': 'Xatbots, sistemes de recomanació i contingut generat per IA. Complint amb la EU AI Act.',
+          'categories.aiNotice': '🤖 Aquesta funció està impulsada per IA.',
+          'categories.alwaysActive': 'Sempre actiu',
+          'details.provider': 'Proveïdor:',
+          'details.location': 'Ubicació:',
+          'details.duration': 'Durada d\'emmagatzematge:',
+          'details.purpose': 'Finalitat:',
+          'details.legalBasis': 'Base legal:',
+          'details.privacy': 'Privadesa:',
+          'details.privacyLink': 'Política de privadesa',
+          'details.transfer': 'Transferència de dades:',
+          'details.notSpecified': 'No especificat',
+          'details.consentId': 'ID: Consent ID:',
+          'details.lookupTitle': 'Cerca de consentiment',
+          'details.details': 'Detalls',
+          'services.biscottiDesc': 'Emmagatzema les teves preferències de consentiment de cookies',
+          'services.biscottiPurpose': 'Emmagatzematge de la decisió de consentiment tal com ho requereix el GDPR Art. 7',
+          'services.wordpressDesc': 'Tècnicament necessari per a la funcionalitat del lloc web',
+          'services.wordpressPurpose': 'Gestió de la sessió, estat d\'inici de sessió, configuració de l\'usuari',
+          'tcf.storageDisclosure': 'Nosaltres i els nostres socis emmagatzemem i/o accedim a informació al vostre dispositiu (p. ex. galetes) i processem dades personals.',
+          'tcf.dataExamples': 'Això pot incloure adreces IP, identificadors d\'ús, comportament de navegació i identificadors de dispositiu.',
+          'tcf.purposeSummary': 'El processament de dades serveix per a finalitats com la personalització d\'anuncis, la mesura de contingut i l\'anàlisi d\'audiència.',
+          'tcf.vendorCount': 'Nosaltres i {count} socis podem processar les vostres dades — Veure llista',
+
+          'tcf.vendorCountSingular': 'Nosaltres i 1 soci podem processar les vostres dades — Veure llista',
+          'tcf.consentScope': 'El vostre consentiment s\'aplica només a aquest lloc web.',
+          'tcf.withdrawInfo': 'Podeu canviar o retirar el vostre consentiment en qualsevol moment a través de la Configuració.',
+          'tcf.vendorsPerPurpose': '{count} socis',
+          'tcf.iabPartnerSingular': '1 soci certificat IAB',
+          'tcf.iabPartnerPlural': '{count} socis certificats IAB',
+          'tcf.nonIabPartnerSingular': '1 proveïdor addicional',
+          'tcf.nonIabPartnerPlural': '{count} proveïdors addicionals',
+          'tcf.partnerCountPrefix': 'Nosaltres i',
+          'tcf.partnerCountConjunction': 'així com',
+          'tcf.partnerCountSuffix': 'podem processar aquestes dades.',
+          'tcf.cmpStorage': 'Biscotti CMP emmagatzema la vostra elecció de consentiment a l\'emmagatzematge local del navegador (fins a 180 dies).',
+          'tcf.maxStorage': 'Durada màx. d\'emmagatzematge:',
+          'tcf.days': 'dies',
+          'tcf.usesNonCookieAccess': 'També utilitza emmagatzematge sense galetes',
+          'tcf.storageInfo': 'Info emmagatzematge',
+          'tcf.specialFeaturesDisclosure': 'Some partners use special features such as precise geolocation data or active scanning of device characteristics for identification.',
+          'tcf.liDisclosure': 'Some partners process your data on the basis of legitimate interest, which you have the right to object to.',
+          'tcf.liLinkText': 'Manage legitimate interests',
+          'tcf.purposeNames': 'Purposes: {names}.'
+        },
+        cs: {
+          'banner.title': 'Respektujeme vaše soukromí',
+          'banner.text': 'Na našich webových stránkách používáme cookies a podobné technologie. Některé z nich jsou technicky nezbytné pro provoz stránek. S vaším souhlasem používáme cookies také k statistické analýze používání našich webových stránek a k personalizaci obsahu a reklamy.',
+          'banner.accept': 'Přijmout vše',
+          'banner.reject': 'Odmítnout vše',
+          'banner.withdrawAll': 'Odvolat vše',
+          'banner.settings': 'Nastavení',
+          'banner.ok': 'OK',
+          'banner.doNotSell': 'Neprodávejte ani nesdílejte mé osobní údaje',
+          'banner.managePrivacy': 'Spravovat volby ochrany soukromí',
+          'banner.save': 'Uložit preference',
+          'categories.essential': 'Nezbytné',
+          'categories.essentialDesc': 'Vyžadováno pro základní funkčnost webových stránek.',
+          'categories.functional': 'Funkční',
+          'categories.functionalDesc': 'Umožňují rozšířené funkce a personalizaci.',
+          'categories.analytics': 'Analytické',
+          'categories.analyticsDesc': 'Pomáhají nám pochopit, jak je náš web používán.',
+          'categories.marketing': 'Marketingové',
+          'categories.marketingDesc': 'Používají se pro reklamu a sledování napříč stránkami.',
+          'categories.ai': 'AI Služby',
+          'categories.aiDesc': 'Chatboti, doporučovací systémy a obsah generovaný umělou inteligencí. V souladu s EU AI Act.',
+          'categories.aiNotice': '🤖 Tato funkce je poháněna umělou inteligencí.',
+          'categories.alwaysActive': 'Vždy aktivní',
+          'details.provider': 'Poskytovatel:',
+          'details.location': 'Umístění:',
+          'details.duration': 'Doba uložení:',
+          'details.purpose': 'Účel:',
+          'details.legalBasis': 'Právní základ:',
+          'details.privacy': 'Soukromí:',
+          'details.privacyLink': 'Zásady ochrany osobních údajů',
+          'details.transfer': 'Přenos dat:',
+          'details.notSpecified': 'Nespecifikováno',
+          'details.consentId': 'ID souhlasu:',
+          'details.details': 'Podrobnosti',
+          'services.biscottiDesc': 'Ukládá vaše preference souhlasu s cookies',
+          'services.biscottiPurpose': 'Uložení rozhodnutí o souhlasu, jak vyžaduje GDPR čl. 7',
+          'services.wordpressDesc': 'Technicky nezbytné pro funkčnost webových stránek',
+          'services.wordpressPurpose': 'Správa relací, stav přihlášení, uživatelská nastavení',
+          'tcf.storageDisclosure': 'My a naši partneři ukládáme a/nebo přistupujeme k informacím na vašem zařízení (např. soubory cookie) a zpracováváme osobní údaje.',
+          'tcf.dataExamples': 'To může zahrnovat IP adresy, identifikátory použití, chování při prohlížení a identifikátory zařízení.',
+          'tcf.purposeSummary': 'Zpracování dat slouží účelům jako personalizace reklam, měření obsahu a analýza publika.',
+          'tcf.vendorCount': 'My a {count} partnerů můžeme zpracovávat vaše údaje — Zobrazit seznam',
+
+          'tcf.vendorCountSingular': 'My a 1 partner můžeme zpracovávat vaše údaje — Zobrazit seznam',
+          'tcf.consentScope': 'Váš souhlas se vztahuje pouze na tyto webové stránky.',
+          'tcf.withdrawInfo': 'Svůj souhlas můžete kdykoli změnit nebo odvolat prostřednictvím Nastavení.',
+          'tcf.vendorsPerPurpose': '{count} partnerů',
+          'tcf.iabPartnerSingular': '1 IAB certifikovaný partner',
+          'tcf.iabPartnerPlural': '{count} IAB certifikovaných partnerů',
+          'tcf.nonIabPartnerSingular': '1 další poskytovatel',
+          'tcf.nonIabPartnerPlural': '{count} dalších poskytovatelů',
+          'tcf.partnerCountPrefix': 'My a',
+          'tcf.partnerCountConjunction': 'jakož i',
+          'tcf.partnerCountSuffix': 'můžeme zpracovávat tyto údaje.',
+          'tcf.cmpStorage': 'Biscotti CMP ukládá vaši volbu souhlasu do místního úložiště prohlížeče (až 180 dní).',
+          'tcf.maxStorage': 'Max. doba uložení:',
+          'tcf.days': 'dní',
+          'tcf.usesNonCookieAccess': 'Využívá také úložiště bez souborů cookie',
+          'tcf.storageInfo': 'Info o úložišti',
+          'tcf.specialFeaturesDisclosure': 'Někteří partneři k identifikaci využívají speciální funkce, jako jsou přesné údaje o poloze nebo aktivní snímání charakteristik zařízení.',
+          'tcf.liDisclosure': 'Někteří partneři zpracovávají vaše údaje na základě oprávněného zájmu, proti čemuž máte právo vznést námitku.',
+          'tcf.liLinkText': 'Zajišťování oprávněných zájmů',
+          'tcf.purposeNames': 'Účel: {names}.'
+        },
+        el: {
+          'banner.title': 'Σεβόμαστε την ιδιωτικότητά σας',
+          'banner.text': 'Χρησιμοποιούμε cookies και παρόμοιες τεχνολογίες στον ιστότοπό μας. Ορισμένα είναι τεχνικά απαραίτητα για τη λειτουργία του ιστότοπου. Με τη συγκατάθεσή σας, χρησιμοποιούμε επίσης cookies για να αναλύσουμε στατιστικά τη χρήση του ιστότοπού μας και να εξατομικεύσουμε το περιεχόμενο και τη διαφήμιση.',
+          'banner.accept': 'Αποδοχή όλων',
+          'banner.reject': 'Απόρριψη όλων',
+          'banner.withdrawAll': 'Ανάκληση όλων',
+          'banner.settings': 'Ρυθμίσεις',
+          'banner.ok': 'OK',
+          'banner.doNotSell': 'Μην πουλάτε ή μοιράζεστε τα προσωπικά μου στοιχεία',
+          'banner.managePrivacy': 'Διαχείριση επιλογών απορρήτου',
+          'banner.save': 'Αποθήκευση προτιμήσεων',
+          'categories.essential': 'Απαραίτητα',
+          'categories.essentialDesc': 'Απαιτούνται για τη βασική λειτουργικότητα του ιστότοπου.',
+          'categories.functional': 'Λειτουργικά',
+          'categories.functionalDesc': 'Ενεργοποιήστε βελτιωμένη λειτουργικότητα και εξατομίκευση.',
+          'categories.analytics': 'Ανάλυσης',
+          'categories.analyticsDesc': 'Βοηθήστε μας να κατανοήσουμε πώς χρησιμοποιείται ο ιστότοπός μας.',
+          'categories.marketing': 'Μάρκετινγκ',
+          'categories.marketingDesc': 'Χρησιμοποιούνται για διαφήμιση και παρακολούθηση σε όλο τον ιστότοπο.',
+          'categories.ai': 'Υπηρεσίες AI',
+          'categories.aiDesc': 'Chatbots, συστήματα συστάσεων και περιεχόμενο που δημιουργείται από AI. Συμμορφώνεται με τον EU AI Act.',
+          'categories.aiNotice': '🤖 Αυτή η λειτουργία υποστηρίζεται από AI.',
+          'categories.alwaysActive': 'Πάντα ενεργό',
+          'details.provider': 'Πάροχος:',
+          'details.location': 'Τοποθεσία:',
+          'details.duration': 'Διάρκεια αποθήκευσης:',
+          'details.purpose': 'Σκοπός:',
+          'details.legalBasis': 'Νομική βάση:',
+          'details.privacy': 'Απόρρητο:',
+          'details.privacyLink': 'Πολιτική Απορρήτου',
+          'details.transfer': 'Μεταφορά δεδομένων:',
+          'details.notSpecified': 'Δεν προσδιορίζεται',
+          'details.consentId': 'ID: Συγκατάθεσης:',
+          'details.details': 'Λεπτομέρειες',
+          'services.biscottiDesc': 'Αποθηκεύει τις προτιμήσεις συγκατάθεσης cookie',
+          'services.biscottiPurpose': 'Αποθήκευση της απόφασης συγκατάθεσης όπως απαιτείται από το GDPR Art. 7',
+          'services.wordpressDesc': 'Τεχνικά απαραίτητο για τη λειτουργικότητα του ιστότοπου',
+          'services.wordpressPurpose': 'Διαχείριση συνεδριών, κατάσταση σύνδεσης, ρυθμίσεις χρήστη',
+          'tcf.storageDisclosure': 'Εμείς και οι συνεργάτες μας αποθηκεύουμε και/ή έχουμε πρόσβαση σε πληροφορίες στη συσκευή σας (π.χ. cookies) και επεξεργαζόμαστε προσωπικά δεδομένα.',
+          'tcf.dataExamples': 'Αυτό μπορεί να περιλαμβάνει διευθύνσεις IP, αναγνωριστικά χρήσης, συμπεριφορά πλοήγησης και αναγνωριστικά συσκευών.',
+          'tcf.purposeSummary': 'Η επεξεργασία δεδομένων εξυπηρετεί σκοπούς όπως η εξατομίκευση διαφημίσεων, η μέτρηση περιεχομένου και η ανάλυση κοινού.',
+          'tcf.vendorCount': 'Εμείς και {count} συνεργάτες μπορούμε να επεξεργαστούμε τα δεδομένα σας — Προβολή λίστας',
+
+          'tcf.vendorCountSingular': 'Εμείς και 1 συνεργάτης μπορούμε να επεξεργαστούμε τα δεδομένα σας — Προβολή λίστας',
+          'tcf.consentScope': 'Η συγκατάθεσή σας ισχύει μόνο για αυτόν τον ιστότοπο.',
+          'tcf.withdrawInfo': 'Μπορείτε να αλλάξετε ή να αποσύρετε τη συγκατάθεσή σας ανά πάσα στιγμή μέσω των Ρυθμίσεων.',
+          'tcf.vendorsPerPurpose': '{count} συνεργάτες',
+          'tcf.iabPartnerSingular': '1 πιστοποιημένος συνεργάτης IAB',
+          'tcf.iabPartnerPlural': '{count} πιστοποιημένοι συνεργάτες IAB',
+          'tcf.nonIabPartnerSingular': '1 επιπλέον πάροχος',
+          'tcf.nonIabPartnerPlural': '{count} επιπλέον πάροχοι',
+          'tcf.partnerCountPrefix': 'Εμείς και',
+          'tcf.partnerCountConjunction': 'καθώς και',
+          'tcf.partnerCountSuffix': 'μπορούμε να επεξεργαστούμε αυτά τα δεδομένα.',
+          'tcf.cmpStorage': 'Το Biscotti CMP αποθηκεύει την επιλογή συγκατάθεσής σας στον τοπικό χώρο αποθήκευσης του προγράμματος περιήγησής σας (έως 180 ημέρες).',
+          'tcf.maxStorage': 'Μέγ. διάρκεια αποθήκευσης:',
+          'tcf.days': 'ημέρες',
+          'tcf.usesNonCookieAccess': 'Χρησιμοποιεί επίσης αποθήκευση χωρίς cookies',
+          'tcf.storageInfo': 'Πληροφορίες αποθήκευσης',
+          'tcf.specialFeaturesDisclosure': 'Ορισμένοι συνεργάτες χρησιμοποιούν ειδικές λειτουργίες, όπως ακριβή δεδομένα γεωγραφικής θέσης ή ενεργή ανίχνευση των χαρακτηριστικών της συσκευής, για σκοπούς ταυτοποίησης.',
+          'tcf.liDisclosure': 'Ορισμένοι συνεργάτες επεξεργάζονται τα δεδομένα σας βάσει έννομου συμφέροντος, έναντι του οποίου έχετε το δικαίωμα να εκφράσετε την αντίρρησή σας.',
+          'tcf.liLinkText': 'Διαχείριση έννομων συμφερόντων',
+          'tcf.purposeNames': 'Σκοποί: {names}.'
+        },
+        eu: {
+          'banner.title': 'Zure pribatutasuna errespetatzen dugu',
+          'banner.text': 'Cookie-ak eta antzeko teknologiak erabiltzen ditugu gure webgunean. Batzuk teknikoki beharrezkoak dira gunea funtzionatzeko. Zure baimenarekin, cookie-ak ere erabiltzen ditugu gure webgunearen erabilera estatistikoki aztertzeko eta edukia eta publizitatea pertsonalizatzeko.',
+          'banner.accept': 'Onartu guztiak',
+          'banner.reject': 'Ezinbestekoak soilik',
+          'banner.withdrawAll': 'Guztiak kendu',
+          'banner.settings': 'Ezarpenak',
+          'banner.ok': 'Ados',
+          'banner.close': 'Itxi',
+          'banner.doNotSell': 'Ez saldu edo partekatu nire informazio pertsonala',
+          'banner.managePrivacy': 'Pribatutasun-aukerak kudeatu',
+          'banner.save': 'Gorde hobespenak',
+          'categories.essential': 'Ezinbestekoak',
+          'categories.essentialDesc': 'Webgunearen oinarrizko funtzionalitaterako beharrezkoak.',
+          'categories.functional': 'Funtzionalak',
+          'categories.functionalDesc': 'Funtzionalitate hobetua eta pertsonalizazioa ahalbidetu.',
+          'categories.analytics': 'Analitika',
+          'categories.analyticsDesc': 'Gure webgunea nola erabiltzen den ulertzen laguntzen digute.',
+          'categories.marketing': 'Marketina',
+          'categories.marketingDesc': 'Publizitaterako eta guneen arteko jarraipenerako erabiltzen da.',
+          'categories.ai': 'AI Zerbitzuak',
+          'categories.aiDesc': 'Chatbot-ak, gomendio sistemak eta AI-k sortutako edukia. EU AI Act-ekin bat dator.',
+          'categories.aiNotice': '🤖 Funtzio hau AI-k bultzatuta dago.',
+          'categories.alwaysActive': 'Beti aktibo',
+          'details.provider': 'Hornitzailea:',
+          'details.location': 'Kokapena:',
+          'details.duration': 'Biltegiratze iraupena:',
+          'details.purpose': 'Helburua:',
+          'details.legalBasis': 'Lege-oinarria:',
+          'details.privacy': 'Pribatutasuna:',
+          'details.privacyLink': 'Pribatutasun Politika',
+          'details.transfer': 'Datuen transferentzia:',
+          'details.notSpecified': 'Zehaztu gabe',
+          'details.consentId': 'Baimen ID-a:',
+          'details.lookupTitle': 'Baimen-bilaketa',
+          'details.details': 'Xehetasunak',
+          'services.biscottiDesc': 'Zure cookie baimenaren hobespenak gordetzen ditu',
+          'services.biscottiPurpose': 'Baimen erabakiaren biltegiratzea, GDPR Art. 7-k eskatzen duen moduan',
+          'services.wordpressDesc': 'Teknikoki beharrezkoa webgunearen funtzionalitaterako',
+          'services.wordpressPurpose': 'Saioaren kudeaketa, saioa hasteko egoera, erabiltzailearen ezarpenak',
+          'tcf.storageDisclosure': 'Guk eta gure bazkideek informazioa gordetzen eta/edo atzitzen dugu zure gailuan (adib. cookieak) eta datu pertsonalak prozesatzen ditugu.',
+          'tcf.dataExamples': 'Honek IP helbideak, erabilera identifikatzaileak, nabigazio jokaera eta gailu identifikatzaileak izan ditzake.',
+          'tcf.purposeSummary': 'Datuen prozesamendua iragarki pertsonalizazioa, eduki neurketa eta audientzia analisia bezalako helburuetarako da.',
+          'tcf.vendorCount': 'Guk eta {count} bazkidek zure datuak prozesatu ditzakegu — Zerrenda ikusi',
+
+          'tcf.vendorCountSingular': 'Guk eta bazkide 1ek zure datuak prozesatu ditzakegu — Zerrenda ikusi',
+          'tcf.consentScope': 'Zure baimena webgune honetarako bakarrik da.',
+          'tcf.withdrawInfo': 'Zure baimena edozein unetan alda edo ken dezakezu Ezarpenen bidez.',
+          'tcf.vendorsPerPurpose': '{count} bazkide',
+          'tcf.iabPartnerSingular': '1 IAB ziurtagiridun bazkide',
+          'tcf.iabPartnerPlural': '{count} IAB ziurtagiridun bazkide',
+          'tcf.nonIabPartnerSingular': '1 hornitzaile gehigarri',
+          'tcf.nonIabPartnerPlural': '{count} hornitzaile gehigarri',
+          'tcf.partnerCountPrefix': 'Guk eta',
+          'tcf.partnerCountConjunction': 'baita',
+          'tcf.partnerCountSuffix': 'datu hauek prozesatu ditzakegu.',
+          'tcf.cmpStorage': 'Biscotti CMP-k zure baimen aukera zure nabigatzailearen tokiko biltegian gordetzen du (180 egun arte).',
+          'tcf.maxStorage': 'Geh. biltegiratze iraupena:',
+          'tcf.days': 'egun',
+          'tcf.usesNonCookieAccess': 'Cookie gabeko biltegiratzea ere erabiltzen du',
+          'tcf.storageInfo': 'Biltegiratze info',
+          'tcf.specialFeaturesDisclosure': 'Some partners use special features such as precise geolocation data or active scanning of device characteristics for identification.',
+          'tcf.liDisclosure': 'Some partners process your data on the basis of legitimate interest, which you have the right to object to.',
+          'tcf.liLinkText': 'Manage legitimate interests',
+          'tcf.purposeNames': 'Purposes: {names}.'
+        },
+        fi: {
+          'banner.title': 'Kunnioitamme yksityisyyttäsi',
+          'banner.text': 'Käytämme verkkosivustollamme evästeitä ja vastaavia teknologioita. Osa niistä on teknisesti välttämättömiä sivuston toiminnalle. Suostumuksellasi käytämme evästeitä myös verkkosivustomme käytön tilastolliseen analysointiin sekä sisällön ja mainonnan personointiin.',
+          'banner.accept': 'Hyväksy kaikki',
+          'banner.reject': 'Hylkää kaikki',
+          'banner.withdrawAll': 'Peruuta kaikki',
+          'banner.settings': 'Asetukset',
+          'banner.ok': 'OK',
+          'banner.close': 'Sulje',
+          'banner.doNotSell': 'Älä myy tai jaa henkilötietojani',
+          'banner.managePrivacy': 'Hallitse yksityisyysvalintoja',
+          'banner.save': 'Tallenna asetukset',
+          'categories.essential': 'Välttämättömät',
+          'categories.essentialDesc': 'Vaaditaan verkkosivuston perustoimintoihin.',
+          'categories.functional': 'Toiminnalliset',
+          'categories.functionalDesc': 'Mahdollistavat parannetun toiminnallisuuden ja personoinnin.',
+          'categories.analytics': 'Analytiikka',
+          'categories.analyticsDesc': 'Auttavat meitä ymmärtämään, miten verkkosivustoamme käytetään.',
+          'categories.marketing': 'Markkinointi',
+          'categories.marketingDesc': 'Käytetään mainontaan ja sivustojen väliseen seurantaan.',
+          'categories.ai': 'AI-palvelut',
+          'categories.aiDesc': 'Chatbotit, suositusjärjestelmät ja tekoälyn tuottama sisältö. EU AI Act -yhteensopiva.',
+          'categories.aiNotice': '🤖 Tämä ominaisuus toimii tekoälyn avulla.',
+          'categories.alwaysActive': 'Aina aktiivinen',
+          'details.provider': 'Palveluntarjoaja:',
+          'details.location': 'Sijainti:',
+          'details.duration': 'Säilytysaika:',
+          'details.purpose': 'Tarkoitus:',
+          'details.legalBasis': 'Oikeusperusta:',
+          'details.privacy': 'Tietosuoja:',
+          'details.privacyLink': 'Tietosuojakäytäntö',
+          'details.transfer': 'Tiedonsiirto:',
+          'details.notSpecified': 'Ei määritelty',
+          'details.consentId': 'Suostumuksen ID:',
+          'details.lookupTitle': 'Suostumuksen haku',
+          'details.details': 'Tiedot',
+          'services.biscottiDesc': 'Tallentaa evästeisiin liittyvät suostumusasetuksesi',
+          'services.biscottiPurpose': 'Suostumuspäätöksen tallentaminen GDPR Art. 7:n vaatimusten mukaisesti',
+          'services.wordpressDesc': 'Teknisesti välttämätön verkkosivuston toiminnalle',
+          'services.wordpressPurpose': 'Istunnonhallinta, kirjautumistila, käyttäjäasetukset',
+          'tcf.storageDisclosure': 'Me ja kumppanimme tallennamme ja/tai käytämme tietoja laitteellesi (esim. evästeet) ja käsittelemme henkilötietoja.',
+          'tcf.dataExamples': 'Tämä voi sisältää IP-osoitteita, käyttötunnisteita, selauskäyttäytymistä ja laitetunnisteita.',
+          'tcf.purposeSummary': 'Tietojenkäsittely palvelee tarkoituksia kuten mainosten personointi, sisällön mittaus ja yleisöanalyysi.',
+          'tcf.vendorCount': 'Me ja {count} kumppania voimme käsitellä tietojasi — Näytä lista',
+
+          'tcf.vendorCountSingular': 'Me ja 1 kumppani voimme käsitellä tietojasi — Näytä lista',
+          'tcf.consentScope': 'Suostumuksesi koskee vain tätä verkkosivustoa.',
+          'tcf.withdrawInfo': 'Voit muuttaa tai peruuttaa suostumuksesi milloin tahansa Asetuksista.',
+          'tcf.vendorsPerPurpose': '{count} kumppania',
+          'tcf.iabPartnerSingular': '1 IAB-sertifioitu kumppani',
+          'tcf.iabPartnerPlural': '{count} IAB-sertifioitua kumppania',
+          'tcf.nonIabPartnerSingular': '1 lisäpalveluntarjoaja',
+          'tcf.nonIabPartnerPlural': '{count} lisäpalveluntarjoajaa',
+          'tcf.partnerCountPrefix': 'Me ja',
+          'tcf.partnerCountConjunction': 'sekä',
+          'tcf.partnerCountSuffix': 'voimme käsitellä näitä tietoja.',
+          'tcf.cmpStorage': 'Biscotti CMP tallentaa suostumuksesi selaimesi paikalliseen tallennustilaan (enintään 180 päivää).',
+          'tcf.maxStorage': 'Enimmäistallennusaika:',
+          'tcf.days': 'päivää',
+          'tcf.usesNonCookieAccess': 'Käyttää myös evästeettömiä tallennusmuotoja',
+          'tcf.storageInfo': 'Tallennustiedot',
+          'tcf.specialFeaturesDisclosure': 'Jotkut kumppanit käyttävät tunnistamiseen erityisominaisuuksia, kuten tarkkoja sijaintitietoja tai laitteiden ominaisuuksien aktiivista skannausta.',
+          'tcf.liDisclosure': 'Jotkut yhteistyökumppanit käsittelevät tietojasi oikeutetun edun perusteella, ja sinulla on oikeus vastustaa tätä.',
+          'tcf.liLinkText': 'Oikeutettujen etujen hallinta',
+          'tcf.purposeNames': 'Tarkoitus: {names}.'
+        },
+        gl: {
+          'banner.title': 'Respectamos a túa privacidade',
+          'banner.text': 'Usamos cookies e tecnoloxías similares no noso sitio web. Algunhas son tecnicamente necesarias para o funcionamento do sitio. Co teu consentimento, tamén usamos cookies para analizar estatisticamente o uso do noso sitio web e para personalizar o contido e a publicidade.',
+          'banner.accept': 'Aceptar todo',
+          'banner.reject': 'Rexeitar todo',
+          'banner.withdrawAll': 'Retirar todo',
+          'banner.settings': 'Configuración',
+          'banner.ok': 'OK',
+          'banner.close': 'Pechar',
+          'banner.doNotSell': 'Non venda nin comparta a miña información persoal',
+          'banner.managePrivacy': 'Xestionar opcións de privacidade',
+          'banner.save': 'Gardar preferencias',
+          'categories.essential': 'Esenciais',
+          'categories.essentialDesc': 'Requiridas para a funcionalidade básica do sitio web.',
+          'categories.functional': 'Funcionais',
+          'categories.functionalDesc': 'Activar a funcionalidade mellorada e a personalización.',
+          'categories.analytics': 'Analíticas',
+          'categories.analyticsDesc': 'Axúdanos a comprender como se usa o noso sitio web.',
+          'categories.marketing': 'Marketing',
+          'categories.marketingDesc': 'Usadas para publicidade e seguimento entre sitios.',
+          'categories.ai': 'Servizos de IA',
+          'categories.aiDesc': 'Chatbots, sistemas de recomendación e contido xerado por IA. Cumpre coa EU AI Act.',
+          'categories.aiNotice': '🤖 Esta función está impulsada por IA.',
+          'categories.alwaysActive': 'Sempre activo',
+          'details.provider': 'Proveedor:',
+          'details.location': 'Localización:',
+          'details.duration': 'Duración do almacenamento:',
+          'details.purpose': 'Finalidade:',
+          'details.legalBasis': 'Base legal:',
+          'details.privacy': 'Privacidade:',
+          'details.privacyLink': 'Política de Privacidade',
+          'details.transfer': 'Transferencia de datos:',
+          'details.notSpecified': 'Non especificado',
+          'details.consentId': 'ID:',
+          'details.lookupTitle': 'Busca de consentimento',
+          'details.details': 'Detalles',
+          'services.biscottiDesc': 'Almacena as túas preferencias de consentimento de cookies',
+          'services.biscottiPurpose': 'Almacenamento da decisión de consentimento segundo o requirido polo GDPR Art. 7',
+          'services.wordpressDesc': 'Tecnicamente necesario para a funcionalidade do sitio web',
+          'services.wordpressPurpose': 'Xestión de sesións, estado de inicio de sesión, configuración do usuario',
+          'tcf.storageDisclosure': 'Nós e os nosos socios almacenamos e/ou accedemos a información no seu dispositivo (p. ex. cookies) e procesamos datos persoais.',
+          'tcf.dataExamples': 'Isto pode incluír enderezos IP, identificadores de uso, comportamento de navegación e identificadores de dispositivo.',
+          'tcf.purposeSummary': 'O procesamento de datos serve para fins como a personalización de anuncios, a medición de contido e a análise de audiencia.',
+          'tcf.vendorCount': 'Nós e {count} socios podemos procesar os seus datos — Ver lista',
+
+          'tcf.vendorCountSingular': 'Nós e 1 socio podemos procesar os seus datos — Ver lista',
+          'tcf.consentScope': 'O seu consentimento aplícase só a este sitio web.',
+          'tcf.withdrawInfo': 'Pode cambiar ou retirar o seu consentimento en calquera momento a través da Configuración.',
+          'tcf.vendorsPerPurpose': '{count} socios',
+          'tcf.iabPartnerSingular': '1 socio certificado IAB',
+          'tcf.iabPartnerPlural': '{count} socios certificados IAB',
+          'tcf.nonIabPartnerSingular': '1 provedor adicional',
+          'tcf.nonIabPartnerPlural': '{count} provedores adicionais',
+          'tcf.partnerCountPrefix': 'Nós e',
+          'tcf.partnerCountConjunction': 'así como',
+          'tcf.partnerCountSuffix': 'podemos procesar estes datos.',
+          'tcf.cmpStorage': 'Biscotti CMP almacena a súa elección de consentimento no almacenamento local do seu navegador (ata 180 días).',
+          'tcf.maxStorage': 'Duración máx. de almacenamento:',
+          'tcf.days': 'días',
+          'tcf.usesNonCookieAccess': 'Tamén usa almacenamento sen cookies',
+          'tcf.storageInfo': 'Info almacenamento',
+          'tcf.specialFeaturesDisclosure': 'Some partners use special features such as precise geolocation data or active scanning of device characteristics for identification.',
+          'tcf.liDisclosure': 'Some partners process your data on the basis of legitimate interest, which you have the right to object to.',
+          'tcf.liLinkText': 'Manage legitimate interests',
+          'tcf.purposeNames': 'Purposes: {names}.'
+        },
+        he: {
+          'banner.title': 'אנו מכבדים את פרטיותך',
+          'banner.text': 'אנו משתמשים בעוגיות ובטכנולוגיות דומות באתר האינטרנט שלנו. חלקן הכרחיות מבחינה טכנית לתפעול האתר. בהסכמתך, אנו משתמשים גם בעוגיות כדי לנתח סטטיסטית את השימוש באתר האינטרנט שלנו וכדי להתאים אישית תוכן ופרסום.',
+          'banner.accept': 'קבל הכל',
+          'banner.reject': 'דחה הכל',
+          'banner.withdrawAll': 'ביטול הכל',
+          'banner.settings': 'הגדרות',
+          'banner.ok': 'אישור',
+          'banner.close': 'סגור',
+          'banner.doNotSell': 'אל תמכרו או תשתפו את המידע האישי שלי',
+          'banner.managePrivacy': 'ניהול בחירות פרטיות',
+          'banner.save': 'שמור העדפות',
+          'categories.essential': 'הכרחיות',
+          'categories.essentialDesc': 'נדרש עבור פונקציונליות בסיסית של האתר.',
+          'categories.functional': 'פונקציונליות',
+          'categories.functionalDesc': 'אפשר פונקציונליות משופרת והתאמה אישית.',
+          'categories.analytics': 'ניתוח נתונים',
+          'categories.analyticsDesc': 'עזור לנו להבין כיצד משתמשים באתר האינטרנט שלנו.',
+          'categories.marketing': 'שיווק',
+          'categories.marketingDesc': 'משמש לפרסום ומעקב חוצה אתרים.',
+          'categories.ai': 'שירותי AI',
+          'categories.aiDesc': 'צ\'אטבוטים, מערכות המלצה ותוכן שנוצר על ידי AI. תואם ל-EU AI Act.',
+          'categories.aiNotice': '🤖 תכונה זו מופעלת על ידי AI.',
+          'categories.alwaysActive': 'פעיל תמיד',
+          'details.provider': 'ספק:',
+          'details.location': 'מיקום:',
+          'details.duration': 'משך אחסון:',
+          'details.purpose': 'מטרה:',
+          'details.legalBasis': 'בסיס משפטי:',
+          'details.privacy': 'פרטיות:',
+          'details.privacyLink': 'מדיניות פרטיות',
+          'details.transfer': 'העברת נתונים:',
+          'details.notSpecified': 'לא צוין',
+          'details.consentId': 'ID: מזהה הסכמה',
+          'details.lookupTitle': 'חיפוש הסכמה',
+          'details.details': 'פרטים',
+          'services.biscottiDesc': 'מאחסן את העדפות הסכמת העוגיות שלך',
+          'services.biscottiPurpose': 'אחסון החלטת הסכמה כנדרש על ידי GDPR Art. 7',
+          'services.wordpressDesc': 'הכרחי מבחינה טכנית עבור פונקציונליות האתר',
+          'services.wordpressPurpose': 'ניהול сессия, מצב כניסה, הגדרות משתמש',
+          'tcf.storageDisclosure': 'אנחנו והשותפים שלנו מאחסנים ו/או ניגשים למידע במכשיר שלך (למשל עוגיות) ומעבדים נתונים אישיים.',
+          'tcf.dataExamples': 'זה עשוי לכלול כתובות IP, מזהי שימוש, התנהגות גלישה ומזהי מכשירים.',
+          'tcf.purposeSummary': 'עיבוד הנתונים משרת מטרות כגון התאמה אישית של מודעות, מדידת תוכן ותובנות קהל.',
+          'tcf.vendorCount': 'אנחנו ו-{count} שותפים עשויים לעבד את הנתונים שלך — הצג רשימה',
+
+          'tcf.vendorCountSingular': 'אנחנו ושותף אחד עשויים לעבד את הנתונים שלך — הצג רשימה',
+          'tcf.consentScope': 'ההסכמה שלך חלה על אתר זה בלבד.',
+          'tcf.withdrawInfo': 'ניתן לשנות או לבטל את הסכמתך בכל עת דרך הגדרות.',
+          'tcf.vendorsPerPurpose': '{count} שותפים',
+          'tcf.iabPartnerSingular': '1 שותף מוסמך IAB',
+          'tcf.iabPartnerPlural': '{count} שותפים מוסמכי IAB',
+          'tcf.nonIabPartnerSingular': '1 ספק נוסף',
+          'tcf.nonIabPartnerPlural': '{count} ספקים נוספים',
+          'tcf.partnerCountPrefix': 'אנחנו ו',
+          'tcf.partnerCountConjunction': 'וכן',
+          'tcf.partnerCountSuffix': 'יכולים לעבד נתונים אלה.',
+          'tcf.cmpStorage': 'Biscotti CMP מאחסן את בחירת ההסכמה שלך באחסון המקומי של הדפדפן (עד 180 ימים).',
+          'tcf.maxStorage': 'משך אחסון מרבי:',
+          'tcf.days': 'ימים',
+          'tcf.usesNonCookieAccess': 'משתמש גם באחסון שאינו עוגיות',
+          'tcf.storageInfo': 'מידע אחסון',
+          'tcf.specialFeaturesDisclosure': 'Some partners use special features such as precise geolocation data or active scanning of device characteristics for identification.',
+          'tcf.liDisclosure': 'Some partners process your data on the basis of legitimate interest, which you have the right to object to.',
+          'tcf.liLinkText': 'Manage legitimate interests',
+          'tcf.purposeNames': 'Purposes: {names}.'
+        },
+        hi: {
+          'banner.title': 'हम आपकी गोपनीयता का सम्मान करते हैं',
+          'banner.text': 'हम अपनी वेबसाइट पर कुकीज़ और समान तकनीकों का उपयोग करते हैं. साइट के संचालन के लिए कुछ तकनीकी रूप से आवश्यक हैं. आपकी सहमति से, हम अपनी वेबसाइट के उपयोग का सांख्यिकीय विश्लेषण करने और सामग्री और विज्ञापन को निजीकृत करने के लिए कुकीज़ का भी उपयोग करते हैं.',
+          'banner.accept': 'सभी स्वीकार करें',
+          'banner.reject': 'सभी अस्वीकार करें',
+          'banner.withdrawAll': 'सभी वापस लें',
+          'banner.settings': 'सेटिंग्स',
+          'banner.ok': 'ठीक है',
+          'banner.close': 'बंद करें',
+          'banner.doNotSell': 'मेरी व्यक्तिगत जानकारी न बेचें या साझा न करें',
+          'banner.managePrivacy': 'गोपनीयता विकल्प प्रबंधित करें',
+          'banner.save': 'वरीयताएँ सहेजें',
+          'categories.essential': 'आवश्यक',
+          'categories.essentialDesc': 'बुनियादी वेबसाइट कार्यक्षमता के लिए आवश्यक.',
+          'categories.functional': 'कार्यात्मक',
+          'categories.functionalDesc': 'उन्नत कार्यक्षमता और निजीकरण को सक्षम करें.',
+          'categories.analytics': 'विश्लेषण',
+          'categories.analyticsDesc': 'यह समझने में हमारी सहायता करें कि हमारी वेबसाइट का उपयोग कैसे किया जाता है.',
+          'categories.marketing': 'विपणन',
+          'categories.marketingDesc': 'विज्ञापन और क्रॉस-साइट ट्रैकिंग के लिए उपयोग किया जाता है.',
+          'categories.ai': 'एआई सेवाएँ',
+          'categories.aiDesc': 'चैटबॉट, अनुशंसा प्रणाली, और एआई-जनित सामग्री. EU AI Act के अनुरूप.',
+          'categories.aiNotice': '🤖 यह सुविधा एआई द्वारा संचालित है.',
+          'categories.alwaysActive': 'हमेशा सक्रिय',
+          'details.provider': 'प्रदाता:',
+          'details.location': 'स्थान:',
+          'details.duration': 'भंडारण अवधि:',
+          'details.purpose': 'उद्देश्य:',
+          'details.legalBasis': 'कानूनी आधार:',
+          'details.privacy': 'गोपनीयता:',
+          'details.privacyLink': 'गोपनीयता नीति',
+          'details.transfer': 'डेटा ट्रांसफर:',
+          'details.notSpecified': 'निर्दिष्ट नहीं है',
+          'details.consentId': 'Consent ID:',
+          'details.lookupTitle': 'सहमति खोज',
+          'details.details': 'विवरण',
+          'services.biscottiDesc': 'आपकी कुकी सहमति वरीयताओं को संग्रहीत करता है',
+          'services.biscottiPurpose': 'GDPR Art. 7 द्वारा आवश्यक सहमति निर्णय का भंडारण',
+          'services.wordpressDesc': 'वेबसाइट कार्यक्षमता के लिए तकनीकी रूप से आवश्यक',
+          'services.wordpressPurpose': 'सत्र प्रबंधन, लॉगिन स्थिति, उपयोगकर्ता सेटिंग्स',
+          'tcf.storageDisclosure': 'हम और हमारे साझेदार आपके डिवाइस पर जानकारी संग्रहीत और/या एक्सेस करते हैं (जैसे कुकीज़) और व्यक्तिगत डेटा संसाधित करते हैं।',
+          'tcf.dataExamples': 'इसमें IP पते, उपयोग पहचानकर्ता, ब्राउज़िंग व्यवहार और डिवाइस पहचानकर्ता शामिल हो सकते हैं।',
+          'tcf.purposeSummary': 'डेटा प्रसंस्करण विज्ञापन वैयक्तिकरण, सामग्री माप और दर्शक विश्लेषण जैसे उद्देश्यों की सेवा करता है।',
+          'tcf.vendorCount': 'हम और {count} साझेदार आपके डेटा को संसाधित कर सकते हैं — सूची देखें',
+
+          'tcf.vendorCountSingular': 'हम और 1 साझेदार आपके डेटा को संसाधित कर सकते हैं — सूची देखें',
+          'tcf.consentScope': 'आपकी सहमति केवल इस वेबसाइट पर लागू होती है।',
+          'tcf.withdrawInfo': 'आप सेटिंग्स के माध्यम से किसी भी समय अपनी सहमति बदल या वापस ले सकते हैं।',
+          'tcf.vendorsPerPurpose': '{count} साझेदार',
+          'tcf.iabPartnerSingular': '1 IAB-प्रमाणित साझेदार',
+          'tcf.iabPartnerPlural': '{count} IAB-प्रमाणित साझेदार',
+          'tcf.nonIabPartnerSingular': '1 अतिरिक्त प्रदाता',
+          'tcf.nonIabPartnerPlural': '{count} अतिरिक्त प्रदाता',
+          'tcf.partnerCountPrefix': 'हम और',
+          'tcf.partnerCountConjunction': 'साथ ही',
+          'tcf.partnerCountSuffix': 'इन डेटा को संसाधित कर सकते हैं।',
+          'tcf.cmpStorage': 'Biscotti CMP आपकी सहमति पसंद को आपके ब्राउज़र के स्थानीय संग्रहण में संग्रहीत करता है (180 दिनों तक)।',
+          'tcf.maxStorage': 'अधिकतम संग्रहण अवधि:',
+          'tcf.days': 'दिन',
+          'tcf.usesNonCookieAccess': 'गैर-कुकी संग्रहण का भी उपयोग करता है',
+          'tcf.storageInfo': 'संग्रहण जानकारी',
+          'tcf.specialFeaturesDisclosure': 'Some partners use special features such as precise geolocation data or active scanning of device characteristics for identification.',
+          'tcf.liDisclosure': 'Some partners process your data on the basis of legitimate interest, which you have the right to object to.',
+          'tcf.liLinkText': 'Manage legitimate interests',
+          'tcf.purposeNames': 'Purposes: {names}.'
+        },
+        hr: {
+          'banner.title': 'Poštujemo vašu privatnost',
+          'banner.text': 'Na našoj web stranici koristimo kolačiće i slične tehnologije. Neki su tehnički nužni za rad stranice. Uz vaš pristanak, koristimo i kolačiće za statističku analizu korištenja naše web stranice te za personalizaciju sadržaja i oglašavanja.',
+          'banner.accept': 'Prihvati sve',
+          'banner.reject': 'Samo nužni',
+          'banner.withdrawAll': 'Povuci sve',
+          'banner.settings': 'Postavke',
+          'banner.ok': 'OK',
+          'banner.doNotSell': 'Ne prodajite niti ne dijelite moje osobne podatke',
+          'banner.managePrivacy': 'Upravljanje postavkama privatnosti',
+          'banner.save': 'Spremi postavke',
+          'categories.essential': 'Nužni',
+          'categories.essentialDesc': 'Potrebni za osnovnu funkcionalnost web stranice.',
+          'categories.functional': 'Funkcionalni',
+          'categories.functionalDesc': 'Omogućuju poboljšanu funkcionalnost i personalizaciju.',
+          'categories.analytics': 'Analitika',
+          'categories.analyticsDesc': 'Pomažu nam razumjeti kako se koristi naša web stranica.',
+          'categories.marketing': 'Marketing',
+          'categories.marketingDesc': 'Koriste se za oglašavanje i praćenje na različitim web stranicama.',
+          'categories.ai': 'AI Usluge',
+          'categories.aiDesc': 'Chatbotovi, sustavi preporuka i AI-generirani sadržaj. U skladu s EU AI Act.',
+          'categories.aiNotice': '🤖 Ovu značajku pokreće AI.',
+          'categories.alwaysActive': 'Uvijek aktivno',
+          'details.provider': 'Pružatelj:',
+          'details.location': 'Lokacija:',
+          'details.duration': 'Trajanje pohrane:',
+          'details.purpose': 'Svrha:',
+          'details.legalBasis': 'Pravna osnova:',
+          'details.privacy': 'Privatnost:',
+          'details.privacyLink': 'Politika privatnosti',
+          'details.transfer': 'Prijenos podataka:',
+          'details.notSpecified': 'Nije specificirano',
+          'details.consentId': 'ID: Suglasnosti:',
+          'details.lookupTitle': 'Pretraživanje pristanka',
+          'details.details': 'Detalji',
+          'services.biscottiDesc': 'Pohranjuje vaše postavke pristanka za kolačiće',
+          'services.biscottiPurpose': 'Pohrana odluke o pristanku kako zahtijeva GDPR čl. 7',
+          'services.wordpressDesc': 'Tehnički nužno za funkcionalnost web stranice',
+          'services.wordpressPurpose': 'Upravljanje sesijama, status prijave, korisničke postavke',
+          'tcf.storageDisclosure': 'Mi i naši partneri pohranjujemo i/ili pristupamo informacijama na vašem uređaju (npr. kolačiće) i obrađujemo osobne podatke.',
+          'tcf.dataExamples': 'To može uključivati IP adrese, identifikatore korištenja, ponašanje pri pregledavanju i identifikatore uređaja.',
+          'tcf.purposeSummary': 'Obrada podataka služi u svrhe poput personalizacije oglasa, mjerenja sadržaja i analize publike.',
+          'tcf.vendorCount': 'Mi i {count} partnera možemo obrađivati vaše podatke — Prikaži popis',
+
+          'tcf.vendorCountSingular': 'Mi i 1 partner možemo obrađivati vaše podatke — Prikaži popis',
+          'tcf.consentScope': 'Vaša privola odnosi se samo na ovu web stranicu.',
+          'tcf.withdrawInfo': 'Možete promijeniti ili povući svoju privolu u bilo kojem trenutku putem Postavki.',
+          'tcf.vendorsPerPurpose': '{count} partnera',
+          'tcf.iabPartnerSingular': '1 IAB-certificirani partner',
+          'tcf.iabPartnerPlural': '{count} IAB-certificiranih partnera',
+          'tcf.nonIabPartnerSingular': '1 dodatni pružatelj',
+          'tcf.nonIabPartnerPlural': '{count} dodatnih pružatelja',
+          'tcf.partnerCountPrefix': 'Mi i',
+          'tcf.partnerCountConjunction': 'kao i',
+          'tcf.partnerCountSuffix': 'možemo obrađivati ove podatke.',
+          'tcf.cmpStorage': 'Biscotti CMP pohranjuje vaš izbor privole u lokalnu pohranu vašeg preglednika (do 180 dana).',
+          'tcf.maxStorage': 'Maks. trajanje pohrane:',
+          'tcf.days': 'dana',
+          'tcf.usesNonCookieAccess': 'Također koristi pohranu bez kolačića',
+          'tcf.storageInfo': 'Informacije o pohrani',
+          'tcf.specialFeaturesDisclosure': 'Neki partneri koriste posebne značajke poput preciznih geolokacijskih podataka ili aktivnog skeniranja karakteristika uređaja za identifikaciju.',
+          'tcf.liDisclosure': 'Neki partneri obrađuju vaše podatke na temelju legitimnog interesa, na što imate pravo uložiti prigovor.',
+          'tcf.liLinkText': 'Upravljanje legitimnim interesima',
+          'tcf.purposeNames': 'Svrhe: {names}.'
+        },
+        hu: {
+          'banner.title': 'Tiszteletben tartjuk a magánéletét',
+          'banner.text': 'Weboldalunkon cookie-kat és hasonló technológiákat használunk. Néhányuk technikailag szükséges az oldal működéséhez. Az Ön hozzájárulásával cookie-kat is használunk weboldalunk használatának statisztikai elemzésére, valamint a tartalom és a hirdetések személyre szabására.',
+          'banner.accept': 'Összes elfogadása',
+          'banner.reject': 'Csak a lényegesek',
+          'banner.withdrawAll': 'Összes visszavonása',
+          'banner.settings': 'Beállítások',
+          'banner.ok': 'OK',
+          'banner.close': 'Bezárás',
+          'banner.doNotSell': 'Ne adja el és ne ossza meg személyes adataimat',
+          'banner.managePrivacy': 'Adatvédelmi beállítások kezelése',
+          'banner.save': 'Beállítások mentése',
+          'categories.essential': 'Lényeges',
+          'categories.essentialDesc': 'Szükséges a weboldal alapvető működéséhez.',
+          'categories.functional': 'Funkcionális',
+          'categories.functionalDesc': 'Továbbfejlesztett funkcionalitást és személyre szabást tesz lehetővé.',
+          'categories.analytics': 'Analitika',
+          'categories.analyticsDesc': 'Segít megérteni, hogyan használják weboldalunkat.',
+          'categories.marketing': 'Marketing',
+          'categories.marketingDesc': 'Hirdetésre és oldalak közötti nyomon követésre használatos.',
+          'categories.ai': 'AI Szolgáltatások',
+          'categories.aiDesc': 'Chatbotok, ajánlórendszerek és AI által generált tartalom. EU AI Act kompatibilis.',
+          'categories.aiNotice': '🤖 Ezt a funkciót az AI működteti.',
+          'categories.alwaysActive': 'Mindig aktív',
+          'details.provider': 'Szolgáltató:',
+          'details.location': 'Helyszín:',
+          'details.duration': 'Tárolási időtartam:',
+          'details.purpose': 'Cél:',
+          'details.legalBasis': 'Jogalap:',
+          'details.privacy': 'Adatvédelem:',
+          'details.privacyLink': 'Adatvédelmi irányelvek',
+          'details.transfer': 'Adatátvitel:',
+          'details.notSpecified': 'Nincs megadva',
+          'details.consentId': 'Hozzájárulás ID:',
+          'details.lookupTitle': 'Hozzájárulás keresése',
+          'details.details': 'Részletek',
+          'services.biscottiDesc': 'Tárolja a cookie-hozzájárulási beállításait',
+          'services.biscottiPurpose': 'A hozzájárulási döntés tárolása a GDPR 7. cikke szerint',
+          'services.wordpressDesc': 'Technikailag szükséges a weboldal működéséhez',
+          'services.wordpressPurpose': 'Munkamenet-kezelés, bejelentkezési állapot, felhasználói beállítások',
+          'tcf.storageDisclosure': 'Mi és partnereink információkat tárolunk és/vagy érünk el az Ön eszközén (pl. sütik), és személyes adatokat dolgozunk fel.',
+          'tcf.dataExamples': 'Ez magában foglalhat IP-címeket, használati azonosítókat, böngészési viselkedést és eszközazonosítókat.',
+          'tcf.purposeSummary': 'Az adatfeldolgozás olyan célokat szolgál, mint a hirdetések személyre szabása, a tartalom mérése és a közönségelemzés.',
+          'tcf.vendorCount': 'Mi és {count} partner dolgozhatjuk fel az Ön adatait — Lista megtekintése',
+
+          'tcf.vendorCountSingular': 'Mi és 1 partner dolgozhatjuk fel az Ön adatait — Lista megtekintése',
+          'tcf.consentScope': 'Az Ön hozzájárulása csak erre a weboldalra vonatkozik.',
+          'tcf.withdrawInfo': 'Hozzájárulását bármikor módosíthatja vagy visszavonhatja a Beállításokon keresztül.',
+          'tcf.vendorsPerPurpose': '{count} partner',
+          'tcf.iabPartnerSingular': '1 IAB-tanúsított partner',
+          'tcf.iabPartnerPlural': '{count} IAB-tanúsított partner',
+          'tcf.nonIabPartnerSingular': '1 további szolgáltató',
+          'tcf.nonIabPartnerPlural': '{count} további szolgáltató',
+          'tcf.partnerCountPrefix': 'Mi és',
+          'tcf.partnerCountConjunction': 'valamint',
+          'tcf.partnerCountSuffix': 'feldolgozhatjuk ezeket az adatokat.',
+          'tcf.cmpStorage': 'A Biscotti CMP az Ön hozzájárulási választását a böngészője helyi tárhelyén tárolja (legfeljebb 180 napig).',
+          'tcf.maxStorage': 'Max. tárolási időtartam:',
+          'tcf.days': 'nap',
+          'tcf.usesNonCookieAccess': 'Süti nélküli tárolást is használ',
+          'tcf.storageInfo': 'Tárolási információ',
+          'tcf.specialFeaturesDisclosure': 'Egyes partnerek az azonosításhoz olyan speciális funkciókat használnak, mint a pontos helymeghatározási adatok vagy az eszköz jellemzőinek aktív lekérdezése.',
+          'tcf.liDisclosure': 'Egyes partnereink az Ön adatait jogos érdek alapján kezelik, amely ellen Önnek jogában áll tiltakozni.',
+          'tcf.liLinkText': 'Jogszerű érdekek kezelése',
+          'tcf.purposeNames': 'Célok: {names}.'
+        },
+        id: {
+          'banner.title': 'Kami menghargai privasi Anda',
+          'banner.text': 'Kami menggunakan cookie dan teknologi serupa di situs web kami. Beberapa di antaranya secara teknis diperlukan untuk pengoperasian situs. Dengan persetujuan Anda, kami juga menggunakan cookie untuk menganalisis secara statistik penggunaan situs web kami dan untuk mempersonalisasi konten dan iklan.',
+          'banner.accept': 'Terima semua',
+          'banner.reject': 'Hanya yang penting',
+          'banner.withdrawAll': 'Tarik semua',
+          'banner.settings': 'Pengaturan',
+          'banner.ok': 'OK',
+          'banner.doNotSell': 'Jangan jual atau bagikan informasi pribadi saya',
+          'banner.managePrivacy': 'Kelola pilihan privasi',
+          'banner.save': 'Simpan preferensi',
+          'categories.essential': 'Esensial',
+          'categories.essentialDesc': 'Diperlukan untuk fungsionalitas dasar situs web.',
+          'categories.functional': 'Fungsional',
+          'categories.functionalDesc': 'Aktifkan fungsionalitas dan personalisasi yang ditingkatkan.',
+          'categories.analytics': 'Analitik',
+          'categories.analyticsDesc': 'Membantu kami memahami bagaimana situs web kami digunakan.',
+          'categories.marketing': 'Pemasaran',
+          'categories.marketingDesc': 'Digunakan untuk periklanan dan pelacakan lintas situs.',
+          'categories.ai': 'Layanan AI',
+          'categories.aiDesc': 'Chatbot, sistem rekomendasi, dan konten yang dihasilkan AI. Sesuai dengan EU AI Act.',
+          'categories.aiNotice': '🤖 Fitur ini didukung oleh AI.',
+          'categories.alwaysActive': 'Selalu aktif',
+          'details.provider': 'Penyedia:',
+          'details.location': 'Lokasi:',
+          'details.duration': 'Durasi penyimpanan:',
+          'details.purpose': 'Tujuan:',
+          'details.legalBasis': 'Dasar hukum:',
+          'details.privacy': 'Privasi:',
+          'details.privacyLink': 'Kebijakan Privasi',
+          'details.transfer': 'Transfer data:',
+          'details.notSpecified': 'Tidak ditentukan',
+          'details.consentId': 'ID Persetujuan:',
+          'details.details': 'Detail',
+          'services.biscottiDesc': 'Menyimpan preferensi persetujuan cookie Anda',
+          'services.biscottiPurpose': 'Penyimpanan keputusan persetujuan sebagaimana disyaratkan oleh GDPR Pasal 7',
+          'services.wordpressDesc': 'Secara teknis diperlukan untuk fungsionalitas situs web',
+          'services.wordpressPurpose': 'Manajemen sesi, status login, pengaturan pengguna',
+          'tcf.storageDisclosure': 'Kami dan mitra kami menyimpan dan/atau mengakses informasi di perangkat Anda (misalnya cookie) dan memproses data pribadi.',
+          'tcf.dataExamples': 'Ini dapat mencakup alamat IP, pengidentifikasi penggunaan, perilaku penjelajahan, dan pengidentifikasi perangkat.',
+          'tcf.purposeSummary': 'Pemrosesan data melayani tujuan seperti personalisasi iklan, pengukuran konten, dan wawasan audiens.',
+          'tcf.vendorCount': 'Kami dan {count} mitra dapat memproses data Anda — Lihat daftar',
+
+          'tcf.vendorCountSingular': 'Kami dan 1 mitra dapat memproses data Anda — Lihat daftar',
+          'tcf.consentScope': 'Persetujuan Anda hanya berlaku untuk situs web ini.',
+          'tcf.withdrawInfo': 'Anda dapat mengubah atau menarik persetujuan kapan saja melalui Pengaturan.',
+          'tcf.vendorsPerPurpose': '{count} mitra',
+          'tcf.iabPartnerSingular': '1 mitra bersertifikat IAB',
+          'tcf.iabPartnerPlural': '{count} mitra bersertifikat IAB',
+          'tcf.nonIabPartnerSingular': '1 penyedia tambahan',
+          'tcf.nonIabPartnerPlural': '{count} penyedia tambahan',
+          'tcf.partnerCountPrefix': 'Kami dan',
+          'tcf.partnerCountConjunction': 'serta',
+          'tcf.partnerCountSuffix': 'dapat memproses data ini.',
+          'tcf.cmpStorage': 'Biscotti CMP menyimpan pilihan persetujuan Anda di penyimpanan lokal browser Anda (hingga 180 hari).',
+          'tcf.maxStorage': 'Durasi penyimpanan maks.:',
+          'tcf.days': 'hari',
+          'tcf.usesNonCookieAccess': 'Juga menggunakan penyimpanan non-cookie',
+          'tcf.storageInfo': 'Info penyimpanan',
+          'tcf.specialFeaturesDisclosure': 'Beberapa mitra menggunakan fitur khusus seperti data geolokasi yang akurat atau pemindaian aktif terhadap karakteristik perangkat untuk tujuan identifikasi.',
+          'tcf.liDisclosure': 'Beberapa mitra memproses data Anda berdasarkan kepentingan sah, dan Anda berhak untuk mengajukan keberatan terhadap hal tersebut.',
+          'tcf.liLinkText': 'Mengelola kepentingan yang sah',
+          'tcf.purposeNames': 'Tujuan: {names}.'
+        },
+        ja: {
+          'banner.title': 'お客様のプライバシーを尊重します',
+          'banner.text': '当社のウェブサイトでは、クッキーおよび類似の技術を使用しています。一部はサイトの運営に技術的に必要なものです。お客様の同意を得て、当社はウェブサイトの利用状況を統計的に分析し、コンテンツや広告をパーソナライズするためにクッキーを使用します。',
+          'banner.accept': 'すべて同意する',
+          'banner.reject': '必須項目のみ',
+          'banner.withdrawAll': 'すべて撤回',
+          'banner.settings': '設定',
+          'banner.ok': 'OK',
+          'banner.close': '閉じる',
+          'banner.doNotSell': '個人情報を販売・共有しないでください',
+          'banner.managePrivacy': 'プライバシー設定を管理',
+          'banner.save': '設定を保存',
+          'categories.essential': '必須',
+          'categories.essentialDesc': 'ウェブサイトの基本的な機能に必要な項目です。',
+          'categories.functional': '機能',
+          'categories.functionalDesc': '機能拡張とパーソナライズを有効にします。',
+          'categories.analytics': '分析',
+          'categories.analyticsDesc': 'ウェブサイトの利用状況を把握するために役立ちます。',
+          'categories.marketing': 'マーケティング',
+          'categories.marketingDesc': '広告およびサイトを横断したトラッキングに使用されます。',
+          'categories.ai': 'AIサービス',
+          'categories.aiDesc': 'チャットボット、レコメンデーションシステム、AI生成コンテンツ。EU AI Actに準拠。',
+          'categories.aiNotice': '🤖 この機能はAIによって提供されています。',
+          'categories.alwaysActive': '常にアクティブ',
+          'details.provider': 'プロバイダー:',
+          'details.location': '所在地:',
+          'details.duration': '保存期間:',
+          'details.purpose': '目的:',
+          'details.legalBasis': '法的根拠:',
+          'details.privacy': 'プライバシー:',
+          'details.privacyLink': 'プライバシーポリシー',
+          'details.transfer': 'データ転送:',
+          'details.notSpecified': '指定なし',
+          'details.consentId': 'Consent ID:',
+          'details.lookupTitle': '同意データの検索',
+          'details.details': '詳細',
+          'services.biscottiDesc': 'クッキーの同意設定を保存します',
+          'services.biscottiPurpose': 'GDPR第7条で義務付けられている同意決定の保存',
+          'services.wordpressDesc': 'ウェブサイトの機能に技術的に必要な項目です',
+          'services.wordpressPurpose': 'セッション管理、ログイン状態、ユーザー設定',
+          'tcf.storageDisclosure': '当社およびパートナーは、お客様のデバイスに情報を保存および/またはアクセスし（例：Cookie）、個人データを処理します。',
+          'tcf.dataExamples': 'これには、IPアドレス、使用識別子、閲覧行動、デバイス識別子が含まれる場合があります。',
+          'tcf.purposeSummary': 'データ処理は、広告のパーソナライゼーション、コンテンツの測定、オーディエンスの分析などの目的に役立ちます。',
+          'tcf.vendorCount': '当社と{count}のパートナーがお客様のデータを処理する場合があります — リストを表示',
+
+          'tcf.vendorCountSingular': '当社と1つのパートナーがお客様のデータを処理する場合があります — リストを表示',
+          'tcf.consentScope': 'お客様の同意は、このウェブサイトにのみ適用されます。',
+          'tcf.withdrawInfo': '設定からいつでも同意を変更または撤回できます。',
+          'tcf.vendorsPerPurpose': '{count}パートナー',
+          'tcf.iabPartnerSingular': '1 IAB認定パートナー',
+          'tcf.iabPartnerPlural': '{count} IAB認定パートナー',
+          'tcf.nonIabPartnerSingular': '1 追加プロバイダー',
+          'tcf.nonIabPartnerPlural': '{count} 追加プロバイダー',
+          'tcf.partnerCountPrefix': '当社および',
+          'tcf.partnerCountConjunction': 'ならびに',
+          'tcf.partnerCountSuffix': 'がこのデータを処理する場合があります。',
+          'tcf.cmpStorage': 'Biscotti CMPは、お客様の同意選択をブラウザのローカルストレージに保存します（最大180日間）。',
+          'tcf.maxStorage': '最大保存期間：',
+          'tcf.days': '日',
+          'tcf.usesNonCookieAccess': 'Cookie以外のストレージも使用します',
+          'tcf.storageInfo': 'ストレージ情報',
+          'tcf.specialFeaturesDisclosure': '一部のパートナー企業は、正確な位置情報データや、端末の特性を能動的にスキャンする機能など、特別な機能を利用して端末を識別しています。',
+          'tcf.liDisclosure': '一部のパートナーは、正当な利益に基づきお客様のデータを処理していますが、お客様にはこれに異議を申し立てる権利があります。',
+          'tcf.liLinkText': '正当な利益の管理',
+          'tcf.purposeNames': '目的: {names}.'
+        },
+        lt: {
+          'banner.title': 'Mes gerbiame jūsų privatumą',
+          'banner.text': 'Mūsų svetainėje naudojami slapukai ir panašios technologijos. Kai kurie iš jų yra techniškai būtini svetainės veikimui. Jums sutikus, mes taip pat naudojame slapukus, kad statistiškai analizuotume mūsų svetainės naudojimą ir personalizuotume turinį bei reklamą.',
+          'banner.accept': 'Sutikti su visais',
+          'banner.reject': 'Tik būtini',
+          'banner.withdrawAll': 'Atšaukti viską',
+          'banner.settings': 'Nustatymai',
+          'banner.ok': 'Gerai',
+          'banner.close': 'Uždaryti',
+          'banner.doNotSell': 'Neparduokite ir nedalinkite mano asmeninės informacijos',
+          'banner.managePrivacy': 'Tvarkyti privatumo pasirinkimus',
+          'banner.save': 'Išsaugoti nustatymus',
+          'categories.essential': 'Būtini',
+          'categories.essentialDesc': 'Būtini pagrindinėms svetainės funkcijoms.',
+          'categories.functional': 'Funkciniai',
+          'categories.functionalDesc': 'Įgalinti patobulintas funkcijas ir personalizavimą.',
+          'categories.analytics': 'Analitiniai',
+          'categories.analyticsDesc': 'Padeda mums suprasti, kaip naudojama mūsų svetainė.',
+          'categories.marketing': 'Rinkodaros',
+          'categories.marketingDesc': 'Naudojami reklamai ir stebėjimui įvairiose svetainėse.',
+          'categories.ai': 'AI Paslaugos',
+          'categories.aiDesc': 'Pokalbių robotai, rekomendacijų sistemos ir AI sukurtas turinys. Atitinka EU AI Act.',
+          'categories.aiNotice': '🤖 Šią funkciją palaiko AI.',
+          'categories.alwaysActive': 'Visada aktyvus',
+          'details.provider': 'Teikėjas:',
+          'details.location': 'Vieta:',
+          'details.duration': 'Saugojimo trukmė:',
+          'details.purpose': 'Tikslas:',
+          'details.legalBasis': 'Teisinis pagrindas:',
+          'details.privacy': 'Privatumas:',
+          'details.privacyLink': 'Privatumo politika',
+          'details.transfer': 'Duomenų perdavimas:',
+          'details.notSpecified': 'Nenurodyta',
+          'details.consentId': 'Sutikimo ID:',
+          'details.lookupTitle': 'Sutikimo paieška',
+          'details.details': 'Išsami informacija',
+          'services.biscottiDesc': 'Saugo jūsų slapukų sutikimo nustatymus',
+          'services.biscottiPurpose': 'Sutikimo sprendimo saugojimas, kaip reikalaujama pagal GDPR 7 str.',
+          'services.wordpressDesc': 'Techniškai būtinas svetainės funkcionalumui',
+          'services.wordpressPurpose': 'Sesijos valdymas, prisijungimo būsena, vartotojo nustatymai',
+          'tcf.storageDisclosure': 'Mes ir mūsų partneriai saugome ir/arba pasiekiame informaciją jūsų įrenginyje (pvz., slapukus) ir tvarkome asmens duomenis.',
+          'tcf.dataExamples': 'Tai gali apimti IP adresus, naudojimo identifikatorius, naršymo elgseną ir įrenginių identifikatorius.',
+          'tcf.purposeSummary': 'Duomenų tvarkymas tarnauja tikslams, tokiems kaip reklamos personalizavimas, turinio matavimas ir auditorijos analizė.',
+          'tcf.vendorCount': 'Mes ir {count} partnerių gali tvarkyti jūsų duomenis — Peržiūrėti sąrašą',
+
+          'tcf.vendorCountSingular': 'Mes ir 1 partneris gali tvarkyti jūsų duomenis — Peržiūrėti sąrašą',
+          'tcf.consentScope': 'Jūsų sutikimas galioja tik šiai svetainei.',
+          'tcf.withdrawInfo': 'Galite bet kada pakeisti ar atšaukti savo sutikimą per Nustatymus.',
+          'tcf.vendorsPerPurpose': '{count} partnerių',
+          'tcf.iabPartnerSingular': '1 IAB sertifikuotas partneris',
+          'tcf.iabPartnerPlural': '{count} IAB sertifikuotų partnerių',
+          'tcf.nonIabPartnerSingular': '1 papildomas teikėjas',
+          'tcf.nonIabPartnerPlural': '{count} papildomų teikėjų',
+          'tcf.partnerCountPrefix': 'Mes ir',
+          'tcf.partnerCountConjunction': 'taip pat',
+          'tcf.partnerCountSuffix': 'galime tvarkyti šiuos duomenis.',
+          'tcf.cmpStorage': 'Biscotti CMP saugo jūsų sutikimo pasirinkimą naršyklės vietinėje saugykloje (iki 180 dienų).',
+          'tcf.maxStorage': 'Maks. saugojimo trukmė:',
+          'tcf.days': 'dienų',
+          'tcf.usesNonCookieAccess': 'Taip pat naudoja ne slapukų saugyklą',
+          'tcf.storageInfo': 'Saugyklos informacija',
+          'tcf.specialFeaturesDisclosure': 'Kai kurie partneriai identifikavimo tikslais naudoja specialias funkcijas, pavyzdžiui, tikslius geografinės vietos nustatymo duomenis arba aktyvų įrenginio charakteristikų nuskaitymą.',
+          'tcf.liDisclosure': 'Kai kurie partneriai tvarko jūsų duomenis remdamiesi teisėtu interesu, kuriam jūs turite teisę pareikšti prieštaravimą.',
+          'tcf.liLinkText': 'Teisėtų interesų tvarkymas',
+          'tcf.purposeNames': 'Tikslai: {names}.'
+        },
+        mr: {
+          'banner.title': 'आम्ही तुमच्या गोपनीयतेचा आदर करतो',
+          'banner.text': 'आम्ही आमच्या वेबसाइटवर कुकीज आणि तत्सम तंत्रज्ञान वापरतो. साइटच्या कार्यासाठी काही तांत्रिकदृष्ट्या आवश्यक आहेत. तुमच्या संमतीने, आम्ही आमच्या वेबसाइटच्या वापराचे सांख्यिकीय विश्लेषण करण्यासाठी आणि सामग्री आणि जाहिरात वैयक्तिकृत करण्यासाठी कुकीज वापरतो.',
+          'banner.accept': 'सर्व स्वीकारा',
+          'banner.reject': 'केवळ आवश्यक',
+          'banner.withdrawAll': 'सर्व मागे घ्या',
+          'banner.settings': 'सेटिंग्ज',
+          'banner.ok': 'ठीक आहे',
+          'banner.close': 'बंद करा',
+          'banner.doNotSell': 'माझी वैयक्तिक माहिती विकू किंवा शेअर करू नका',
+          'banner.managePrivacy': 'गोपनीयता पर्याय व्यवस्थापित करा',
+          'banner.save': 'प्राधान्ये जतन करा',
+          'categories.essential': 'आवश्यक',
+          'categories.essentialDesc': 'वेबसाइटच्या मूलभूत कार्यासाठी आवश्यक.',
+          'categories.functional': 'कार्यात्मक',
+          'categories.functionalDesc': 'वर्धित कार्यक्षमता आणि वैयक्तिकरण सक्षम करा.',
+          'categories.analytics': 'विश्लेषण',
+          'categories.analyticsDesc': 'आमची वेबसाइट कशी वापरली जाते हे समजून घेण्यासाठी आम्हाला मदत करा.',
+          'categories.marketing': 'विपणन',
+          'categories.marketingDesc': 'जाहिरात आणि क्रॉस-साइट ट्रॅकिंगसाठी वापरले जाते.',
+          'categories.ai': 'AI सेवा',
+          'categories.aiDesc': 'चॅटबॉट्स, शिफारस प्रणाली आणि AI- व्युत्पन्न सामग्री. EU AI Act अनुरूप.',
+          'categories.aiNotice': '🤖 हे वैशिष्ट्य AI द्वारे समर्थित आहे.',
+          'categories.alwaysActive': 'नेहमी सक्रिय',
+          'details.provider': 'प्रदाता:',
+          'details.location': 'स्थान:',
+          'details.duration': 'संग्रहण कालावधी:',
+          'details.purpose': 'हेतू:',
+          'details.legalBasis': 'कायदेशीर आधार:',
+          'details.privacy': 'गोपनीयता:',
+          'details.privacyLink': 'गोपनीयता धोरण',
+          'details.transfer': 'डेटा हस्तांतरण:',
+          'details.notSpecified': 'अस्पष्ट',
+          'details.consentId': 'संमती ID:',
+          'details.lookupTitle': 'संमती शोध',
+          'details.details': 'तपशील',
+          'services.biscottiDesc': 'तुमच्या कुकी संमती प्राधान्ये संग्रहित करते',
+          'services.biscottiPurpose': 'GDPR आर्ट. 7 नुसार आवश्यक संमती निर्णयाचे स्टोरेज',
+          'services.wordpressDesc': 'वेबसाइट कार्यक्षमतेसाठी तांत्रिकदृष्ट्या आवश्यक',
+          'services.wordpressPurpose': 'सत्र व्यवस्थापन, लॉगिन स्थिती, वापरकर्ता सेटिंग्ज',
+          'tcf.storageDisclosure': 'आम्ही आणि आमचे भागीदार तुमच्या डिव्हाइसवर माहिती संग्रहित आणि/किंवा ऍक्सेस करतो (उदा. कुकीज) आणि वैयक्तिक डेटावर प्रक्रिया करतो.',
+          'tcf.dataExamples': 'यात IP पत्ते, वापर ओळखकर्ते, ब्राउझिंग वर्तन आणि डिव्हाइस ओळखकर्ते समाविष्ट असू शकतात.',
+          'tcf.purposeSummary': 'डेटा प्रक्रिया जाहिरात वैयक्तिकरण, सामग्री मापन आणि प्रेक्षक विश्लेषण यांसारख्या उद्देशांसाठी कार्य करते.',
+          'tcf.vendorCount': 'आम्ही आणि {count} भागीदार तुमच्या डेटावर प्रक्रिया करू शकतो — यादी पहा',
+
+          'tcf.vendorCountSingular': 'आम्ही आणि 1 भागीदार तुमच्या डेटावर प्रक्रिया करू शकतो — यादी पहा',
+          'tcf.consentScope': 'तुमची संमती केवळ या वेबसाइटसाठी लागू आहे.',
+          'tcf.withdrawInfo': 'तुम्ही सेटिंग्जद्वारे कधीही तुमची संमती बदलू किंवा मागे घेऊ शकता.',
+          'tcf.vendorsPerPurpose': '{count} भागीदार',
+          'tcf.iabPartnerSingular': '1 IAB-प्रमाणित भागीदार',
+          'tcf.iabPartnerPlural': '{count} IAB-प्रमाणित भागीदार',
+          'tcf.nonIabPartnerSingular': '1 अतिरिक्त प्रदाता',
+          'tcf.nonIabPartnerPlural': '{count} अतिरिक्त प्रदाता',
+          'tcf.partnerCountPrefix': 'आम्ही आणि',
+          'tcf.partnerCountConjunction': 'तसेच',
+          'tcf.partnerCountSuffix': 'हे डेटा प्रक्रिया करू शकतो.',
+          'tcf.cmpStorage': 'Biscotti CMP तुमच्या ब्राउझरच्या स्थानिक संग्रहणात तुमची संमती निवड संग्रहित करतो (180 दिवसांपर्यंत).',
+          'tcf.maxStorage': 'कमाल संग्रहण कालावधी:',
+          'tcf.days': 'दिवस',
+          'tcf.usesNonCookieAccess': 'नॉन-कुकी संग्रहण देखील वापरते',
+          'tcf.storageInfo': 'संग्रहण माहिती',
+          'tcf.specialFeaturesDisclosure': 'Some partners use special features such as precise geolocation data or active scanning of device characteristics for identification.',
+          'tcf.liDisclosure': 'Some partners process your data on the basis of legitimate interest, which you have the right to object to.',
+          'tcf.liLinkText': 'Manage legitimate interests',
+          'tcf.purposeNames': 'Purposes: {names}.'
+        },
+        nb: {
+          'banner.title': 'Vi respekterer ditt personvern',
+          'banner.text': 'Vi bruker informasjonskapsler og lignende teknologier på vår nettside. Noen er teknisk nødvendige for driften av siden. Med ditt samtykke bruker vi også informasjonskapsler for å statistisk analysere bruken av vår nettside og for å tilpasse innhold og reklame.',
+          'banner.accept': 'Aksepter alle',
+          'banner.reject': 'Avvis alle',
+          'banner.withdrawAll': 'Trekk tilbake alle',
+          'banner.settings': 'Innstillinger',
+          'banner.ok': 'OK',
+          'banner.close': 'Lukk',
+          'banner.doNotSell': 'Ikke selg eller del mine personopplysninger',
+          'banner.managePrivacy': 'Administrer personvernvalg',
+          'banner.save': 'Lagre preferanser',
+          'categories.essential': 'Nødvendige',
+          'categories.essentialDesc': 'Påkrevd for grunnleggende funksjonalitet på nettstedet.',
+          'categories.functional': 'Funksjonelle',
+          'categories.functionalDesc': 'Aktiverer forbedret funksjonalitet og personalisering.',
+          'categories.analytics': 'Analyse',
+          'categories.analyticsDesc': 'Hjelp oss å forstå hvordan nettstedet vårt brukes.',
+          'categories.marketing': 'Markedsføring',
+          'categories.marketingDesc': 'Brukes til reklame og sporing på tvers av nettsteder.',
+          'categories.ai': 'AI-tjenester',
+          'categories.aiDesc': 'Chatbots, anbefalingssystemer og AI-generert innhold. EU AI Act-kompatibel.',
+          'categories.aiNotice': '🤖 Denne funksjonen drives av AI.',
+          'categories.alwaysActive': 'Alltid aktiv',
+          'details.provider': 'Leverandør:',
+          'details.location': 'Lokasjon:',
+          'details.duration': 'Lagringsvarighet:',
+          'details.purpose': 'Formål:',
+          'details.legalBasis': 'Juridisk grunnlag:',
+          'details.privacy': 'Personvern:',
+          'details.privacyLink': 'Personvernerklæring',
+          'details.transfer': 'Dataoverføring:',
+          'details.notSpecified': 'Ikke spesifisert',
+          'details.consentId': 'Samtykke-ID:',
+          'details.lookupTitle': 'Samtykke-oppslag',
+          'details.details': 'Detaljer',
+          'services.biscottiDesc': 'Lagrer dine preferanser for informasjonskapselsamtykke',
+          'services.biscottiPurpose': 'Lagring av samtykkebeslutning som kreves av GDPR Art. 7',
+          'services.wordpressDesc': 'Teknisk nødvendig for nettstedets funksjonalitet',
+          'services.wordpressPurpose': 'Sesjonsadministrasjon, påloggingsstatus, brukerinnstillinger',
+          'tcf.storageDisclosure': 'Vi og våre partnere lagrer og/eller får tilgang til informasjon på enheten din (f.eks. informasjonskapsler) og behandler personopplysninger.',
+          'tcf.dataExamples': 'Dette kan omfatte IP-adresser, bruksidentifikatorer, surfeatferd og enhetsidentifikatorer.',
+          'tcf.purposeSummary': 'Databehandlingen tjener formål som annonsepersonalisering, innholdsmåling og publikumsanalyse.',
+          'tcf.vendorCount': 'Vi og {count} partnere kan behandle dine data — Vis liste',
+
+          'tcf.vendorCountSingular': 'Vi og 1 partner kan behandle dine data — Vis liste',
+          'tcf.consentScope': 'Ditt samtykke gjelder kun for denne nettsiden.',
+          'tcf.withdrawInfo': 'Du kan endre eller trekke tilbake ditt samtykke når som helst via Innstillinger.',
+          'tcf.vendorsPerPurpose': '{count} partnere',
+          'tcf.iabPartnerSingular': '1 IAB-sertifisert partner',
+          'tcf.iabPartnerPlural': '{count} IAB-sertifiserte partnere',
+          'tcf.nonIabPartnerSingular': '1 ytterligere leverandør',
+          'tcf.nonIabPartnerPlural': '{count} ytterligere leverandører',
+          'tcf.partnerCountPrefix': 'Vi og',
+          'tcf.partnerCountConjunction': 'samt',
+          'tcf.partnerCountSuffix': 'kan behandle disse dataene.',
+          'tcf.cmpStorage': 'Biscotti CMP lagrer ditt samtykkevalg i nettleserens lokale lagring (opptil 180 dager).',
+          'tcf.maxStorage': 'Maks. lagringsvarighet:',
+          'tcf.days': 'dager',
+          'tcf.usesNonCookieAccess': 'Bruker også lagring uten informasjonskapsler',
+          'tcf.storageInfo': 'Lagringsinformasjon',
+          'tcf.specialFeaturesDisclosure': 'Noen partnere bruker spesielle funksjoner som nøyaktige posisjonsdata eller aktiv skanning av enhetsegenskaper for identifisering.',
+          'tcf.liDisclosure': 'Noen samarbeidspartnere behandler opplysningene dine på grunnlag av berettiget interesse, noe du har rett til å gjøre innsigelse mot.',
+          'tcf.liLinkText': 'Behandle berettigede interesser',
+          'tcf.purposeNames': 'Formål: {names}.'
+        },
+        ro: {
+          'banner.title': 'Respectăm confidențialitatea dumneavoastră',
+          'banner.text': 'Folosim cookie-uri și tehnologii similare pe site-ul nostru web. Unele sunt necesare din punct de vedere tehnic pentru funcționarea site-ului. Cu consimțământul dumneavoastră, folosim, de asemenea, cookie-uri pentru a analiza statistic utilizarea site-ului nostru web și pentru a personaliza conținutul și publicitatea.',
+          'banner.accept': 'Acceptă toate',
+          'banner.reject': 'Doar esențiale',
+          'banner.withdrawAll': 'Retrage tot',
+          'banner.settings': 'Setări',
+          'banner.ok': 'OK',
+          'banner.close': 'Închide',
+          'banner.doNotSell': 'Nu vindeți și nu partajați informațiile mele personale',
+          'banner.managePrivacy': 'Gestionați opțiunile de confidențialitate',
+          'banner.save': 'Salvează preferințele',
+          'categories.essential': 'Esențiale',
+          'categories.essentialDesc': 'Necesare pentru funcționalitatea de bază a site-ului web.',
+          'categories.functional': 'Funcționale',
+          'categories.functionalDesc': 'Activează funcționalități îmbunătățite și personalizare.',
+          'categories.analytics': 'Analitice',
+          'categories.analyticsDesc': 'Ne ajută să înțelegem cum este utilizat site-ul nostru web.',
+          'categories.marketing': 'Marketing',
+          'categories.marketingDesc': 'Folosite pentru publicitate și urmărire pe mai multe site-uri.',
+          'categories.ai': 'Servicii AI',
+          'categories.aiDesc': 'Chatboți, sisteme de recomandare și conținut generat de AI. Conform cu EU AI Act.',
+          'categories.aiNotice': '🤖 Această funcție este alimentată de AI.',
+          'categories.alwaysActive': 'Întotdeauna activ',
+          'details.provider': 'Furnizor:',
+          'details.location': 'Locație:',
+          'details.duration': 'Durata de stocare:',
+          'details.purpose': 'Scop:',
+          'details.legalBasis': 'Bază legală:',
+          'details.privacy': 'Confidențialitate:',
+          'details.privacyLink': 'Politica de confidențialitate',
+          'details.transfer': 'Transfer de date:',
+          'details.notSpecified': 'Nespecificat',
+          'details.consentId': 'ID: Consimțământ:',
+          'details.lookupTitle': 'Căutare consimțământ',
+          'details.details': 'Detalii',
+          'services.biscottiDesc': 'Stochează preferințele dumneavoastră privind consimțământul pentru cookie-uri',
+          'services.biscottiPurpose': 'Stocarea deciziei de consimțământ, conform cerințelor GDPR Art. 7',
+          'services.wordpressDesc': 'Necesare din punct de vedere tehnic pentru funcționalitatea site-ului web',
+          'services.wordpressPurpose': 'Gestionarea sesiunii, starea de conectare, setările utilizatorului',
+          'tcf.storageDisclosure': 'Noi și partenerii noștri stocăm și/sau accesăm informații pe dispozitivul dvs. (de ex. cookie-uri) și procesăm date personale.',
+          'tcf.dataExamples': 'Aceasta poate include adrese IP, identificatori de utilizare, comportament de navigare și identificatori de dispozitiv.',
+          'tcf.purposeSummary': 'Procesarea datelor servește scopuri precum personalizarea reclamelor, măsurarea conținutului și analiza audienței.',
+          'tcf.vendorCount': 'Noi și {count} parteneri putem procesa datele dvs. — Vizualizare listă',
+
+          'tcf.vendorCountSingular': 'Noi și 1 partener putem procesa datele dvs. — Vizualizare listă',
+          'tcf.consentScope': 'Consimțământul dvs. se aplică doar pentru acest site web.',
+          'tcf.withdrawInfo': 'Puteți modifica sau retrage consimțământul dvs. oricând prin Setări.',
+          'tcf.vendorsPerPurpose': '{count} parteneri',
+          'tcf.iabPartnerSingular': '1 partener certificat IAB',
+          'tcf.iabPartnerPlural': '{count} parteneri certificați IAB',
+          'tcf.nonIabPartnerSingular': '1 furnizor suplimentar',
+          'tcf.nonIabPartnerPlural': '{count} furnizori suplimentari',
+          'tcf.partnerCountPrefix': 'Noi și',
+          'tcf.partnerCountConjunction': 'precum și',
+          'tcf.partnerCountSuffix': 'putem procesa aceste date.',
+          'tcf.cmpStorage': 'Biscotti CMP stochează alegerea dvs. de consimțământ în stocarea locală a browserului (până la 180 de zile).',
+          'tcf.maxStorage': 'Durată max. de stocare:',
+          'tcf.days': 'zile',
+          'tcf.usesNonCookieAccess': 'Utilizează și stocare fără cookie-uri',
+          'tcf.storageInfo': 'Info stocare',
+          'tcf.specialFeaturesDisclosure': 'Unii parteneri utilizează funcții speciale, cum ar fi date precise de geolocalizare sau scanarea activă a caracteristicilor dispozitivului, în scopul identificării.',
+          'tcf.liDisclosure': 'Unii parteneri prelucrează datele dumneavoastră pe baza unui interes legitim, împotriva căruia aveți dreptul să vă opuneți.',
+          'tcf.liLinkText': 'Gestionarea intereselor legitime',
+          'tcf.purposeNames': 'Scopuri: {names}.'
+        },
+        ru: {
+          'banner.title': 'Мы уважаем вашу конфиденциальность',
+          'banner.text': 'Мы используем файлы cookie и аналогичные технологии на нашем веб-сайте. Некоторые из них технически необходимы для работы сайта. С вашего согласия мы также используем файлы cookie для статистического анализа использования нашего веб-сайта и для персонализации контента и рекламы.',
+          'banner.accept': 'Принять все',
+          'banner.reject': 'Только необходимые',
+          'banner.withdrawAll': 'Отозвать все',
+          'banner.settings': 'Настройки',
+          'banner.ok': 'OK',
+          'banner.close': 'Закрыть',
+          'banner.doNotSell': 'Не продавать и не передавать мои персональные данные',
+          'banner.managePrivacy': 'Управление настройками конфиденциальности',
+          'banner.save': 'Сохранить настройки',
+          'categories.essential': 'Необходимые',
+          'categories.essentialDesc': 'Требуются для базовой функциональности веб-сайта.',
+          'categories.functional': 'Функциональные',
+          'categories.functionalDesc': 'Включите расширенные функциональные возможности и персонализацию.',
+          'categories.analytics': 'Аналитические',
+          'categories.analyticsDesc': 'Помогите нам понять, как используется наш веб-сайт.',
+          'categories.marketing': 'Маркетинговые',
+          'categories.marketingDesc': 'Используются для рекламы и межсайтового отслеживания.',
+          'categories.ai': 'Сервисы ИИ',
+          'categories.aiDesc': 'Чат-боты, системы рекомендаций и контент, сгенерированный ИИ. Соответствует EU AI Act.',
+          'categories.aiNotice': '🤖 Эта функция работает на основе ИИ.',
+          'categories.alwaysActive': 'Всегда активно',
+          'details.provider': 'Поставщик:',
+          'details.location': 'Местоположение:',
+          'details.duration': 'Срок хранения:',
+          'details.purpose': 'Цель:',
+          'details.legalBasis': 'Правовая основа:',
+          'details.privacy': 'Конфиденциальность:',
+          'details.privacyLink': 'Политика конфиденциальности',
+          'details.transfer': 'Передача данных:',
+          'details.notSpecified': 'Не указано',
+          'details.consentId': 'ID согласия:',
+          'details.lookupTitle': 'Поиск согласия',
+          'details.details': 'Подробности',
+          'services.biscottiDesc': 'Сохраняет ваши предпочтения в отношении файлов cookie',
+          'services.biscottiPurpose': 'Хранение решения о согласии в соответствии с GDPR Art. 7',
+          'services.wordpressDesc': 'Технически необходимо для функциональности веб-сайта',
+          'services.wordpressPurpose': 'Управление сеансом, статус входа в систему, пользовательские настройки',
+          'tcf.storageDisclosure': 'Мы и наши партнёры храним и/или получаем доступ к информации на вашем устройстве (например, файлы cookie) и обрабатываем персональные данные.',
+          'tcf.dataExamples': 'Это может включать IP-адреса, идентификаторы использования, поведение при просмотре и идентификаторы устройств.',
+          'tcf.purposeSummary': 'Обработка данных служит таким целям, как персонализация рекламы, измерение контента и анализ аудитории.',
+          'tcf.vendorCount': 'Мы и {count} партнёров можем обрабатывать ваши данные — Показать список',
+
+          'tcf.vendorCountSingular': 'Мы и 1 партнёр можем обрабатывать ваши данные — Показать список',
+          'tcf.consentScope': 'Ваше согласие действует только для этого веб-сайта.',
+          'tcf.withdrawInfo': 'Вы можете изменить или отозвать своё согласие в любое время через Настройки.',
+          'tcf.vendorsPerPurpose': '{count} партнёров',
+          'tcf.iabPartnerSingular': '1 сертифицированный IAB партнёр',
+          'tcf.iabPartnerPlural': '{count} сертифицированных IAB партнёров',
+          'tcf.nonIabPartnerSingular': '1 дополнительный поставщик',
+          'tcf.nonIabPartnerPlural': '{count} дополнительных поставщиков',
+          'tcf.partnerCountPrefix': 'Мы и',
+          'tcf.partnerCountConjunction': 'а также',
+          'tcf.partnerCountSuffix': 'можем обрабатывать эти данные.',
+          'tcf.cmpStorage': 'Biscotti CMP сохраняет ваш выбор согласия в локальном хранилище браузера (до 180 дней).',
+          'tcf.maxStorage': 'Макс. срок хранения:',
+          'tcf.days': 'дней',
+          'tcf.usesNonCookieAccess': 'Также использует хранилище без файлов cookie',
+          'tcf.storageInfo': 'Информация о хранилище',
+          'tcf.specialFeaturesDisclosure': 'Некоторые партнеры используют для идентификации специальные функции, такие как точные данные геолокации или активное сканирование характеристик устройства.',
+          'tcf.liDisclosure': 'Некоторые партнеры обрабатывают ваши данные на основании законных интересов, против чего вы имеете право возразить.',
+          'tcf.liLinkText': 'Обеспечение законных интересов',
+          'tcf.purposeNames': 'Цели: {names}.'
+        },
+        sk: {
+          'banner.title': 'Rešpektujeme vaše súkromie',
+          'banner.text': 'Na našej webovej stránke používame súbory cookie a podobné technológie. Niektoré sú technicky nevyhnutné pre prevádzku stránky. S vaším súhlasom používame súbory cookie aj na štatistickú analýzu používania našej webovej stránky a na prispôsobenie obsahu a reklamy.',
+          'banner.accept': 'Prijať všetky',
+          'banner.reject': 'Iba nevyhnutné',
+          'banner.withdrawAll': 'Odvolať všetko',
+          'banner.settings': 'Nastavenia',
+          'banner.ok': 'OK',
+          'banner.doNotSell': 'Nepredávajte ani nezdieľajte moje osobné údaje',
+          'banner.managePrivacy': 'Spravovať voľby ochrany súkromia',
+          'banner.save': 'Uložiť preferencie',
+          'categories.essential': 'Nevyhnutné',
+          'categories.essentialDesc': 'Vyžadované pre základnú funkčnosť webovej stránky.',
+          'categories.functional': 'Funkčné',
+          'categories.functionalDesc': 'Umožňujú rozšírenú funkčnosť a personalizáciu.',
+          'categories.analytics': 'Analytické',
+          'categories.analyticsDesc': 'Pomáhajú nám pochopiť, ako sa naša webová stránka používa.',
+          'categories.marketing': 'Marketingové',
+          'categories.marketingDesc': 'Používajú sa na reklamu a sledovanie naprieč stránkami.',
+          'categories.ai': 'AI Služby',
+          'categories.aiDesc': 'Chatboti, systémy odporúčaní a obsah generovaný AI. V súlade s EU AI Act.',
+          'categories.aiNotice': '🤖 Táto funkcia je poháňaná AI.',
+          'categories.alwaysActive': 'Vždy aktívne',
+          'details.provider': 'Poskytovateľ:',
+          'details.location': 'Umiestnenie:',
+          'details.duration': 'Doba uloženia:',
+          'details.purpose': 'Účel:',
+          'details.legalBasis': 'Právny základ:',
+          'details.privacy': 'Súkromie:',
+          'details.privacyLink': 'Zásady ochrany osobných údajov',
+          'details.transfer': 'Prenos dát:',
+          'details.notSpecified': 'Nešpecifikované',
+          'details.consentId': 'ID súhlasu:',
+          'details.details': 'Podrobnosti',
+          'services.biscottiDesc': 'Ukladá vaše preferencie súhlasu so súbormi cookie',
+          'services.biscottiPurpose': 'Uloženie rozhodnutia o súhlase podľa GDPR čl. 7',
+          'services.wordpressDesc': 'Technicky nevyhnutné pre funkčnosť webovej stránky',
+          'services.wordpressPurpose': 'Správa relácií, stav prihlásenia, nastavenia používateľa',
+          'tcf.storageDisclosure': 'My a naši partneri ukladáme a/alebo pristupujeme k informáciám na vašom zariadení (napr. súbory cookie) a spracúvame osobné údaje.',
+          'tcf.dataExamples': 'To môže zahŕňať IP adresy, identifikátory používania, správanie pri prehliadaní a identifikátory zariadení.',
+          'tcf.purposeSummary': 'Spracovanie údajov slúži na účely ako personalizácia reklám, meranie obsahu a analýza publika.',
+          'tcf.vendorCount': 'My a {count} partnerov môžeme spracovávať vaše údaje — Zobraziť zoznam',
+
+          'tcf.vendorCountSingular': 'My a 1 partner môžeme spracovávať vaše údaje — Zobraziť zoznam',
+          'tcf.consentScope': 'Váš súhlas sa vzťahuje len na tieto webové stránky.',
+          'tcf.withdrawInfo': 'Svoj súhlas môžete kedykoľvek zmeniť alebo odvolať prostredníctvom Nastavení.',
+          'tcf.vendorsPerPurpose': '{count} partnerov',
+          'tcf.iabPartnerSingular': '1 IAB certifikovaný partner',
+          'tcf.iabPartnerPlural': '{count} IAB certifikovaných partnerov',
+          'tcf.nonIabPartnerSingular': '1 ďalší poskytovateľ',
+          'tcf.nonIabPartnerPlural': '{count} ďalších poskytovateľov',
+          'tcf.partnerCountPrefix': 'My a',
+          'tcf.partnerCountConjunction': 'ako aj',
+          'tcf.partnerCountSuffix': 'môžeme spracovávať tieto údaje.',
+          'tcf.cmpStorage': 'Biscotti CMP ukladá vašu voľbu súhlasu do miestneho úložiska prehliadača (až 180 dní).',
+          'tcf.maxStorage': 'Max. doba uloženia:',
+          'tcf.days': 'dní',
+          'tcf.usesNonCookieAccess': 'Využíva aj úložisko bez súborov cookie',
+          'tcf.storageInfo': 'Info o úložisku',
+          'tcf.specialFeaturesDisclosure': 'Niektorí partneri na identifikáciu využívajú špeciálne funkcie, ako sú presné údaje o geolokácii alebo aktívne skenovanie charakteristík zariadenia.',
+          'tcf.liDisclosure': 'Niektorí partneri spracúvajú vaše údaje na základe oprávneného záujmu, proti čomu máte právo namietať.',
+          'tcf.liLinkText': 'Spravovať oprávnené záujmy',
+          'tcf.purposeNames': 'Účely: {names}.'
+        },
+        sl: {
+          'banner.title': 'Spoštujemo vašo zasebnost',
+          'banner.text': 'Na naši spletni strani uporabljamo piškotke in podobne tehnologije. Nekateri so tehnično potrebni za delovanje spletnega mesta. Z vašim soglasjem uporabljamo piškotke tudi za statistično analizo uporabe naše spletne strani ter za personalizacijo vsebine in oglaševanja.',
+          'banner.accept': 'Sprejmi vse',
+          'banner.reject': 'Samo nujni',
+          'banner.withdrawAll': 'Prekliči vse',
+          'banner.settings': 'Nastavitve',
+          'banner.ok': 'OK',
+          'banner.close': 'Zapri',
+          'banner.doNotSell': 'Ne prodajajte ali delite mojih osebnih podatkov',
+          'banner.managePrivacy': 'Upravljanje izbir zasebnosti',
+          'banner.save': 'Shrani nastavitve',
+          'categories.essential': 'Nujni',
+          'categories.essentialDesc': 'Potrebni za osnovno funkcionalnost spletnega mesta.',
+          'categories.functional': 'Funkcionalni',
+          'categories.functionalDesc': 'Omogočajo izboljšano funkcionalnost in personalizacijo.',
+          'categories.analytics': 'Analitika',
+          'categories.analyticsDesc': 'Pomagajo nam razumeti, kako se uporablja naša spletna stran.',
+          'categories.marketing': 'Marketing',
+          'categories.marketingDesc': 'Uporabljajo se za oglaševanje in sledenje po spletnih mestih.',
+          'categories.ai': 'Storitve UI',
+          'categories.aiDesc': 'Klepetalni roboti, sistemi za priporočila in vsebina, ustvarjena z UI. Skladno z EU AI Act.',
+          'categories.aiNotice': '🤖 To funkcijo poganja UI.',
+          'categories.alwaysActive': 'Vedno aktivno',
+          'details.provider': 'Ponudnik:',
+          'details.location': 'Lokacija:',
+          'details.duration': 'Trajanje shranjevanja:',
+          'details.purpose': 'Namen:',
+          'details.legalBasis': 'Pravna podlaga:',
+          'details.privacy': 'Zasebnost:',
+          'details.privacyLink': 'Politika zasebnosti',
+          'details.transfer': 'Prenos podatkov:',
+          'details.notSpecified': 'Ni določeno',
+          'details.consentId': 'ID soglasja:',
+          'details.lookupTitle': 'Iskanje soglasja',
+          'details.details': 'Podrobnosti',
+          'services.biscottiDesc': 'Shrani vaše nastavitve soglasja za piškotke',
+          'services.biscottiPurpose': 'Shranjevanje odločitve o soglasju, kot zahteva GDPR člen 7',
+          'services.wordpressDesc': 'Tehnično potrebno za funkcionalnost spletnega mesta',
+          'services.wordpressPurpose': 'Upravljanje sej, status prijave, uporabniške nastavitve',
+          'tcf.storageDisclosure': 'Mi in naši partnerji shranjujemo in/ali dostopamo do informacij na vaši napravi (npr. piškotke) in obdelujemo osebne podatke.',
+          'tcf.dataExamples': 'To lahko vključuje IP-naslove, identifikatorje uporabe, vedenje pri brskanju in identifikatorje naprav.',
+          'tcf.purposeSummary': 'Obdelava podatkov služi namenom, kot so prilagajanje oglasov, merjenje vsebine in analiza občinstva.',
+          'tcf.vendorCount': 'Mi in {count} partnerjev lahko obdelujemo vaše podatke — Prikaži seznam',
+
+          'tcf.vendorCountSingular': 'Mi in 1 partner lahko obdelujemo vaše podatke — Prikaži seznam',
+          'tcf.consentScope': 'Vaša privolitev velja samo za to spletno stran.',
+          'tcf.withdrawInfo': 'Svojo privolitev lahko kadar koli spremenite ali prekličete prek Nastavitev.',
+          'tcf.vendorsPerPurpose': '{count} partnerjev',
+          'tcf.iabPartnerSingular': '1 IAB-certificiran partner',
+          'tcf.iabPartnerPlural': '{count} IAB-certificiranih partnerjev',
+          'tcf.nonIabPartnerSingular': '1 dodatni ponudnik',
+          'tcf.nonIabPartnerPlural': '{count} dodatnih ponudnikov',
+          'tcf.partnerCountPrefix': 'Mi in',
+          'tcf.partnerCountConjunction': 'kot tudi',
+          'tcf.partnerCountSuffix': 'lahko obdelujemo te podatke.',
+          'tcf.cmpStorage': 'Biscotti CMP shranjuje vašo izbiro privolitve v lokalni shrambi brskalnika (do 180 dni).',
+          'tcf.maxStorage': 'Najv. trajanje shranjevanja:',
+          'tcf.days': 'dni',
+          'tcf.usesNonCookieAccess': 'Uporablja tudi shranjevanje brez piškotkov',
+          'tcf.storageInfo': 'Informacije o shranjevanju',
+          'tcf.specialFeaturesDisclosure': 'Nekateri partnerji za identifikacijo uporabljajo posebne funkcije, kot so natančni podatki o geografski lokaciji ali aktivno skeniranje značilnosti naprav.',
+          'tcf.liDisclosure': 'Nekateri partnerji obdelujejo vaše podatke na podlagi zakonitega interesa, proti čemur imate pravico ugovarjati.',
+          'tcf.liLinkText': 'Upravljanje zakonitih interesov',
+          'tcf.purposeNames': 'Nameni: {names}.'
+        },
+        sr: {
+          'banner.title': 'Poštujemo vašu privatnost',
+          'banner.text': 'Na našoj veb stranici koristimo kolačiće i slične tehnologije. Neki su tehnički neophodni za rad sajta. Uz vašu saglasnost, koristimo i kolačiće za statističku analizu korišćenja naše veb stranice i za personalizaciju sadržaja i oglašavanja.',
+          'banner.accept': 'Prihvati sve',
+          'banner.reject': 'Odbij sve',
+          'banner.withdrawAll': 'Povuci sve',
+          'banner.settings': 'Podešavanja',
+          'banner.ok': 'У реду',
+          'banner.doNotSell': 'Не продајте нити делите моје личне податке',
+          'banner.managePrivacy': 'Управљање подешавањима приватности',
+          'banner.save': 'Sačuvaj podešavanja',
+          'categories.essential': 'Neophodni',
+          'categories.essentialDesc': 'Neophodni za osnovnu funkcionalnost veb stranice.',
+          'categories.functional': 'Funkcionalni',
+          'categories.functionalDesc': 'Omogućavaju poboljšanu funkcionalnost i personalizaciju.',
+          'categories.analytics': 'Analitika',
+          'categories.analyticsDesc': 'Pomažu nam da razumemo kako se koristi naša veb stranica.',
+          'categories.marketing': 'Marketing',
+          'categories.marketingDesc': 'Koriste se za oglašavanje i praćenje na različitim sajtovima.',
+          'categories.ai': 'AI Usluge',
+          'categories.aiDesc': 'Četbotovi, sistemi preporuka i AI-generisan sadržaj. U skladu sa EU AI Act.',
+          'categories.aiNotice': '🤖 Ovu funkciju pokreće AI.',
+          'categories.alwaysActive': 'Увек активно',
+          'details.provider': 'Pružalac usluge:',
+          'details.location': 'Lokacija:',
+          'details.duration': 'Trajanje skladištenja:',
+          'details.purpose': 'Svrha:',
+          'details.legalBasis': 'Pravni osnov:',
+          'details.privacy': 'Privatnost:',
+          'details.privacyLink': 'Politika privatnosti',
+          'details.transfer': 'Prenos podataka:',
+          'details.notSpecified': 'Nije navedeno',
+          'details.consentId': 'ID: Saglasnosti:',
+          'details.lookupTitle': 'Претрага сагласности',
+          'details.details': 'Detalji',
+          'services.biscottiDesc': 'Čuva vaša podešavanja saglasnosti za kolačiće',
+          'services.biscottiPurpose': 'Čuvanje odluke o saglasnosti kao što zahteva GDPR član 7',
+          'services.wordpressDesc': 'Tehnički neophodni za funkcionalnost veb stranice',
+          'services.wordpressPurpose': 'Upravljanje sesijama, status prijave, korisnička podešavanja',
+          'tcf.storageDisclosure': 'Ми и наши партнери чувамо и/или приступамо информацијама на вашем уређају (нпр. колачиће) и обрађујемо личне податке.',
+          'tcf.dataExamples': 'Ово може укључивати IP адресе, идентификаторе коришћења, понашање при прегледању и идентификаторе уређаја.',
+          'tcf.purposeSummary': 'Обрада података служи сврхама као што су персонализација огласа, мерење садржаја и анализа публике.',
+          'tcf.vendorCount': 'Ми и {count} партнера можемо обрађивати ваше податке — Прикажи листу',
+
+          'tcf.vendorCountSingular': 'Ми и 1 партнер можемо обрађивати ваше податке — Прикажи листу',
+          'tcf.consentScope': 'Ваш пристанак се односи само на овај веб-сајт.',
+          'tcf.withdrawInfo': 'Можете променити или повући свој пристанак у било ком тренутку путем Подешавања.',
+          'tcf.vendorsPerPurpose': '{count} партнера',
+          'tcf.iabPartnerSingular': '1 IAB-сертификовани партнер',
+          'tcf.iabPartnerPlural': '{count} IAB-сертификованих партнера',
+          'tcf.nonIabPartnerSingular': '1 додатни пружалац',
+          'tcf.nonIabPartnerPlural': '{count} додатних пружалаца',
+          'tcf.partnerCountPrefix': 'Ми и',
+          'tcf.partnerCountConjunction': 'као и',
+          'tcf.partnerCountSuffix': 'можемо обрађивати ове податке.',
+          'tcf.cmpStorage': 'Biscotti CMP чува ваш избор пристанка у локалном складишту вашег прегледача (до 180 дана).',
+          'tcf.maxStorage': 'Макс. трајање складиштења:',
+          'tcf.days': 'дана',
+          'tcf.usesNonCookieAccess': 'Такође користи складиштење без колачића',
+          'tcf.storageInfo': 'Информације о складиштењу',
+          'tcf.specialFeaturesDisclosure': 'Неки партнери користе посебне функције као што су прецизни гео-локациони подаци или активно скенирање карактеристика уређаја за идентификацију.',
+          'tcf.liDisclosure': 'Неки партнери обрађују ваше податке на основу легитимног интереса, на шта имате право да приговорите.',
+          'tcf.liLinkText': 'Управљајте легитимним интересовањима',
+          'tcf.purposeNames': 'Сврхе: {names}.'
+        },
+        sv: {
+          'banner.title': 'Vi respekterar din integritet',
+          'banner.text': 'Vi använder cookies och liknande tekniker på vår webbplats. Vissa är tekniskt nödvändiga för att webbplatsen ska fungera. Med ditt samtycke använder vi också cookies för att statistiskt analysera användningen av vår webbplats och för att anpassa innehåll och reklam.',
+          'banner.accept': 'Acceptera alla',
+          'banner.reject': 'Endast nödvändiga',
+          'banner.withdrawAll': 'Återkalla alla',
+          'banner.settings': 'Inställningar',
+          'banner.ok': 'OK',
+          'banner.doNotSell': 'Sälj eller dela inte min personliga information',
+          'banner.managePrivacy': 'Hantera integritetsval',
+          'banner.save': 'Spara preferenser',
+          'categories.essential': 'Nödvändiga',
+          'categories.essentialDesc': 'Krävs för grundläggande webbplatsfunktionalitet.',
+          'categories.functional': 'Funktionella',
+          'categories.functionalDesc': 'Möjliggör förbättrad funktionalitet och personalisering.',
+          'categories.analytics': 'Analys',
+          'categories.analyticsDesc': 'Hjälp oss att förstå hur vår webbplats används.',
+          'categories.marketing': 'Marknadsföring',
+          'categories.marketingDesc': 'Används för reklam och spårning över flera webbplatser.',
+          'categories.ai': 'AI-tjänster',
+          'categories.aiDesc': 'Chatbottar, rekommendationssystem och AI-genererat innehåll. EU AI Act-kompatibel.',
+          'categories.aiNotice': '🤖 Den här funktionen drivs av AI.',
+          'categories.alwaysActive': 'Alltid aktiv',
+          'details.provider': 'Leverantör:',
+          'details.location': 'Plats:',
+          'details.duration': 'Lagringstid:',
+          'details.purpose': 'Syfte:',
+          'details.legalBasis': 'Rättslig grund:',
+          'details.privacy': 'Integritet:',
+          'details.privacyLink': 'Integritetspolicy',
+          'details.transfer': 'Dataöverföring:',
+          'details.notSpecified': 'Ej specificerad',
+          'details.consentId': 'Samtyckes-ID:',
+          'details.lookupTitle': 'Samtycke-sökning',
+          'details.details': 'Detaljer',
+          'services.biscottiDesc': 'Lagrar dina preferenser för cookie-samtycke',
+          'services.biscottiPurpose': 'Lagring av samtyckesbeslut enligt GDPR Art. 7',
+          'services.wordpressDesc': 'Tekniskt nödvändigt för webbplatsens funktionalitet',
+          'services.wordpressPurpose': 'Sessionshantering, inloggningsstatus, användarinställningar',
+          'tcf.storageDisclosure': 'Vi och våra partners lagrar och/eller får åtkomst till information på din enhet (t.ex. cookies) och behandlar personuppgifter.',
+          'tcf.dataExamples': 'Detta kan omfatta IP-adresser, användningsidentifierare, surfbeteende och enhetsidentifierare.',
+          'tcf.purposeSummary': 'Databehandlingen tjänar syften som annonsanpassning, innehållsmätning och publikanalys.',
+          'tcf.vendorCount': 'Vi och {count} partners kan behandla dina uppgifter — Visa lista',
+
+          'tcf.vendorCountSingular': 'Vi och 1 partner kan behandla dina uppgifter — Visa lista',
+          'tcf.consentScope': 'Ditt samtycke gäller endast för denna webbplats.',
+          'tcf.withdrawInfo': 'Du kan ändra eller återkalla ditt samtycke när som helst via Inställningar.',
+          'tcf.vendorsPerPurpose': '{count} partners',
+          'tcf.iabPartnerSingular': '1 IAB-certifierad partner',
+          'tcf.iabPartnerPlural': '{count} IAB-certifierade partners',
+          'tcf.nonIabPartnerSingular': '1 ytterligare leverantör',
+          'tcf.nonIabPartnerPlural': '{count} ytterligare leverantörer',
+          'tcf.partnerCountPrefix': 'Vi och',
+          'tcf.partnerCountConjunction': 'samt',
+          'tcf.partnerCountSuffix': 'kan behandla dessa uppgifter.',
+          'tcf.cmpStorage': 'Biscotti CMP lagrar ditt samtyckesval i din webbläsares lokala lagring (upp till 180 dagar).',
+          'tcf.maxStorage': 'Max. lagringstid:',
+          'tcf.days': 'dagar',
+          'tcf.usesNonCookieAccess': 'Använder även lagring utan cookies',
+          'tcf.storageInfo': 'Lagringsinformation',
+          'tcf.specialFeaturesDisclosure': 'Vissa partner använder specialfunktioner som exakta geolokaliseringsuppgifter eller aktiv avläsning av enhetens egenskaper för identifiering.',
+          'tcf.liDisclosure': 'Vissa samarbetspartner behandlar dina uppgifter på grundval av berättigat intresse, vilket du har rätt att invända mot.',
+          'tcf.liLinkText': 'Hantera berättigade intressen',
+          'tcf.purposeNames': 'Syften: {names}.'
+        },
+        th: {
+          'banner.title': 'เราเคารพความเป็นส่วนตัวของคุณ',
+          'banner.text': 'เราใช้คุกกี้และเทคโนโลยีที่คล้ายคลึงกันบนเว็บไซต์ของเรา บางอย่างมีความจำเป็นทางเทคนิคสำหรับการทำงานของเว็บไซต์ ด้วยความยินยอมของคุณ เรายังใช้คุกกี้เพื่อวิเคราะห์ทางสถิติเกี่ยวกับการใช้งานเว็บไซต์ของเรา และเพื่อปรับเนื้อหาและการโฆษณาให้เป็นส่วนตัว',
+          'banner.accept': 'ยอมรับทั้งหมด',
+          'banner.reject': 'จำเป็นเท่านั้น',
+          'banner.withdrawAll': 'ถอนทั้งหมด',
+          'banner.settings': 'การตั้งค่า',
+          'banner.ok': 'ตกลง',
+          'banner.close': 'ปิด',
+          'banner.doNotSell': 'ห้ามขายหรือแบ่งปันข้อมูลส่วนบุคคลของฉัน',
+          'banner.managePrivacy': 'จัดการตัวเลือกความเป็นส่วนตัว',
+          'banner.save': 'บันทึกการตั้งค่า',
+          'categories.essential': 'จำเป็น',
+          'categories.essentialDesc': 'จำเป็นสำหรับฟังก์ชันพื้นฐานของเว็บไซต์',
+          'categories.functional': 'เชิงหน้าที่',
+          'categories.functionalDesc': 'เปิดใช้งานฟังก์ชันและการปรับแต่งขั้นสูง',
+          'categories.analytics': 'การวิเคราะห์',
+          'categories.analyticsDesc': 'ช่วยให้เราเข้าใจว่าเว็บไซต์ของเราถูกใช้งานอย่างไร',
+          'categories.marketing': 'การตลาด',
+          'categories.marketingDesc': 'ใช้สำหรับการโฆษณาและการติดตามข้ามเว็บไซต์',
+          'categories.ai': 'บริการ AI',
+          'categories.aiDesc': 'แชทบอท ระบบแนะนำ และเนื้อหาที่สร้างโดย AI เป็นไปตาม EU AI Act',
+          'categories.aiNotice': '🤖 คุณสมบัตินี้ขับเคลื่อนโดย AI',
+          'categories.alwaysActive': 'ใช้งานตลอด',
+          'details.provider': 'ผู้ให้บริการ:',
+          'details.location': 'สถานที่:',
+          'details.duration': 'ระยะเวลาการจัดเก็บ:',
+          'details.purpose': 'วัตถุประสงค์:',
+          'details.legalBasis': 'ฐานทางกฎหมาย:',
+          'details.privacy': 'ความเป็นส่วนตัว:',
+          'details.privacyLink': 'นโยบายความเป็นส่วนตัว',
+          'details.transfer': 'การถ่ายโอนข้อมูล:',
+          'details.notSpecified': 'ไม่ได้ระบุ',
+          'details.consentId': 'ID: การยินยอม:',
+          'details.lookupTitle': 'ค้นหาความยินยอม',
+          'details.details': 'รายละเอียด',
+          'services.biscottiDesc': 'จัดเก็บการตั้งค่าความยินยอมคุกกี้ของคุณ',
+          'services.biscottiPurpose': 'การจัดเก็บการตัดสินใจยินยอมตามที่กำหนดโดย GDPR Art. 7',
+          'services.wordpressDesc': 'จำเป็นทางเทคนิคสำหรับการทำงานของเว็บไซต์',
+          'services.wordpressPurpose': 'การจัดการเซสชัน สถานะการเข้าสู่ระบบ การตั้งค่าผู้ใช้',
+          'tcf.storageDisclosure': 'เราและพันธมิตรของเราจัดเก็บและ/หรือเข้าถึงข้อมูลบนอุปกรณ์ของคุณ (เช่น คุกกี้) และประมวลผลข้อมูลส่วนบุคคล',
+          'tcf.dataExamples': 'ซึ่งอาจรวมถึงที่อยู่ IP ตัวระบุการใช้งาน พฤติกรรมการท่องเว็บ และตัวระบุอุปกรณ์',
+          'tcf.purposeSummary': 'การประมวลผลข้อมูลมีวัตถุประสงค์เช่น การปรับแต่งโฆษณา การวัดเนื้อหา และการวิเคราะห์กลุ่มเป้าหมาย',
+          'tcf.vendorCount': 'เราและ {count} พันธมิตรอาจประมวลผลข้อมูลของคุณ — ดูรายการ',
+
+          'tcf.vendorCountSingular': 'เราและ 1 พันธมิตรอาจประมวลผลข้อมูลของคุณ — ดูรายการ',
+          'tcf.consentScope': 'ความยินยอมของคุณใช้ได้กับเว็บไซต์นี้เท่านั้น',
+          'tcf.withdrawInfo': 'คุณสามารถเปลี่ยนแปลงหรือถอนความยินยอมได้ตลอดเวลาผ่านการตั้งค่า',
+          'tcf.vendorsPerPurpose': '{count} พันธมิตร',
+          'tcf.iabPartnerSingular': '1 พันธมิตรที่ได้รับการรับรอง IAB',
+          'tcf.iabPartnerPlural': '{count} พันธมิตรที่ได้รับการรับรอง IAB',
+          'tcf.nonIabPartnerSingular': '1 ผู้ให้บริการเพิ่มเติม',
+          'tcf.nonIabPartnerPlural': '{count} ผู้ให้บริการเพิ่มเติม',
+          'tcf.partnerCountPrefix': 'เราและ',
+          'tcf.partnerCountConjunction': 'รวมถึง',
+          'tcf.partnerCountSuffix': 'สามารถประมวลผลข้อมูลนี้ได้',
+          'tcf.cmpStorage': 'Biscotti CMP จัดเก็บตัวเลือกความยินยอมของคุณในหน่วยความจำท้องถิ่นของเบราว์เซอร์ (สูงสุด 180 วัน)',
+          'tcf.maxStorage': 'ระยะเวลาเก็บรักษาสูงสุด:',
+          'tcf.days': 'วัน',
+          'tcf.usesNonCookieAccess': 'ใช้พื้นที่จัดเก็บที่ไม่ใช่คุกกี้ด้วย',
+          'tcf.storageInfo': 'ข้อมูลการจัดเก็บ',
+          'tcf.specialFeaturesDisclosure': 'Some partners use special features such as precise geolocation data or active scanning of device characteristics for identification.',
+          'tcf.liDisclosure': 'Some partners process your data on the basis of legitimate interest, which you have the right to object to.',
+          'tcf.liLinkText': 'Manage legitimate interests',
+          'tcf.purposeNames': 'Purposes: {names}.'
+        },
+        tr: {
+          'banner.title': 'Gizliliğinize saygı duyuyoruz',
+          'banner.text': 'Web sitemizde çerezler ve benzeri teknolojiler kullanıyoruz. Bazıları sitenin çalışması için teknik olarak gereklidir. İzninizle, web sitemizin kullanımını istatistiksel olarak analiz etmek ve içeriği ve reklamları kişiselleştirmek için de çerezler kullanıyoruz.',
+          'banner.accept': 'Tümünü kabul et',
+          'banner.reject': 'Yalnızca zorunlu',
+          'banner.withdrawAll': 'Tümünü geri çek',
+          'banner.settings': 'Ayarlar',
+          'banner.ok': 'Tamam',
+          'banner.close': 'Kapat',
+          'banner.doNotSell': 'Kişisel bilgilerimi satmayın veya paylaşmayın',
+          'banner.managePrivacy': 'Gizlilik tercihlerini yönet',
+          'banner.save': 'Tercihleri kaydet',
+          'categories.essential': 'Zorunlu',
+          'categories.essentialDesc': 'Temel web sitesi işlevselliği için gereklidir.',
+          'categories.functional': 'Fonksiyonel',
+          'categories.functionalDesc': 'Gelişmiş işlevselliği ve kişiselleştirmeyi etkinleştirin.',
+          'categories.analytics': 'Analitik',
+          'categories.analyticsDesc': 'Web sitemizin nasıl kullanıldığını anlamamıza yardımcı olun.',
+          'categories.marketing': 'Pazarlama',
+          'categories.marketingDesc': 'Reklam ve siteler arası izleme için kullanılır.',
+          'categories.ai': 'Yapay Zeka Hizmetleri',
+          'categories.aiDesc': 'Sohbet robotları, öneri sistemleri ve yapay zeka tarafından oluşturulan içerik. EU AI Act uyumlu.',
+          'categories.aiNotice': '🤖 Bu özellik yapay zeka tarafından desteklenmektedir.',
+          'categories.alwaysActive': 'Her zaman aktif',
+          'details.provider': 'Sağlayıcı:',
+          'details.location': 'Konum:',
+          'details.duration': 'Saklama süresi:',
+          'details.purpose': 'Amaç:',
+          'details.legalBasis': 'Yasal dayanak:',
+          'details.privacy': 'Gizlilik:',
+          'details.privacyLink': 'Gizlilik Politikası',
+          'details.transfer': 'Veri transferi:',
+          'details.notSpecified': 'Belirtilmemiş',
+          'details.consentId': 'Onay ID\'si:',
+          'details.details': 'Detaylar',
+          'services.biscottiDesc': 'Çerez onay tercihlerinizi saklar',
+          'services.biscottiPurpose': 'GDPR Madde 7\'nin gerektirdiği şekilde onay kararının saklanması',
+          'services.wordpressDesc': 'Web sitesi işlevselliği için teknik olarak gereklidir',
+          'services.wordpressPurpose': 'Oturum yönetimi, oturum açma durumu, kullanıcı ayarları',
+          'tcf.storageDisclosure': 'Biz ve ortaklarımız cihazınızda bilgi saklar ve/veya bilgiye erişiriz (ör. çerezler) ve kişisel verileri işleriz.',
+          'tcf.dataExamples': 'Bu, IP adreslerini, kullanım tanımlayıcılarını, tarama davranışını ve cihaz tanımlayıcılarını içerebilir.',
+          'tcf.purposeSummary': 'Veri işleme, reklam kişiselleştirme, içerik ölçümü ve kitle analizi gibi amaçlara hizmet eder.',
+          'tcf.vendorCount': 'Biz ve {count} ortak verilerinizi işleyebiliriz — Listeyi görüntüle',
+
+          'tcf.vendorCountSingular': 'Biz ve 1 ortak verilerinizi işleyebiliriz — Listeyi görüntüle',
+          'tcf.consentScope': 'Onayınız yalnızca bu web sitesi için geçerlidir.',
+          'tcf.withdrawInfo': 'Onayınızı Ayarlar üzerinden istediğiniz zaman değiştirebilir veya geri çekebilirsiniz.',
+          'tcf.vendorsPerPurpose': '{count} ortak',
+          'tcf.iabPartnerSingular': '1 IAB sertifikalı ortak',
+          'tcf.iabPartnerPlural': '{count} IAB sertifikalı ortak',
+          'tcf.nonIabPartnerSingular': '1 ek sağlayıcı',
+          'tcf.nonIabPartnerPlural': '{count} ek sağlayıcı',
+          'tcf.partnerCountPrefix': 'Biz ve',
+          'tcf.partnerCountConjunction': 'ile birlikte',
+          'tcf.partnerCountSuffix': 'bu verileri işleyebiliriz.',
+          'tcf.cmpStorage': 'Biscotti CMP onay tercihinizi tarayıcınızın yerel depolama alanında saklar (180 güne kadar).',
+          'tcf.maxStorage': 'Maks. saklama süresi:',
+          'tcf.days': 'gün',
+          'tcf.usesNonCookieAccess': 'Çerez dışı depolama da kullanır',
+          'tcf.storageInfo': 'Depolama bilgisi',
+          'tcf.specialFeaturesDisclosure': 'Bazı iş ortakları, kimlik tespiti amacıyla hassas konum bilgileri veya cihaz özelliklerinin aktif olarak taranması gibi özel özellikleri kullanır.',
+          'tcf.liDisclosure': 'Bazı iş ortaklarımız, verilerinizi meşru menfaat temelinde işler; bu duruma itiraz etme hakkınız bulunmaktadır.',
+          'tcf.liLinkText': 'Meşru menfaatlerin yönetimi',
+          'tcf.purposeNames': 'Amaçlar: {names}.'
+        },
+        uk: {
+          'banner.title': 'Ми поважаємо вашу конфіденційність',
+          'banner.text': 'Ми використовуємо файли cookie та подібні технології на нашому веб-сайті. Деякі з них технічно необхідні для роботи сайту. За вашою згодою ми також використовуємо файли cookie для статистичного аналізу використання нашого веб-сайту та для персоналізації контенту та реклами.',
+          'banner.accept': 'Прийняти все',
+          'banner.reject': 'Тільки необхідні',
+          'banner.withdrawAll': 'Відкликати все',
+          'banner.settings': 'Налаштування',
+          'banner.ok': 'OK',
+          'banner.close': 'Закрити',
+          'banner.doNotSell': 'Не продавайте та не передавайте мої персональні дані',
+          'banner.managePrivacy': 'Керування налаштуваннями конфіденційності',
+          'banner.save': 'Зберегти налаштування',
+          'categories.essential': 'Необхідні',
+          'categories.essentialDesc': 'Необхідні для базової функціональності веб-сайту.',
+          'categories.functional': 'Функціональні',
+          'categories.functionalDesc': 'Увімкнути розширену функціональність та персоналізацію.',
+          'categories.analytics': 'Аналітика',
+          'categories.analyticsDesc': 'Допоможіть нам зрозуміти, як використовується наш веб-сайт.',
+          'categories.marketing': 'Маркетинг',
+          'categories.marketingDesc': 'Використовується для реклами та міжсайтового відстеження.',
+          'categories.ai': 'AI Сервіси',
+          'categories.aiDesc': 'Чат-боти, системи рекомендацій та контент, згенерований ШІ. Відповідає вимогам EU AI Act.',
+          'categories.aiNotice': '🤖 Ця функція працює на основі штучного інтелекту.',
+          'categories.alwaysActive': 'Завжди активно',
+          'details.provider': 'Постачальник:',
+          'details.location': 'Місцезнаходження:',
+          'details.duration': 'Термін зберігання:',
+          'details.purpose': 'Мета:',
+          'details.legalBasis': 'Правова основа:',
+          'details.privacy': 'Конфіденційність:',
+          'details.privacyLink': 'Політика конфіденційності',
+          'details.transfer': 'Передача даних:',
+          'details.notSpecified': 'Не вказано',
+          'details.consentId': 'ID згоди:',
+          'details.lookupTitle': 'Пошук згоди',
+          'details.details': 'Деталі',
+          'services.biscottiDesc': 'Зберігає ваші налаштування згоди на використання файлів cookie',
+          'services.biscottiPurpose': 'Зберігання рішення про згоду відповідно до вимог GDPR ст. 7',
+          'services.wordpressDesc': 'Технічно необхідні для функціональності веб-сайту',
+          'services.wordpressPurpose': 'Керування сеансом, статус входу, налаштування користувача',
+          'tcf.storageDisclosure': 'Ми та наші партнери зберігаємо та/або отримуємо доступ до інформації на вашому пристрої (наприклад, файли cookie) та обробляємо персональні дані.',
+          'tcf.dataExamples': 'Це може включати IP-адреси, ідентифікатори використання, поведінку при перегляді та ідентифікатори пристроїв.',
+          'tcf.purposeSummary': 'Обробка даних слугує таким цілям, як персоналізація реклами, вимірювання контенту та аналіз аудиторії.',
+          'tcf.vendorCount': 'Ми та {count} партнерів можемо обробляти ваші дані — Переглянути список',
+
+          'tcf.vendorCountSingular': 'Ми та 1 партнер можемо обробляти ваші дані — Переглянути список',
+          'tcf.consentScope': 'Ваша згода поширюється лише на цей веб-сайт.',
+          'tcf.withdrawInfo': 'Ви можете змінити або відкликати свою згоду будь-коли через Налаштування.',
+          'tcf.vendorsPerPurpose': '{count} партнерів',
+          'tcf.iabPartnerSingular': '1 сертифікований IAB партнер',
+          'tcf.iabPartnerPlural': '{count} сертифікованих IAB партнерів',
+          'tcf.nonIabPartnerSingular': '1 додатковий постачальник',
+          'tcf.nonIabPartnerPlural': '{count} додаткових постачальників',
+          'tcf.partnerCountPrefix': 'Ми та',
+          'tcf.partnerCountConjunction': 'а також',
+          'tcf.partnerCountSuffix': 'можемо обробляти ці дані.',
+          'tcf.cmpStorage': 'Biscotti CMP зберігає ваш вибір згоди в локальному сховищі браузера (до 180 днів).',
+          'tcf.maxStorage': 'Макс. тривалість зберігання:',
+          'tcf.days': 'днів',
+          'tcf.usesNonCookieAccess': 'Також використовує сховище без файлів cookie',
+          'tcf.storageInfo': 'Інформація про сховище',
+          'tcf.specialFeaturesDisclosure': 'Деякі партнери використовують для ідентифікації такі спеціальні функції, як точні дані геолокації або активне сканування характеристик пристрою.',
+          'tcf.liDisclosure': 'Деякі партнери обробляють ваші дані на підставі законних інтересів, проти чого ви маєте право висловити заперечення.',
+          'tcf.liLinkText': 'Забезпечення законних інтересів',
+          'tcf.purposeNames': 'Цілі: {names}.'
+        },
+        vi: {
+          'banner.title': 'Chúng tôi tôn trọng quyền riêng tư của bạn',
+          'banner.text': 'Chúng tôi sử dụng cookie và các công nghệ tương tự trên trang web của chúng tôi. Một số là cần thiết về mặt kỹ thuật cho hoạt động của trang web. Với sự đồng ý của bạn, chúng tôi cũng sử dụng cookie để phân tích thống kê việc sử dụng trang web của chúng tôi và để cá nhân hóa nội dung và quảng cáo.',
+          'banner.accept': 'Chấp nhận tất cả',
+          'banner.reject': 'Chỉ những yếu tố cần thiết',
+          'banner.withdrawAll': 'Rút lại tất cả',
+          'banner.settings': 'Cài đặt',
+          'banner.ok': 'OK',
+          'banner.close': 'Đóng',
+          'banner.doNotSell': 'Không bán hoặc chia sẻ thông tin cá nhân của tôi',
+          'banner.managePrivacy': 'Quản lý lựa chọn quyền riêng tư',
+          'banner.save': 'Lưu tùy chọn',
+          'categories.essential': 'Thiết yếu',
+          'categories.essentialDesc': 'Bắt buộc để có chức năng trang web cơ bản.',
+          'categories.functional': 'Chức năng',
+          'categories.functionalDesc': 'Cho phép chức năng nâng cao và cá nhân hóa.',
+          'categories.analytics': 'Phân tích',
+          'categories.analyticsDesc': 'Giúp chúng tôi hiểu cách trang web của chúng tôi được sử dụng.',
+          'categories.marketing': 'Tiếp thị',
+          'categories.marketingDesc': 'Được sử dụng cho quảng cáo và theo dõi trên các trang web.',
+          'categories.ai': 'Dịch vụ AI',
+          'categories.aiDesc': 'Chatbot, hệ thống đề xuất và nội dung do AI tạo ra. Tuân thủ EU AI Act.',
+          'categories.aiNotice': '🤖 Tính năng này được hỗ trợ bởi AI.',
+          'categories.alwaysActive': 'Luôn hoạt động',
+          'details.provider': 'Nhà cung cấp:',
+          'details.location': 'Vị trí:',
+          'details.duration': 'Thời gian lưu trữ:',
+          'details.purpose': 'Mục đích:',
+          'details.legalBasis': 'Cơ sở pháp lý:',
+          'details.privacy': 'Quyền riêng tư:',
+          'details.privacyLink': 'Chính sách bảo mật',
+          'details.transfer': 'Truyền dữ liệu:',
+          'details.notSpecified': 'Không được chỉ định',
+          'details.consentId': 'ID đồng ý:',
+          'details.lookupTitle': 'Tra cứu đồng ý',
+          'details.details': 'Chi tiết',
+          'services.biscottiDesc': 'Lưu trữ tùy chọn chấp thuận cookie của bạn',
+          'services.biscottiPurpose': 'Lưu trữ quyết định chấp thuận theo yêu cầu của GDPR Điều 7',
+          'services.wordpressDesc': 'Cần thiết về mặt kỹ thuật cho chức năng trang web',
+          'services.wordpressPurpose': 'Quản lý phiên, trạng thái đăng nhập, cài đặt người dùng',
+          'tcf.storageDisclosure': 'Chúng tôi và các đối tác lưu trữ và/hoặc truy cập thông tin trên thiết bị của bạn (ví dụ: cookie) và xử lý dữ liệu cá nhân.',
+          'tcf.dataExamples': 'Điều này có thể bao gồm địa chỉ IP, mã nhận dạng sử dụng, hành vi duyệt web và mã nhận dạng thiết bị.',
+          'tcf.purposeSummary': 'Việc xử lý dữ liệu phục vụ các mục đích như cá nhân hóa quảng cáo, đo lường nội dung và phân tích đối tượng.',
+          'tcf.vendorCount': 'Chúng tôi và {count} đối tác có thể xử lý dữ liệu của bạn — Xem danh sách',
+
+          'tcf.vendorCountSingular': 'Chúng tôi và 1 đối tác có thể xử lý dữ liệu của bạn — Xem danh sách',
+          'tcf.consentScope': 'Sự đồng ý của bạn chỉ áp dụng cho trang web này.',
+          'tcf.withdrawInfo': 'Bạn có thể thay đổi hoặc rút lại sự đồng ý bất cứ lúc nào qua Cài đặt.',
+          'tcf.vendorsPerPurpose': '{count} đối tác',
+          'tcf.iabPartnerSingular': '1 đối tác được chứng nhận IAB',
+          'tcf.iabPartnerPlural': '{count} đối tác được chứng nhận IAB',
+          'tcf.nonIabPartnerSingular': '1 nhà cung cấp bổ sung',
+          'tcf.nonIabPartnerPlural': '{count} nhà cung cấp bổ sung',
+          'tcf.partnerCountPrefix': 'Chúng tôi và',
+          'tcf.partnerCountConjunction': 'cũng như',
+          'tcf.partnerCountSuffix': 'có thể xử lý dữ liệu này.',
+          'tcf.cmpStorage': 'Biscotti CMP lưu trữ lựa chọn đồng ý của bạn trong bộ nhớ cục bộ của trình duyệt (tối đa 180 ngày).',
+          'tcf.maxStorage': 'Thời gian lưu trữ tối đa:',
+          'tcf.days': 'ngày',
+          'tcf.usesNonCookieAccess': 'Cũng sử dụng bộ nhớ không phải cookie',
+          'tcf.storageInfo': 'Thông tin lưu trữ',
+          'tcf.specialFeaturesDisclosure': 'Some partners use special features such as precise geolocation data or active scanning of device characteristics for identification.',
+          'tcf.liDisclosure': 'Some partners process your data on the basis of legitimate interest, which you have the right to object to.',
+          'tcf.liLinkText': 'Manage legitimate interests',
+          'tcf.purposeNames': 'Purposes: {names}.'
+        },
+        zh: {
+          'banner.title': '我们尊重您的隐私',
+          'banner.text': '我们在我们的网站上使用 Cookie 和类似技术。有些技术对于网站的运行是必不可少的。在您同意的情况下，我们还会使用 Cookie 来统计分析我们网站的使用情况，并个性化内容和广告。',
+          'banner.accept': '全部接受',
+          'banner.reject': '仅限必要项',
+          'banner.withdrawAll': '撤回全部',
+          'banner.settings': '设置',
+          'banner.ok': 'OK',
+          'banner.close': '关闭',
+          'banner.doNotSell': '不要出售或分享我的个人信息',
+          'banner.managePrivacy': '管理隐私选择',
+          'banner.save': '保存偏好',
+          'categories.essential': '必要',
+          'categories.essentialDesc': '网站基本功能所必需。',
+          'categories.functional': '功能性',
+          'categories.functionalDesc': '启用增强的功能和个性化。',
+          'categories.analytics': '分析',
+          'categories.analyticsDesc': '帮助我们了解网站的使用方式。',
+          'categories.marketing': '营销',
+          'categories.marketingDesc': '用于广告和跨站点跟踪。',
+          'categories.ai': 'AI服务',
+          'categories.aiDesc': '聊天机器人、推荐系统和AI生成的内容。符合EU AI Act。',
+          'categories.aiNotice': '🤖 此功能由AI提供支持。',
+          'categories.alwaysActive': '始终启用',
+          'details.provider': '提供商：',
+          'details.location': '位置：',
+          'details.duration': '存储期限：',
+          'details.purpose': '目的：',
+          'details.legalBasis': '法律依据：',
+          'details.privacy': '隐私：',
+          'details.privacyLink': '隐私政策',
+          'details.transfer': '数据传输：',
+          'details.notSpecified': '未指定',
+          'details.consentId': 'Consent ID:',
+          'details.lookupTitle': '查询同意数据',
+          'details.details': '详情',
+          'services.biscottiDesc': '存储您的 Cookie 同意偏好',
+          'services.biscottiPurpose': '根据 GDPR Art. 7 的要求存储同意决定',
+          'services.wordpressDesc': '网站功能在技术上是必需的',
+          'services.wordpressPurpose': '会话管理、登录状态、用户设置',
+          'tcf.storageDisclosure': '我们和我们的合作伙伴在您的设备上存储和/或访问信息（例如Cookie）并处理个人数据。',
+          'tcf.dataExamples': '这可能包括IP地址、使用标识符、浏览行为和设备标识符。',
+          'tcf.purposeSummary': '数据处理用于广告个性化、内容测量和受众分析等目的。',
+          'tcf.vendorCount': '我们和 {count} 个合作伙伴可能会处理您的数据 — 查看列表',
+
+          'tcf.vendorCountSingular': '我们和 1 个合作伙伴可能会处理您的数据 — 查看列表',
+          'tcf.consentScope': '您的同意仅适用于此网站。',
+          'tcf.withdrawInfo': '您可以随时通过设置更改或撤回您的同意。',
+          'tcf.vendorsPerPurpose': '{count} 个合作伙伴',
+          'tcf.iabPartnerSingular': '1 个IAB认证合作伙伴',
+          'tcf.iabPartnerPlural': '{count} 个IAB认证合作伙伴',
+          'tcf.nonIabPartnerSingular': '1 个额外提供商',
+          'tcf.nonIabPartnerPlural': '{count} 个额外提供商',
+          'tcf.partnerCountPrefix': '我们和',
+          'tcf.partnerCountConjunction': '以及',
+          'tcf.partnerCountSuffix': '可以处理这些数据。',
+          'tcf.cmpStorage': 'Biscotti CMP 将您的同意选择存储在浏览器的本地存储中（最长180天）。',
+          'tcf.maxStorage': '最长存储期限：',
+          'tcf.days': '天',
+          'tcf.usesNonCookieAccess': '也使用非Cookie存储',
+          'tcf.storageInfo': '存储信息',
+          'tcf.specialFeaturesDisclosure': '一些合作伙伴会利用精准的地理位置数据或主动扫描设备特征等特殊功能来进行身份识别。',
+          'tcf.liDisclosure': '部分合作伙伴基于合法利益处理您的数据，您有权对此提出异议。',
+          'tcf.liLinkText': '管理合法利益',
+          'tcf.purposeNames': '目的: {names}.'
+        },
+        'zh-TW': {
+          'banner.title': '我們尊重您的隱私',
+          'banner.text': '我們在網站上使用 Cookie 和類似技術。有些技術對於網站的運作是必要的。在您同意的情況下，我們也會使用 Cookie 來統計分析我們網站的使用情況，並對內容和廣告進行個人化設定。',
+          'banner.accept': '全部接受',
+          'banner.reject': '僅限必要項目',
+          'banner.withdrawAll': '撤回全部',
+          'banner.settings': '設定',
+          'banner.ok': 'OK',
+          'banner.close': '關閉',
+          'banner.doNotSell': 'Do Not Sell or Share My Personal Information',
+          'banner.managePrivacy': 'Manage Privacy Choices',
+          'banner.save': '儲存偏好設定',
+          'categories.essential': '必要',
+          'categories.essentialDesc': '網站基本功能所需。',
+          'categories.functional': '功能性',
+          'categories.functionalDesc': '啟用增強的功能和個人化設定。',
+          'categories.analytics': '分析',
+          'categories.analyticsDesc': '幫助我們了解網站的使用方式。',
+          'categories.marketing': '行銷',
+          'categories.marketingDesc': '用於廣告和跨網站追蹤。',
+          'categories.ai': 'AI 服務',
+          'categories.aiDesc': '聊天機器人、推薦系統和 AI 產生的內容。符合 EU AI Act 規範。',
+          'categories.aiNotice': '🤖 此功能由 AI 提供技術支援。',
+          'categories.alwaysActive': '始終啟用',
+          'details.provider': '供應商：',
+          'details.location': '位置：',
+          'details.duration': '儲存期限：',
+          'details.purpose': '目的：',
+          'details.legalBasis': '法律依據：',
+          'details.privacy': '隱私權：',
+          'details.privacyLink': '隱私權政策',
+          'details.transfer': '資料傳輸：',
+          'details.notSpecified': '未指定',
+          'details.consentId': 'Consent ID:',
+          'details.lookupTitle': '查詢同意資料',
+          'details.details': '詳細資訊',
+          'services.biscottiDesc': '儲存您的 Cookie 同意偏好設定',
+          'services.biscottiPurpose': '根據 GDPR Art. 7 的要求儲存同意決定',
+          'services.wordpressDesc': '技術上對於網站功能是必要的',
+          'services.wordpressPurpose': '工作階段管理、登入狀態、使用者設定',
+          'tcf.storageDisclosure': '我們和我們的合作夥伴在您的裝置上儲存和/或存取資訊（例如 Cookie）並處理個人資料。',
+          'tcf.dataExamples': '這可能包括 IP 位址、使用識別碼、瀏覽行為和裝置識別碼。',
+          'tcf.purposeSummary': '資料處理用於廣告個人化、內容衡量和受眾分析等目的。',
+          'tcf.vendorCount': '我們和 {count} 個合作夥伴可能會處理您的資料 — 檢視清單',
+          'tcf.vendorCountSingular': '我們和 1 個合作夥伴可能會處理您的資料 — 檢視清單',
+          'tcf.consentScope': '您的同意僅適用於此網站。',
+          'tcf.withdrawInfo': '您可以隨時透過設定變更或撤回您的同意。',
+          'tcf.vendorsPerPurpose': '{count} 個合作夥伴',
+          'tcf.iabPartnerSingular': '1 個IAB認證合作夥伴',
+          'tcf.iabPartnerPlural': '{count} 個IAB認證合作夥伴',
+          'tcf.nonIabPartnerSingular': '1 個額外供應商',
+          'tcf.nonIabPartnerPlural': '{count} 個額外供應商',
+          'tcf.partnerCountPrefix': '我們和',
+          'tcf.partnerCountConjunction': '以及',
+          'tcf.partnerCountSuffix': '可以處理這些資料。',
+          'tcf.cmpStorage': 'Biscotti CMP 將您的同意選擇儲存在瀏覽器的本機儲存空間中（最長180天）。',
+          'tcf.maxStorage': '最長儲存期限：',
+          'tcf.days': '天',
+          'tcf.usesNonCookieAccess': '也使用非Cookie儲存',
+          'tcf.storageInfo': '儲存資訊',
+          'tcf.specialFeaturesDisclosure': 'Some partners use special features such as precise geolocation data or active scanning of device characteristics for identification.',
+          'tcf.liDisclosure': 'Some partners process your data on the basis of legitimate interest, which you have the right to object to.',
+          'tcf.liLinkText': 'Manage legitimate interests',
+          'tcf.purposeNames': 'Purposes: {names}.'
+        },
+        ko: {
+          'banner.title': '개인정보를 존중합니다',
+          'banner.text': '당사는 웹사이트에서 쿠키 및 유사 기술을 사용합니다. 일부는 사이트 운영에 기술적으로 필요합니다. 귀하의 동의 하에 웹사이트 사용 통계 분석 및 콘텐츠와 광고 개인화를 위해 쿠키를 사용합니다.',
+          'banner.accept': '모두 수락',
+          'banner.reject': '필수 항목만',
+          'banner.withdrawAll': '모두 철회',
+          'banner.settings': '설정',
+          'banner.ok': '확인',
+          'banner.close': '닫기',
+          'banner.doNotSell': '내 개인정보를 판매하거나 공유하지 마세요',
+          'banner.managePrivacy': '개인정보 설정 관리',
+          'banner.save': '설정 저장',
+          'categories.essential': '필수',
+          'categories.essentialDesc': '웹사이트 기본 기능에 필요합니다.',
+          'categories.functional': '기능',
+          'categories.functionalDesc': '향상된 기능 및 개인화를 활성화합니다.',
+          'categories.analytics': '분석',
+          'categories.analyticsDesc': '웹사이트 사용 방식을 이해하는 데 도움이 됩니다.',
+          'categories.marketing': '마케팅',
+          'categories.marketingDesc': '광고 및 교차 사이트 추적에 사용됩니다.',
+          'categories.ai': 'AI 서비스',
+          'categories.aiDesc': '챗봇, 추천 시스템 및 AI 생성 콘텐츠. EU AI Act 준수.',
+          'categories.aiNotice': '🤖 이 기능은 AI로 구동됩니다.',
+          'categories.alwaysActive': '항상 활성',
+          'details.provider': '제공자:',
+          'details.location': '위치:',
+          'details.duration': '저장 기간:',
+          'details.purpose': '목적:',
+          'details.legalBasis': '법적 근거:',
+          'details.privacy': '개인정보:',
+          'details.privacyLink': '개인정보 처리방침',
+          'details.transfer': '데이터 전송:',
+          'details.notSpecified': '지정되지 않음',
+          'details.consentId': '동의 ID:',
+          'details.lookupTitle': '동의 데이터 조회',
+          'details.details': '상세정보',
+          'services.biscottiDesc': '쿠키 동의 설정을 저장합니다',
+          'services.biscottiPurpose': 'GDPR 제7조에 따른 동의 결정 저장',
+          'services.wordpressDesc': '웹사이트 기능에 기술적으로 필요합니다',
+          'services.wordpressPurpose': '세션 관리, 로그인 상태, 사용자 설정',
+          'tcf.storageDisclosure': '당사와 파트너는 귀하의 기기에 정보를 저장하거나 접근하며(예: 쿠키) 개인 데이터를 처리합니다.',
+          'tcf.dataExamples': '여기에는 IP 주소, 사용 식별자, 브라우징 행동 및 기기 식별자가 포함될 수 있습니다.',
+          'tcf.purposeSummary': '데이터 처리는 광고 개인화, 콘텐츠 측정 및 잠재고객 분석 등의 목적으로 사용됩니다.',
+          'tcf.vendorCount': '당사와 {count}개 파트너가 귀하의 데이터를 처리할 수 있습니다 — 목록 보기',
+          'tcf.vendorCountSingular': '당사와 1개 파트너가 귀하의 데이터를 처리할 수 있습니다 — 목록 보기',
+          'tcf.consentScope': '귀하의 동의는 이 웹사이트에만 적용됩니다.',
+          'tcf.withdrawInfo': '설정을 통해 언제든지 동의를 변경하거나 철회할 수 있습니다.',
+          'tcf.vendorsPerPurpose': '{count}개 파트너',
+          'tcf.iabPartnerSingular': '1개 IAB 인증 파트너',
+          'tcf.iabPartnerPlural': '{count}개 IAB 인증 파트너',
+          'tcf.nonIabPartnerSingular': '1개 추가 제공자',
+          'tcf.nonIabPartnerPlural': '{count}개 추가 제공자',
+          'tcf.partnerCountPrefix': '당사와',
+          'tcf.partnerCountConjunction': '및',
+          'tcf.partnerCountSuffix': '이(가) 이 데이터를 처리할 수 있습니다.',
+          'tcf.cmpStorage': 'Biscotti CMP는 브라우저의 로컬 저장소에 동의 선택을 저장합니다(최대 180일).',
+          'tcf.maxStorage': '최대 저장 기간:',
+          'tcf.days': '일',
+          'tcf.usesNonCookieAccess': '비쿠키 저장소도 사용',
+          'tcf.storageInfo': '저장소 정보',
+          'tcf.specialFeaturesDisclosure': '일부 파트너는 정확한 위치 데이터 또는 식별을 위한 기기 특성 능동 스캔과 같은 특수 기능을 사용합니다.',
+          'tcf.liDisclosure': '일부 파트너는 정당한 이익을 근거로 귀하의 데이터를 처리하며, 귀하는 이에 대해 이의를 제기할 권리가 있습니다.',
+          'tcf.liLinkText': '정당한 이익 관리',
+          'tcf.purposeNames': '목적: {names}.'
+        },
+
+      };
+      
+      // Get translation for detected language, fallback to English, then German, then key
+      const langTranslations = translations[lang] || translations['en'];
+      return langTranslations[key] || translations['en'][key] || translations['de'][key] || key;
+    }
+
+    // Detect which services are actually present on the page
+    _detectActiveServices() {
+      if (this.detectedServices) return this.detectedServices; // Cache result
+
+      const detected = {
+        essential: {
+          // Biscotti CMP is always an essential service
+          biscotti_cmp: {
+            name: 'Biscotti CMP',
+            description: { de: 'Speichert Ihre Cookie-Einwilligungspräferenzen', en: 'Stores your cookie consent preferences', fr: 'Enregistre vos préférences de cookies', es: 'Almacena sus preferencias de cookies', it: 'Memorizza le preferenze sui cookie', nl: 'Slaat uw cookievoorkeuren op', pl: 'Przechowuje preferencje dotyczące plików cookie', pt: 'Armazena as suas preferências de cookies', da: 'Gemmer dine cookiepræferencer' , 'ar': "افتح إعدادات ملفات تعريف الارتباط", 'bg': "Отворете настройките за бисквитки", 'bs': "Otvorite postavke kolačića", 'ca': "Obriu la configuració de les galetes", 'cs': "Otevřete nastavení souborů cookie", 'el': "Ανοίξτε τις ρυθμίσεις cookie", 'eu': "Ireki cookieen ezarpenak", 'fi': "Avaa evästeasetukset", 'gl': "Abre a configuración de cookies", 'he': "פתח את הגדרות העוגיות", 'hi': "कुकी सेटिंग खोलें", 'hr': "Otvorite postavke kolačića", 'hu': "Nyissa meg a cookie-beállításokat", 'id': "Buka pengaturan cookie", 'ja': "クッキー設定を開く", 'lt': "Atidarykite slapukų nustatymus", 'mr': "कुकी सेटिंग्ज उघडा", 'nb': "Åpne innstillinger for informasjonskapsler", 'ro': "Deschideți setările cookie", 'ru': "Открыть настройки файлов cookie", 'sk': "Otvorte nastavenia súborov cookie", 'sl': "Odprite nastavitve piškotkov", 'sr': "Отворите подешавања колачића", 'sv': "Öppna cookie-inställningar", 'th': "เปิดการตั้งค่าคุกกี้", 'tr': "Çerez ayarlarını aç", 'uk': "Відкрийте налаштування файлів cookie" , 'vi': "Lưu trữ các tùy chọn đồng ý cookie của bạn", 'zh': "存储您的 Cookie 同意偏好", 'zh-TW': "儲存您的 Cookie 同意偏好" },
+            cookies: ['biscotti_consent'],
+            duration: { de: '6 Monate', en: '6 months', fr: '6 mois', es: '6 meses', it: '6 mesi', nl: '6 maanden', pl: '6 miesięcy', pt: '6 meses', da: '6 måneder' , 'ar': "6 أشهر", 'bg': "6 месеца", 'bs': "6 mjeseci", 'ca': "6 mesos", 'cs': "6 měsíců", 'el': "6 μηνών", 'eu': "6 hilabete", 'fi': "6 kuukautta", 'gl': "6 meses", 'he': "6 חודשים", 'hi': "6 महीने", 'hr': "6 mjeseci", 'hu': "6 hónap", 'id': "6 bulan", 'ja': "6ヶ月", 'lt': "6 mėn", 'mr': "6 महिने", 'nb': "6 måneder", 'ro': "6 luni", 'ru': "6 месяцев", 'sk': "6 mesiacov", 'sl': "6 mesecev", 'sr': "6 месеци", 'sv': "6 månader", 'th': "6 เดือน", 'tr': "6 ay", 'uk': "6 місяців" , 'vi': "6 tháng", 'zh': "6个月", 'zh-TW': "6個月" },
+            purpose: { de: 'Speicherung der Einwilligungsentscheidung gemäß DSGVO Art. 7', en: 'Storage of consent decision pursuant to GDPR Art. 7', fr: 'Stockage de la décision de consentement conformément au RGPD Art. 7', es: 'Almacenamiento de la decisión de consentimiento según RGPD Art. 7', it: 'Archiviazione della decisione di consenso ai sensi del GDPR Art. 7', nl: 'Opslag van toestemmingsbeslissing conform AVG Art. 7', pl: 'Przechowywanie decyzji o zgodzie zgodnie z RODO Art. 7', pt: 'Armazenamento da decisão de consentimento nos termos do RGPD Art. 7', da: 'Lagring af samtykkeafgørelse i henhold til GDPR Art. 7' , 'ar': "تخزين قرار الموافقة وفقًا للائحة العامة لحماية البيانات (GDPR Art). 7", 'bg': "Съхранение на решението за съгласие съгласно чл. GDPR. 7", 'bs': "Čuvanje odluke o saglasnosti u skladu sa GDPR čl. 7", 'ca': "Emmagatzematge de la decisió de consentiment d'acord amb l'art. 7", 'cs': "Uložení rozhodnutí o souhlasu podle GDPR čl. 7", 'el': "Αποθήκευση απόφασης συναίνεσης σύμφωνα με το άρθρο GDPR. 7", 'eu': "Baimenaren erabakia gordetzea GDPR artikuluaren arabera. 7", 'fi': "Suostumuspäätöksen säilyttäminen GDPR artiklan mukaisesti. 7", 'gl': "Almacenamento da decisión de consentimento segundo o art. 7", 'he': "אחסון החלטת הסכמה בהתאם ל-GDPR Art. 7", 'hi': "जीडीपीआर कला के अनुसार सहमति निर्णय का भंडारण। 7", 'hr': "Pohrana odluke o suglasnosti prema GDPR čl. 7", 'hu': "Hozzájárulási határozat tárolása a GDPR Art. 7", 'id': "Penyimpanan keputusan persetujuan sesuai dengan GDPR Art. 7", 'ja': "GDPR 第 2 条に基づく同意決定の保管7", 'lt': "Sutikimo sprendimo saugojimas pagal BDAR str. 7", 'mr': "GDPR आर्टनुसार संमतीच्या निर्णयाचे स्टोरेज. ७", 'nb': "Lagring av samtykkevedtak i henhold til GDPR Art. 7", 'ro': "Stocarea deciziei de consimțământ în conformitate cu GDPR art. 7", 'ru': "Хранение решения о согласии в соответствии со ст. GDPR. 7", 'sk': "Uloženie rozhodnutia o súhlase podľa GDPR čl. 7", 'sl': "Shranjevanje odločitve o soglasju v skladu z GDPR, čl. 7", 'sr': "Чување одлуке о сагласности у складу са ГДПР чл. 7", 'sv': "Lagring av samtyckesbeslut enligt GDPR Art. 7", 'th': "การจัดเก็บคำตัดสินความยินยอมตาม GDPR Art. 7", 'tr': "GDPR Art. 7", 'uk': "Зберігання рішення про згоду відповідно до GDPR ст. 7" , 'vi': "Lưu trữ quyết định đồng ý theo GDPR Điều 7", 'zh': "根据 GDPR 第7条存储同意决定", 'zh-TW': "根據 GDPR 第 7 條儲存同意決定" },
+            legalBasis: { de: 'Art. 6 Abs. 1 lit. c DSGVO (rechtliche Verpflichtung)', en: 'Art. 6(1)(c) GDPR (legal obligation)', fr: 'Art. 6(1)(c) RGPD (obligation légale)', es: 'Art. 6(1)(c) RGPD (obligación legal)', it: 'Art. 6(1)(c) GDPR (obbligo legale)', nl: 'Art. 6(1)(c) AVG (wettelijke verplichting)', pl: 'Art. 6(1)(c) RODO (obowiązek prawny)', pt: 'Art. 6(1)(c) RGPD (obrigação legal)', da: 'Art. 6(1)(c) GDPR (retlig forpligtelse)' , 'ar': "فن. 6(1)(ج) اللائحة العامة لحماية البيانات (الالتزام القانوني)", 'bg': "Чл. 6(1)(c) GDPR (законово задължение)", 'bs': "Art. 6(1)(c) GDPR (pravna obaveza)", 'ca': "Art. 6(1)(c) GDPR (obligació legal)", 'cs': "umění. 6(1)(c) GDPR (zákonná povinnost)", 'el': "Τέχνη. 6(1)(γ) GDPR (νομική υποχρέωση)", 'eu': "art. 6(1)(c) GDPR (lege betebeharra)", 'fi': "Art. 6(1)(c) GDPR (oikeudellinen velvoite)", 'gl': "Art. 6(1)(c) GDPR (obrigación legal)", 'he': "אמנות. 6(1)(ג) GDPR (התחייבות משפטית)", 'hi': "कला. 6(1)(सी) जीडीपीआर (कानूनी दायित्व)", 'hr': "čl. 6(1)(c) GDPR (zakonska obveza)", 'hu': "Art. GDPR 6. cikk (1) bekezdés c) pont (jogi kötelezettség)", 'id': "Seni. 6(1)(c) GDPR (kewajiban hukum)", 'ja': "アート。 6(1)(c) GDPR (法的義務)", 'lt': "Art. BDAR 6 straipsnio 1 dalies c punktas (teisinė prievolė)", 'mr': "कला. 6(1)(c) GDPR (कायदेशीर बंधन)", 'nb': "Art. 6(1)(c) GDPR (juridisk forpliktelse)", 'ro': "art. 6(1)(c) GDPR (obligație legală)", 'ru': "Искусство. 6(1)(c) GDPR (юридическое обязательство)", 'sk': "čl. 6 ods. 1 písm. c) GDPR (zákonná povinnosť)", 'sl': "Art. 6(1)(c) GDPR (pravna obveznost)", 'sr': "чл. 6(1)(ц) ГДПР (правна обавеза)", 'sv': "Art. 6(1)(c) GDPR (rättslig skyldighet)", 'th': "ศิลปะ 6(1)(c) GDPR (ภาระผูกพันทางกฎหมาย)", 'tr': "Sanat. 6(1)(c) GDPR (yasal zorunluluk)", 'uk': "ст. 6(1)(c) GDPR (юридичне зобов’язання)" , 'vi': "Điều. 6(1)(c) GDPR (nghĩa vụ pháp lý)", 'zh': "通用数据保护条例第6条第1款(c)项（法律义务）", 'zh-TW': "GDPR 第6條第1款(c)項（法律義務）" },
+            recipient: 'Biscotti CMP (Campcruisers GmbH)',
+            vendorLocation: 'Campcruisers GmbH, Berliner Str. 21 B, D-14612 Falkensee, Deutschland',
+            privacyPolicyUrl: 'https://biscotti-cmp.com/de/datenschutz',
+            _privacyUrls: { de: 'https://biscotti-cmp.com/de/datenschutz', en: 'https://biscotti-cmp.com/en/privacy-policy', fr: 'https://biscotti-cmp.com/fr/politique-confidentialite', es: 'https://biscotti-cmp.com/es/politica-privacidad', it: 'https://biscotti-cmp.com/it/privacy-policy', nl: 'https://biscotti-cmp.com/nl/privacybeleid', pl: 'https://biscotti-cmp.com/pl/polityka-prywatnosci', pt: 'https://biscotti-cmp.com/pt/privacy-policy', da: 'https://biscotti-cmp.com/da/privatlivspolitik' },
+            transferSafeguard: { de: 'Keine Übermittlung in Drittländer — alle Daten werden auf Servern in der EU (Niederlande) verarbeitet', en: 'No transfer to third countries — all data is processed on servers in the EU (Netherlands)', fr: 'Aucun transfert vers des pays tiers — données traitées sur des serveurs dans l\'UE (Pays-Bas)', es: 'Sin transferencia a terceros países — datos procesados en servidores de la UE (Países Bajos)', it: 'Nessun trasferimento verso paesi terzi — dati elaborati su server nell\'UE (Paesi Bassi)', nl: 'Geen overdracht naar derde landen — gegevens verwerkt op servers in de EU (Nederland)', pl: 'Brak transferu do krajów trzecich — dane przetwarzane na serwerach w UE (Holandia)', pt: 'Sem transferência para países terceiros — dados processados em servidores na UE (Países Baixos)', da: 'Ingen overførsel til tredjelande — data behandles på servere i EU (Holland)', ar: 'لا نقل إلى دول ثالثة — البيانات تُعالج على خوادم في الاتحاد الأوروبي (هولندا)', bg: 'Без трансфер към трети страни — данните се обработват на сървъри в ЕС (Нидерландия)', bs: 'Nema prijenosa u treće zemlje — podaci se obrađuju na serverima u EU (Holandija)', ca: 'Sense transferència a tercers països — dades processades en servidors de la UE (Països Baixos)', cs: 'Žádný přenos do třetích zemí — data zpracovávána na serverech v EU (Nizozemsko)', el: 'Χωρίς μεταφορά σε τρίτες χώρες — δεδομένα επεξεργάζονται σε διακομιστές στην ΕΕ (Ολλανδία)', eu: 'Ez dago transferentziarik hirugarren herrialdeetara — datuak EBko (Herbehereak) zerbitzarietan prozesatzen dira', fi: 'Ei siirtoa kolmansiin maihin — tiedot käsitellään EU:n (Alankomaat) palvelimilla', gl: 'Sen transferencia a terceiros países — datos procesados en servidores da UE (Países Baixos)', he: 'אין העברה למדינות שלישיות — נתונים מעובדים בשרתים באיחוד האירופי (הולנד)', hi: 'तीसरे देशों में कोई स्थानांतरण नहीं — डेटा EU (नीदरलैंड) में सर्वर पर संसाधित किया जाता है', hr: 'Nema prijenosa u treće zemlje — podaci se obrađuju na poslužiteljima u EU (Nizozemska)', hu: 'Nincs adattovábbítás harmadik országokba — adatok feldolgozása EU-ban (Hollandia) lévő szervereken', id: 'Tidak ada transfer ke negara ketiga — data diproses di server di UE (Belanda)', ja: '第三国への転送なし — データはEU（オランダ）のサーバーで処理されます', lt: 'Nėra perdavimo į trečiąsias šalis — duomenys apdorojami ES (Nyderlandai) serveriuose', mr: 'तृतीय देशांमध्ये हस्तांतरण नाही — डेटा EU (नेदरलँड) मधील सर्व्हरवर प्रक्रिया केला जातो', nb: 'Ingen overføring til tredjeland — data behandles på servere i EU (Nederland)', ro: 'Fără transfer către țări terțe — datele sunt procesate pe servere din UE (Țările de Jos)', ru: 'Без передачи в третьи страны — данные обрабатываются на серверах в ЕС (Нидерланды)', sk: 'Žiadny prenos do tretích krajín — údaje spracúvané na serveroch v EÚ (Holandsko)', sl: 'Brez prenosa v tretje države — podatki se obdelujejo na strežnikih v EU (Nizozemska)', sr: 'Нема преноса у треће земље — подаци се обрађују на серверима у ЕУ (Холандија)', sv: 'Ingen överföring till tredje land — data behandlas på servrar i EU (Nederländerna)', th: 'ไม่มีการถ่ายโอนไปยังประเทศที่สาม — ข้อมูลถูกประมวลผลบนเซิร์ฟเวอร์ในสหภาพยุโรป (เนเธอร์แลนด์)', tr: 'Üçüncü ülkelere aktarım yok — veriler AB\'deki (Hollanda) sunucularda işlenir', uk: 'Без передачі в треті країни — дані обробляються на серверах в ЄС (Нідерланди)', vi: 'Không chuyển giao sang nước thứ ba — dữ liệu được xử lý trên máy chủ tại EU (Hà Lan)', zh: '不向第三国传输——数据在欧盟（荷兰）服务器上处理', 'zh-TW': '不向第三國傳輸——資料在歐盟（荷蘭）伺服器上處理' },
+            patterns: []
+          }
+        },
+        analytics: {},
+        marketing: {},
+        functional: {}
+      };
+
+      // WordPress detection: only add if the site actually runs WordPress
+      const isWordPress = !!(
+        document.querySelector('meta[name="generator"][content*="WordPress"]') ||
+        document.querySelector('link[href*="wp-content"]') ||
+        document.querySelector('link[href*="wp-includes"]') ||
+        document.querySelector('script[src*="wp-content"]') ||
+        document.querySelector('script[src*="wp-includes"]') ||
+        document.querySelector('link[rel="https://api.w.org/"]') ||
+        window.wp || window.wpApiSettings
+      );
+
+      if (isWordPress) {
+        detected.essential.wordpress_core = {
+          name: 'WordPress',
+          description: { de: 'Technisch notwendig für Website-Funktionen', en: 'Technically necessary for website functionality', fr: 'Techniquement nécessaire au fonctionnement du site', es: 'Técnicamente necesario para el funcionamiento del sitio', it: 'Tecnicamente necessario per il funzionamento del sito', nl: 'Technisch noodzakelijk voor websitefunctionaliteit', pl: 'Technicznie niezbędne do funkcjonowania strony', pt: 'Tecnicamente necessário para o funcionamento do website', da: 'Teknisk nødvendigt for hjemmesidens funktionalitet' , 'ar': "ضرورية من الناحية الفنية لوظيفة الموقع", 'bg': "Технически необходимо за функционалността на сайта", 'bs': "Tehnički potrebno za funkcionalnost web stranice", 'ca': "Tècnicament necessari per a la funcionalitat del lloc web", 'cs': "Technicky nezbytné pro funkčnost webu", 'el': "Τεχνικά απαραίτητο για τη λειτουργικότητα του ιστότοπου", 'eu': "Webgunearen funtzionaltasunerako beharrezkoa da teknikoki", 'fi': "Teknisesti välttämätön sivuston toiminnalle", 'gl': "Técnicamente necesario para a funcionalidade do sitio web", 'he': "הכרחי מבחינה טכנית לפונקציונליות האתר", 'hi': "वेबसाइट की कार्यक्षमता के लिए तकनीकी रूप से आवश्यक", 'hr': "Tehnički potrebno za funkcionalnost web stranice", 'hu': "Technikailag szükséges a weboldal működéséhez", 'id': "Secara teknis diperlukan untuk fungsionalitas situs web", 'ja': "ウェブサイトの機能に技術的に必要", 'lt': "Techniškai būtina svetainės funkcionalumui", 'mr': "वेबसाइट कार्यक्षमतेसाठी तांत्रिकदृष्ट्या आवश्यक", 'nb': "Teknisk nødvendig for nettsidens funksjonalitet", 'ro': "Este necesar din punct de vedere tehnic pentru funcționalitatea site-ului", 'ru': "Технически необходимо для функциональности сайта.", 'sk': "Technicky nevyhnutné pre funkčnosť webu", 'sl': "Tehnično potrebno za funkcionalnost spletne strani", 'sr': "Технички неопходно за функционалност веб странице", 'sv': "Tekniskt nödvändigt för webbplatsens funktionalitet", 'th': "จำเป็นทางเทคนิคสำหรับการทำงานของเว็บไซต์", 'tr': "Web sitesinin işlevselliği için teknik olarak gerekli", 'uk': "Технічно необхідний для функціонування сайту" , 'vi': "Cần thiết về mặt kỹ thuật cho chức năng của trang web", 'zh': "网站功能所必需的技术", 'zh-TW': "網站功能上技術上必要" },
+          cookies: ['wordpress_logged_in_*', 'wordpress_sec_*', 'wp-settings-*', 'PHPSESSID'],
+          duration: { de: 'Session / 1 Jahr', en: 'Session / 1 year', fr: 'Session / 1 an', es: 'Sesión / 1 año', it: 'Sessione / 1 anno', nl: 'Sessie / 1 jaar', pl: 'Sesja / 1 rok', pt: 'Sessão / 1 ano', da: 'Session / 1 år' , 'ar': "الدورة / سنة", 'bg': "Сесия / 1г", 'bs': "Sesija / 1 godina", 'ca': "Sessió / 1 any", 'cs': "Zasedání / 1 rok", 'el': "Συνεδρία / 1 έτος", 'eu': "Saioa / 1 urte", 'fi': "Istunto / 1 vuosi", 'gl': "Sesión / 1 ano", 'he': "מפגש / שנה", 'hi': "सत्र/1 वर्ष", 'hr': "Sjednica / 1 godina", 'hu': "Szekció / 1 év", 'id': "Sesi / 1 tahun", 'ja': "セッション / 1年", 'lt': "Sesija / 1 metai", 'mr': "सत्र / 1 वर्ष", 'nb': "Økt / 1 år", 'ro': "Sesiune / 1 an", 'ru': "Сессия / 1 год", 'sk': "Relácia / 1 rok", 'sl': "Seja / 1 leto", 'sr': "Сесија / 1 год", 'sv': "Session / 1 år", 'th': "เซสชัน / 1 ปี", 'tr': "Oturum / 1 yıl", 'uk': "Сесія / 1 рік" , 'vi': "Phiên / 1 năm", 'zh': "课程 / 1年", 'zh-TW': "課程 / 1 年" },
+          purpose: { de: 'Session-Verwaltung, Login-Status, Benutzereinstellungen', en: 'Session management, login status, user preferences', fr: 'Gestion de session, statut de connexion, préférences utilisateur', es: 'Gestión de sesiones, estado de inicio de sesión, preferencias del usuario', it: 'Gestione sessione, stato login, preferenze utente', nl: 'Sessiebeheer, inlogstatus, gebruikersvoorkeuren', pl: 'Zarządzanie sesją, status logowania, preferencje użytkownika', pt: 'Gestão de sessão, estado de login, preferências do utilizador', da: 'Sessionsstyring, login-status, brugerindstillinger' , 'ar': "إدارة الجلسة، وحالة تسجيل الدخول، وتفضيلات المستخدم", 'bg': "Управление на сесии, състояние на влизане, потребителски предпочитания", 'bs': "Upravljanje sesijom, status prijave, korisničke postavke", 'ca': "Gestió de sessions, estat d'inici de sessió, preferències de l'usuari", 'cs': "Správa relací, stav přihlášení, uživatelské preference", 'el': "Διαχείριση συνεδρίας, κατάσταση σύνδεσης, προτιμήσεις χρήστη", 'eu': "Saioaren kudeaketa, saioa hasteko egoera, erabiltzailearen hobespenak", 'fi': "Istunnon hallinta, kirjautumistila, käyttäjäasetukset", 'gl': "Xestión de sesións, estado de inicio de sesión, preferencias do usuario", 'he': "ניהול מפגשים, סטטוס התחברות, העדפות משתמש", 'hi': "सत्र प्रबंधन, लॉगिन स्थिति, उपयोगकर्ता प्राथमिकताएँ", 'hr': "Upravljanje sesijom, status prijave, korisničke postavke", 'hu': "Munkamenet-kezelés, bejelentkezési állapot, felhasználói beállítások", 'id': "Manajemen sesi, status login, preferensi pengguna", 'ja': "セッション管理、ログインステータス、ユーザー設定", 'lt': "Seanso valdymas, prisijungimo būsena, vartotojo nuostatos", 'mr': "सत्र व्यवस्थापन, लॉगिन स्थिती, वापरकर्ता प्राधान्ये", 'nb': "Sesjonsadministrasjon, påloggingsstatus, brukerpreferanser", 'ro': "Gestionarea sesiunii, starea de conectare, preferințele utilizatorului", 'ru': "Управление сеансом, статус входа, настройки пользователя", 'sk': "Správa relácií, stav prihlásenia, používateľské preferencie", 'sl': "Upravljanje seje, status prijave, uporabniške nastavitve", 'sr': "Управљање сесијом, статус пријаве, корисничка подешавања", 'sv': "Sessionshantering, inloggningsstatus, användarpreferenser", 'th': "การจัดการเซสชัน สถานะการเข้าสู่ระบบ การตั้งค่าผู้ใช้", 'tr': "Oturum yönetimi, oturum açma durumu, kullanıcı tercihleri", 'uk': "Управління сеансом, статус входу, налаштування користувача" , 'vi': "Quản lý phiên, trạng thái đăng nhập, tùy chọn người dùng", 'zh': "会话管理、登录状态、用户偏好", 'zh-TW': "會話管理、登入狀態、使用者偏好" },
+          legalBasis: { de: 'Art. 6 Abs. 1 lit. f DSGVO (berechtigtes Interesse)', en: 'Art. 6(1)(f) GDPR (legitimate interest)', fr: 'Art. 6(1)(f) RGPD (intérêt légitime)', es: 'Art. 6(1)(f) RGPD (interés legítimo)', it: 'Art. 6(1)(f) GDPR (interesse legittimo)', nl: 'Art. 6(1)(f) AVG (gerechtvaardigd belang)', pl: 'Art. 6(1)(f) RODO (prawnie uzasadniony interes)', pt: 'Art. 6(1)(f) RGPD (interesse legítimo)', da: 'Art. 6(1)(f) GDPR (berettiget interesse)' , 'ar': "فن. 6(1)(و) القانون العام لحماية البيانات (المصلحة المشروعة)", 'bg': "Чл. 6(1)(f) GDPR (легитимен интерес)", 'bs': "Art. 6(1)(f) GDPR (legitimni interes)", 'ca': "Art. 6(1)(f) GDPR (interès legítim)", 'cs': "umění. 6(1)(f) GDPR (oprávněný zájem)", 'el': "Τέχνη. 6(1)(στ) GDPR (νόμιμο συμφέρον)", 'eu': "art. 6(1)(f) GDPR (interes legitimoa)", 'fi': "Art. GDPR 6(1)(f) (oikeutettu etu)", 'gl': "Art. 6(1)(f) GDPR (interese lexítimo)", 'he': "אמנות. 6(1)(ו) GDPR (אינטרס לגיטימי)", 'hi': "कला. 6(1)(एफ) जीडीपीआर (वैध हित)", 'hr': "čl. 6(1)(f) GDPR (legitimni interes)", 'hu': "Art. GDPR 6. cikk (1) bekezdés f) pont (jogos érdek)", 'id': "Seni. 6(1)(f) GDPR (kepentingan yang sah)", 'ja': "アート。 6(1)(f) GDPR (正当な利益)", 'lt': "Art. BDAR 6 straipsnio 1 dalies f punktas (teisėtas interesas)", 'mr': "कला. 6(1)(f) GDPR (कायदेशीर व्याज)", 'nb': "Art. 6(1)(f) GDPR (legitime interesse)", 'ro': "art. 6(1)(f) GDPR (interes legitim)", 'ru': "Искусство. 6(1)(f) GDPR (законный интерес)", 'sk': "čl. 6 ods. 1 písm. f) GDPR (oprávnený záujem)", 'sl': "Art. 6(1)(f) GDPR (legitimni interes)", 'sr': "чл. 6(1)(ф) ГДПР (легитимни интерес)", 'sv': "Art. 6(1)(f) GDPR (berättigat intresse)", 'th': "ศิลปะ 6(1)(f) GDPR (ประโยชน์โดยชอบด้วยกฎหมาย)", 'tr': "Sanat. 6(1)(f) GDPR (meşru menfaat)", 'uk': "ст. 6(1)(f) GDPR (законний інтерес)" , 'vi': "Điều. 6(1)(f) GDPR (lợi ích hợp pháp)", 'zh': "《通用数据保护条例》第6条第1款(f)项（合法利益）", 'zh-TW': "GDPR 第6條第1款(f)項（合法利益）" },
+          recipient: { de: 'Websitebetreiber', en: 'Website operator', fr: 'Exploitant du site', es: 'Operador del sitio web', it: 'Operatore del sito', nl: 'Website-eigenaar', pl: 'Operator strony', pt: 'Operador do website', da: 'Webstedsoperatør' , 'ar': "مشغل الموقع", 'bg': "Оператор на уебсайт", 'bs': "Operater web stranice", 'ca': "Operador del lloc web", 'cs': "Provozovatel webu", 'el': "Χειριστής ιστότοπου", 'eu': "Webgunearen operadorea", 'fi': "Verkkosivuston ylläpitäjä", 'gl': "Operador do sitio web", 'he': "מפעיל אתר", 'hi': "वेबसाइट संचालक", 'hr': "Operater web stranice", 'hu': "Weboldal üzemeltetője", 'id': "Operator situs web", 'ja': "ウェブサイト運営者", 'lt': "Svetainės operatorius", 'mr': "वेबसाइट ऑपरेटर", 'nb': "Nettstedsoperatør", 'ro': "Operator de site", 'ru': "Оператор сайта", 'sk': "Prevádzkovateľ webovej stránky", 'sl': "Operater spletne strani", 'sr': "Оператер веб странице", 'sv': "Webbplatsoperatör", 'th': "ผู้ดำเนินการเว็บไซต์", 'tr': "Web sitesi operatörü", 'uk': "Оператор сайту" , 'vi': "Nhà điều hành trang web", 'zh': "网站运营者", 'zh-TW': "網站營運者" },
+          patterns: []
+        };
+      }
+
+      // Get all scripts (including blocked ones)
+      const scripts = document.querySelectorAll('script[src], script[data-src], script[type="text/plain"]');
+      const iframes = document.querySelectorAll('iframe[src], iframe[data-src]');
+      const allSrcs = [];
+
+      scripts.forEach(s => {
+        const src = s.src || s.dataset.src || s.getAttribute('data-original-src') || '';
+        if (src) allSrcs.push(src.toLowerCase());
+      });
+
+      iframes.forEach(i => {
+        const src = i.src || i.dataset.src || '';
+        if (src) allSrcs.push(src.toLowerCase());
+      });
+
+      // Also check for inline scripts containing certain patterns
+      // IMPORTANT: Skip non-executable scripts like JSON-LD (type="application/ld+json")
+      // which contain metadata (e.g. social media profile URLs in sameAs arrays)
+      // that would cause false positives (e.g. tiktok.com/@username ≠ TikTok Pixel)
+      const inlineScripts = document.querySelectorAll('script:not([src])');
+      const inlineContent = [];
+      inlineScripts.forEach(s => {
+        const scriptType = (s.type || '').toLowerCase();
+        // Skip non-executable script types (JSON-LD, templates, etc.)
+        if (scriptType === 'application/ld+json' || 
+            scriptType === 'text/template' ||
+            scriptType === 'text/x-template' ||
+            scriptType === 'text/html') {
+          return; // Skip metadata/template scripts
+        }
+        if (s.textContent) inlineContent.push(s.textContent.toLowerCase());
+      });
+
+      // Check each provider against found sources
+      for (const [category, services] of Object.entries(PROVIDER_DATABASE)) {
+        for (const [serviceKey, service] of Object.entries(services)) {
+          const isFound = service.patterns.some(pattern => {
+            const patternLower = pattern.toLowerCase();
+            // Check script/iframe sources
+            const foundInSrc = allSrcs.some(src => src.includes(patternLower));
+            // Check inline scripts
+            const foundInline = inlineContent.some(content => content.includes(patternLower));
+            return foundInSrc || foundInline;
+          });
+
+          if (isFound) {
+            detected[category][serviceKey] = service;
+          }
+        }
+      }
+
+      // =====================================================================
+      // MERGE SERVICES FROM API CONFIG (scanner-detected, stored in DB)
+      // These take priority as they are verified by the scanner
+      // DEDUPLICATION: Build global name index from ALL already-detected services
+      // =====================================================================
+      
+      // Build a GLOBAL set of normalized service names already present
+      // across ALL categories (hardcoded + PROVIDER_DATABASE detected)
+      const existingNames = new Set();
+      for (const [cat, services] of Object.entries(detected)) {
+        for (const [key, svc] of Object.entries(services)) {
+          existingNames.add((svc.name || key).toLowerCase().replace(/\s+/g, '_'));
+          // Also add common variations
+          existingNames.add(key);
+        }
+      }
+      
+      // Additional patterns to always skip (consent-related services that
+      // are already covered by the hardcoded biscotti_cmp entry)
+      const skipPatterns = [
+        'cookie_consent', 'gdpr_consent', 'consent_storage',
+        'wp_consent', 'wp_core', 'php_session'
+      ];
+      
+      if (this.engine && this.engine.config && this.engine.config.services) {
+        const apiServices = this.engine.config.services;
+        const seenApiNames = new Set(); // Track seen API service names
+        
+        for (const svc of apiServices) {
+          const category = svc.category || 'functional';
+          const normalizedName = (svc.name || '').toLowerCase().replace(/\s+/g, '_');
+          
+          // Skip if this service name already exists in detected services
+          // (from hardcoded or PROVIDER_DATABASE detection)
+          if (existingNames.has(normalizedName)) {
+            console.log('[Biscotti] Skipping API service (already detected):', svc.name);
+            // Merge in any additional GDPR fields from API
+            for (const [cat, services] of Object.entries(detected)) {
+              for (const [key, existing] of Object.entries(services)) {
+                const existNorm = (existing.name || key).toLowerCase().replace(/\s+/g, '_');
+                if (existNorm === normalizedName || key === normalizedName) {
+                  if (!existing.storageDuration && svc.storageDuration) existing.storageDuration = svc.storageDuration;
+                  if (!existing.vendor && svc.vendor) existing.vendor = svc.vendor;
+                  if (!existing.vendorLocation && svc.vendorLocation) existing.vendorLocation = svc.vendorLocation;
+                  if (!existing.privacyPolicyUrl && svc.privacyPolicyUrl) existing.privacyPolicyUrl = svc.privacyPolicyUrl;
+                  if (!existing.legalBasis && svc.legalBasis) existing.legalBasis = svc.legalBasis;
+                  break;
+                }
+              }
+            }
+            continue;
+          }
+          
+          // Skip if this service matches a hardcoded skip pattern
+          const shouldSkip = skipPatterns.some(pattern => 
+            normalizedName.includes(pattern) || svc.name.toLowerCase().includes(pattern)
+          );
+          if (shouldSkip) {
+            console.log('[Biscotti] Skipping consent-related service:', svc.name);
+            continue;
+          }
+          
+          // Skip if we've already processed this API service name
+          if (seenApiNames.has(normalizedName)) {
+            console.log('[Biscotti] Skipping duplicate API service:', svc.name);
+            continue;
+          }
+          seenApiNames.add(normalizedName);
+          existingNames.add(normalizedName); // Prevent further dupes
+          
+          // Initialize category if needed
+          if (!detected[category]) {
+            detected[category] = {};
+          }
+          
+          // Add service from API config with ALL GDPR fields
+          detected[category][normalizedName] = {
+            name: svc.name,
+            description: svc.description || '',
+            cookies: [],
+            storageItems: svc.storageItems || 0,
+            isRequired: svc.isRequired || false,
+            // GDPR Art. 13 required fields
+            storageDuration: svc.storageDuration || null,
+            vendor: svc.vendor || null,
+            vendorLocation: svc.vendorLocation || null,
+            privacyPolicyUrl: svc.privacyPolicyUrl || null,
+            legalBasis: svc.legalBasis || null,
+            gvlVendorId: svc.gvlVendorId != null ? svc.gvlVendorId : null,
+            fromApi: true
+          };
+        }
+        console.log('[Biscotti] Merged API services:', apiServices.length, '(existing names:', existingNames.size, ')');
+      }
+
+      // =====================================================================
+      // CLIENT-SIDE COOKIE NAME PATTERNS
+      // Used to group/recategorize scanned cookies before creating entries
+      // =====================================================================
+      const CLIENT_COOKIE_PATTERNS = [
+        // PixelYourSite — group all pys_* cookies under one service
+        { pattern: /^pys_|^pysTrafficSource$|^last_pys/, name: 'PixelYourSite', category: 'analytics', provider: 'PixelYourSite' },
+        // PHP Session — essential, not marketing
+        { pattern: /^PHPSESSID$/i, name: null, category: 'essential', provider: null },
+        // WordPress cookies — essential
+        { pattern: /^wordpress_|^wp-settings-/, name: null, category: 'essential', provider: null },
+        // Microsoft Clarity — analytics, not marketing
+        { pattern: /^CLID$|^_clck$|^_clsk$/, name: 'Microsoft Clarity', category: 'analytics', provider: 'Microsoft Clarity' },
+      ];
+
+      // =====================================================================
+      // MERGE SCANNED COOKIES FROM WORDPRESS PLUGIN (BiscottiConfig)
+      // Ensures every cookie found by the scanner appears in the banner
+      // under its correct category
+      // =====================================================================
+      const scannedCookies = (window.BiscottiConfig && window.BiscottiConfig.scannedCookies) || [];
+      if (scannedCookies.length > 0) {
+        const coveredCookies = {};
+        for (const [cat, services] of Object.entries(detected)) {
+          for (const [key, svc] of Object.entries(services)) {
+            if (svc.cookies && Array.isArray(svc.cookies)) {
+              for (const cookieName of svc.cookies) {
+                const baseName = cookieName.replace(/\*$/, '').replace(/-\*$/, '');
+                coveredCookies[baseName] = { category: cat, serviceKey: key };
+                coveredCookies[cookieName] = { category: cat, serviceKey: key };
+              }
+            }
+          }
+        }
+
+        // ---------------------------------------------------------------
+        // FIRST PASS: Categorize cookies using CLIENT_COOKIE_PATTERNS,
+        // then group by resolved provider name
+        // ---------------------------------------------------------------
+        const websiteDomain = (window.location.hostname || '').replace(/^www\./, '');
+        const providerGroups = {}; // key: resolvedProvider, value: { category, cookies[], provider }
+
+        for (const cookie of scannedCookies) {
+          const cookieName = cookie.name || '';
+          if (!cookieName) continue;
+
+          let scanCategory = (cookie.category || 'functional').toLowerCase();
+          if (scanCategory === 'statistics') scanCategory = 'analytics';
+          const provider = cookie.provider || 'Unknown';
+          const cookieDomain = (cookie.domain || '').replace(/^\./, '');
+
+          // Check if already covered by existing detected services
+          let alreadyCovered = false;
+          if (coveredCookies[cookieName]) {
+            alreadyCovered = true;
+          }
+          if (!alreadyCovered) {
+            for (const [pattern, info] of Object.entries(coveredCookies)) {
+              if (pattern.endsWith('*') && cookieName.startsWith(pattern.slice(0, -1))) {
+                alreadyCovered = true;
+                break;
+              }
+              if (cookieName.startsWith(pattern) || pattern.startsWith(cookieName)) {
+                alreadyCovered = true;
+                break;
+              }
+            }
+          }
+          if (alreadyCovered) continue;
+
+          // Match against CLIENT_COOKIE_PATTERNS
+          let matched = null;
+          for (const pat of CLIENT_COOKIE_PATTERNS) {
+            if (pat.pattern.test(cookieName)) {
+              matched = pat;
+              break;
+            }
+          }
+
+          let resolvedProvider, resolvedCategory;
+          if (matched) {
+            resolvedCategory = matched.category || scanCategory;
+            if (matched.name) {
+              // Named pattern (e.g., PixelYourSite, Microsoft Clarity) — group under that name
+              resolvedProvider = matched.name;
+            } else if (matched.provider === null) {
+              // Null provider (e.g., PHPSESSID, wordpress_*) — already covered by WordPress/essential
+              // Skip these — they're covered by the hardcoded WordPress entry or are essential
+              continue;
+            } else {
+              resolvedProvider = provider;
+            }
+          } else {
+            resolvedCategory = scanCategory;
+            // For first-party cookies (domain matches website), group under "Website Cookies"
+            const isFirstParty = !cookieDomain || cookieDomain === websiteDomain || websiteDomain.endsWith('.' + cookieDomain) || cookieDomain.endsWith('.' + websiteDomain);
+            if (isFirstParty && (provider === 'Unknown' || provider === cookieDomain || provider === websiteDomain)) {
+              resolvedProvider = 'Website Cookies';
+              resolvedCategory = 'functional'; // First-party unknown cookies default to functional
+            } else {
+              resolvedProvider = provider;
+            }
+          }
+
+          // Group by resolved provider
+          const groupKey = resolvedProvider.toLowerCase().replace(/\s+/g, '_');
+          if (!providerGroups[groupKey]) {
+            providerGroups[groupKey] = {
+              provider: resolvedProvider,
+              category: resolvedCategory,
+              cookies: []
+            };
+          }
+          providerGroups[groupKey].cookies.push(cookieName);
+          // Use the most specific category (pattern override wins)
+          if (matched && matched.category) {
+            providerGroups[groupKey].category = matched.category;
+          }
+        }
+
+        // ---------------------------------------------------------------
+        // SECOND PASS: Create ONE service entry per provider group
+        // Deduplication uses existingNames (same Set as API merge) for
+        // consistent normalization. When a match is found, merge cookies
+        // into the existing entry instead of silently dropping them.
+        // ---------------------------------------------------------------
+        for (const [groupKey, group] of Object.entries(providerGroups)) {
+          const targetCategory = group.category;
+          if (!detected[targetCategory]) detected[targetCategory] = {};
+
+          // Check if this provider already exists using consistent normalization
+          const normalizedGroupKey = groupKey.toLowerCase().replace(/\s+/g, '_');
+          
+          // Check existingNames set (shared with API merge) for cross-source dedup
+          let alreadyExists = false;
+          let existingEntry = null;
+          
+          if (existingNames.has(normalizedGroupKey)) {
+            alreadyExists = true;
+          }
+          
+          // Also check across all categories by iterating detected services
+          if (!alreadyExists) {
+            for (const [cat, services] of Object.entries(detected)) {
+              for (const [key, svc] of Object.entries(services)) {
+                const svcNorm = (svc.name || key).toLowerCase().replace(/\s+/g, '_');
+                if (svcNorm === normalizedGroupKey || key === normalizedGroupKey) {
+                  alreadyExists = true;
+                  existingEntry = svc;
+                  break;
+                }
+              }
+              if (alreadyExists) break;
+            }
+          } else {
+            // Find the existing entry to merge cookies into
+            for (const [cat, services] of Object.entries(detected)) {
+              for (const [key, svc] of Object.entries(services)) {
+                const svcNorm = (svc.name || key).toLowerCase().replace(/\s+/g, '_');
+                if (svcNorm === normalizedGroupKey || key === normalizedGroupKey) {
+                  existingEntry = svc;
+                  break;
+                }
+              }
+              if (existingEntry) break;
+            }
+          }
+          
+          // If provider already exists, merge cookie names into existing entry
+          if (alreadyExists) {
+            if (existingEntry && existingEntry.cookies && Array.isArray(existingEntry.cookies)) {
+              for (const cookieName of group.cookies) {
+                if (!existingEntry.cookies.includes(cookieName)) {
+                  existingEntry.cookies.push(cookieName);
+                }
+              }
+            }
+            continue;
+          }
+
+          // Get category-appropriate description/purpose/legalBasis
+          let description = '', purpose = '', legalBasis = '';
+          if (targetCategory === 'essential') {
+            description = { de: 'Technisch notwendig für Website-Funktionen', en: 'Technically necessary for website functionality' };
+            purpose = { de: 'Kernfunktionalität der Website', en: 'Core website functionality' };
+            legalBasis = { de: 'Art. 6 Abs. 1 lit. f DSGVO (berechtigtes Interesse)', en: 'Art. 6(1)(f) GDPR (legitimate interest)' };
+          } else if (targetCategory === 'functional') {
+            description = { de: 'Ermöglicht erweiterte Funktionen und Personalisierung', en: 'Enable enhanced functionality and personalisation' };
+            purpose = { de: 'Benutzereinstellungen und Präferenzen', en: 'User settings and preferences' };
+            legalBasis = { de: 'Art. 6 Abs. 1 lit. f DSGVO (berechtigtes Interesse)', en: 'Art. 6(1)(f) GDPR (legitimate interest)' };
+          } else if (targetCategory === 'analytics') {
+            description = { de: 'Hilft uns zu verstehen, wie Besucher die Website nutzen', en: 'Help us understand how our website is used' };
+            purpose = { de: 'Website-Nutzungsanalyse', en: 'Website usage analysis' };
+            legalBasis = { de: 'Art. 6 Abs. 1 lit. a DSGVO (Einwilligung)', en: 'Art. 6(1)(a) GDPR (Consent)' };
+          } else if (targetCategory === 'marketing') {
+            description = { de: 'Wird für Werbezwecke und Tracking verwendet', en: 'Used for advertising and cross-site tracking' };
+            purpose = { de: 'Zielgerichtete Werbung', en: 'Targeted advertising' };
+            legalBasis = { de: 'Art. 6 Abs. 1 lit. a DSGVO (Einwilligung)', en: 'Art. 6(1)(a) GDPR (Consent)' };
+          }
+
+          detected[targetCategory][groupKey] = {
+            name: group.provider,
+            description: description,
+            cookies: group.cookies,
+            duration: { de: 'Session / 1 Jahr', en: 'Session / 1 year' },
+            purpose: purpose,
+            legalBasis: legalBasis,
+            recipient: group.provider,
+            fromScanner: true
+          };
+          existingNames.add(groupKey); // Track for cross-source dedup
+        }
+        console.log('[Biscotti] Merged scanned cookies:', scannedCookies.length, '→', Object.keys(providerGroups).length, 'provider groups');
+      }
+
+      this.detectedServices = detected;
+      console.log('[Biscotti] Detected services:', detected);
+      return detected;
+    }
+
+    createStyles() {
+      const styleId = 'biscotti-banner-styles';
+      if (document.getElementById(styleId)) return;
+
+      // Get theme from engine config (with fallbacks to original defaults)
+      // Check both this.engine.config.theme and this.engine.config.banner.theme
+      const theme = this.engine?.config?.theme || (this.engine?.config?.banner ? this.engine.config.banner.theme : {}) || {};
+      
+      const primaryColor = theme.primaryColor || '#9B6B3C';
+      const backgroundColor = theme.backgroundColor || '#1a1a2e';
+      const textColor = theme.textColor || '#ffffff';
+      const borderRadius = theme.borderRadius != null ? theme.borderRadius : 16;
+      const buttonStyle = theme.buttonStyle || 'rounded';
+      const position = theme.position || 'bottom-center';
+      
+      console.log('[Biscotti] Applying Banner UI styles with theme:', { primaryColor, backgroundColor, textColor, borderRadius, buttonStyle, position });
+      
+      // Calculate derived colors or use theme provided ones
+      const primaryDark = theme.primaryDark || (this.engine?._darkenColor ? this.engine._darkenColor(primaryColor, 10) : '#8B5A2B');
+      const bgDark = theme.bgDark || (this.engine?._darkenColor ? this.engine._darkenColor(backgroundColor, 5) : '#16213e');
+      const textMuted = theme.textMuted || (this.engine?._adjustOpacity ? this.engine._adjustOpacity(textColor, 0.7) : 'rgba(255, 255, 255, 0.7)');
+
+      // Compute position styles from theme.position
+      let positionCSS = 'bottom: 20px; left: 50%; transform: translateX(-50%) translateY(100%);';
+      let visibleTransform = 'transform: translateX(-50%) translateY(0);';
+      if (position === 'bottom-left') {
+        positionCSS = 'bottom: 20px; left: 20px; transform: translateY(100%);';
+        visibleTransform = 'transform: translateY(0);';
+      } else if (position === 'bottom-right') {
+        positionCSS = 'bottom: 20px; right: 20px; transform: translateY(100%);';
+        visibleTransform = 'transform: translateY(0);';
+      } else if (position === 'top-center') {
+        positionCSS = 'top: 20px; left: 50%; transform: translateX(-50%) translateY(-100%);';
+        visibleTransform = 'transform: translateX(-50%) translateY(0);';
+      } else if (position === 'bottom-bar') {
+        positionCSS = 'bottom: 0; left: 0; right: 0; transform: translateY(100%);';
+        visibleTransform = 'transform: translateY(0);';
+      } else if (position === 'top-bar') {
+        positionCSS = 'top: 0; left: 0; right: 0; transform: translateY(-100%);';
+        visibleTransform = 'transform: translateY(0);';
+      }
+
+      // Compute button border-radius from buttonStyle
+      let btnRadius = `${Math.max(borderRadius / 2, 4)}px`;
+      if (buttonStyle === 'pill') btnRadius = '999px';
+      else if (buttonStyle === 'square') btnRadius = '4px';
+
+      const style = document.createElement('style');
+      style.id = styleId;
+      style.textContent = `
+        :root {
+          --biscotti-primary-color: ${primaryColor};
+          --biscotti-primary-dark: ${primaryDark};
+          --biscotti-bg-color: ${backgroundColor};
+          --biscotti-bg-dark: ${bgDark};
+          --biscotti-text-color: ${textColor};
+          --biscotti-text-muted: ${textMuted};
+          --biscotti-border-radius: ${borderRadius}px;
+          --biscotti-btn-radius: ${btnRadius};
+        }
+        #biscotti-banner-overlay {
+          position: fixed;
+          inset: 0;
+          background: rgba(0, 0, 0, 0.6);
+          z-index: 999999;
+          opacity: 0;
+          visibility: hidden;
+          transition: opacity 0.3s, visibility 0.3s;
+        }
+        #biscotti-banner-overlay.visible {
+          opacity: 1;
+          visibility: visible;
+        }
+        #biscotti-banner {
+          position: fixed;
+          ${positionCSS}
+          background: linear-gradient(135deg, var(--biscotti-bg-color) 0%, var(--biscotti-bg-dark) 100%);
+          border-radius: ${position.includes('bar') ? '0' : 'var(--biscotti-border-radius, 16px)'};
+          box-shadow: 0 8px 32px rgba(0, 0, 0, 0.4);
+          padding: 0;
+          max-width: ${position.includes('bar') ? '100%' : '480px'};
+          width: ${position.includes('bar') ? '100%' : 'calc(100% - 40px)'};
+          max-height: ${position.includes('bar') ? '50vh' : 'calc(100vh - 40px)'};
+          overflow: hidden;
+          box-sizing: border-box;
+          z-index: 1000000;
+          font-family: var(--biscotti-font-family, -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif);
+          color: var(--biscotti-text-color, #fff);
+          font-size: var(--biscotti-font-size, 14px);
+          opacity: 0;
+          transition: transform 0.4s cubic-bezier(0.34, 1.56, 0.64, 1), opacity 0.3s;
+          ${position.includes('bar') ? 'box-sizing: border-box;' : ''}
+        }
+        #biscotti-banner > .biscotti-banner-inner {
+          padding: ${position.includes('bar') ? '16px 24px' : '24px'};
+          max-height: ${position.includes('bar') ? '50vh' : 'calc(100vh - 40px)'};
+          overflow-y: auto;
+          box-sizing: border-box;
+        }
+        #biscotti-banner.visible {
+          ${visibleTransform}
+          opacity: 1;
+        }
+        .biscotti-banner-header {
+          display: flex;
+          align-items: center;
+          gap: 12px;
+          margin-bottom: 12px;
+        }
+        .biscotti-banner-icon {
+          font-size: 32px;
+        }
+        .biscotti-banner-icon::before {
+          content: attr(data-icon);
+        }
+        .biscotti-banner-title {
+          font-size: 18px;
+          font-weight: 600;
+          margin: 0;
+        }
+        .biscotti-banner-close {
+          margin-inline-start: auto;
+          background: none !important;
+          background-color: transparent !important;
+          background-image: none !important;
+          border: none !important;
+          box-shadow: none !important;
+          cursor: pointer;
+          font-size: 18px;
+          color: var(--biscotti-text-muted, #767676) !important;
+          padding: 2px 6px !important;
+          line-height: 1;
+          opacity: 0.5;
+          transition: opacity 0.2s;
+          min-width: auto !important;
+          width: auto !important;
+          height: auto !important;
+          border-radius: 0 !important;
+          transform: none !important;
+          text-transform: none !important;
+          letter-spacing: normal !important;
+          font-weight: 300 !important;
+        }
+        .biscotti-banner-close:hover {
+          opacity: 0.8;
+          background: none !important;
+          background-color: transparent !important;
+          transform: none !important;
+          box-shadow: none !important;
+        }
+        .biscotti-banner-text {
+          font-size: 14px;
+          color: var(--biscotti-text-muted, #b0b0b0);
+          line-height: 1.5;
+          margin-bottom: 20px;
+        }
+        .biscotti-banner-buttons {
+          display: flex;
+          gap: 10px;
+          flex-wrap: wrap;
+        }
+        .biscotti-btn {
+          padding: 12px 20px;
+          border-radius: var(--biscotti-btn-radius, 8px);
+          font-size: 14px;
+          font-weight: 600;
+          cursor: pointer;
+          transition: transform 0.2s, box-shadow 0.2s;
+          border: none;
+          flex: 1;
+          min-width: 120px;
+        }
+        .biscotti-btn:hover {
+          transform: translateY(-2px);
+        }
+        .biscotti-btn-primary {
+          background: linear-gradient(135deg, var(--biscotti-primary-color) 0%, var(--biscotti-primary-dark) 100%);
+          color: #fff;
+        }
+        .biscotti-btn-primary:hover {
+          box-shadow: 0 4px 12px rgba(var(--biscotti-primary-rgb, 212, 165, 116), 0.4);
+        }
+        .biscotti-btn-secondary {
+          background: transparent;
+          color: var(--biscotti-text-color, #333);
+          border: 2px solid var(--biscotti-primary-color, #9B6B3C);
+        }
+        .biscotti-btn-secondary:hover {
+          background: rgba(212, 165, 116, 0.1);
+        }
+        
+        /* ===== ETHICAL UI MODE (DSA Compliance) ===== */
+        /* Equal buttons - no dark patterns, no nudging */
+        .biscotti-ethical-mode .biscotti-btn-primary,
+        .biscotti-ethical-mode .biscotti-btn-secondary {
+          background: var(--biscotti-primary-color, #9B6B3C);
+          color: #fff;
+          font-size: 15px;
+          padding: 14px 24px;
+          min-width: 140px;
+          font-weight: 600;
+          border: none;
+        }
+        .biscotti-ethical-mode .biscotti-btn-primary:hover,
+        .biscotti-ethical-mode .biscotti-btn-secondary:hover {
+          background: var(--biscotti-primary-dark, #8B5A2B);
+          box-shadow: 0 4px 12px rgba(0,0,0,0.2);
+        }
+        /* Settings becomes equal button in ethical mode */
+        .biscotti-ethical-mode .biscotti-settings-link {
+          display: inline-block;
+          background: transparent;
+          color: var(--biscotti-primary-color, #9B6B3C);
+          font-size: 15px;
+          padding: 14px 24px;
+          min-width: 140px;
+          font-weight: 600;
+          border: 2px solid var(--biscotti-primary-color, #9B6B3C);
+          border-radius: 12px;
+          text-decoration: none;
+          cursor: pointer;
+          transition: all 0.2s;
+          margin-top: 12px;
+        }
+        .biscotti-ethical-mode .biscotti-settings-link:hover {
+          background: rgba(212, 165, 116, 0.1);
+          text-decoration: none;
+        }
+        /* Three-button layout in ethical mode */
+        .biscotti-ethical-mode .biscotti-banner-buttons {
+          display: flex;
+          flex-wrap: wrap;
+          gap: 12px;
+          justify-content: center;
+        }
+        /* ===== END ETHICAL UI MODE ===== */
+
+        /* ===== TCF COMPLIANCE: CTA Matching Text Treatment (Appendix B, C.g) ===== */
+        /* All CTAs must have matching font, font-size, font-style and ≥5:1 contrast */
+        .biscotti-tcf-mode .biscotti-btn-primary,
+        .biscotti-tcf-mode .biscotti-btn-secondary,
+        .biscotti-tcf-mode .biscotti-settings-link {
+          font-size: 14px;
+          font-weight: 600;
+          font-style: normal;
+          font-family: inherit;
+          letter-spacing: normal;
+        }
+        .biscotti-tcf-mode .biscotti-btn-primary {
+          background: var(--biscotti-primary-dark, #8B5A2B);
+          color: #fff;
+        }
+        .biscotti-tcf-mode .biscotti-btn-secondary {
+          background: transparent;
+          color: var(--biscotti-text-color, #333);
+          border: 2px solid var(--biscotti-primary-dark, #8B5A2B);
+        }
+        .biscotti-tcf-mode .biscotti-settings-link {
+          color: var(--biscotti-primary-dark, #8B5A2B);
+        }
+
+        /* ===== BAR MODE: Horizontal full-width layout ===== */
+        .biscotti-bar-mode .biscotti-banner-header { margin-bottom: 8px; }
+        .biscotti-bar-mode .biscotti-banner-text { margin-bottom: 8px; font-size: 13px; }
+        .biscotti-bar-mode .biscotti-tcf-initial-layer p { margin: 4px 0; font-size: 12px; }
+        .biscotti-bar-mode .biscotti-banner-buttons { flex-wrap: nowrap; }
+        .biscotti-bar-mode .biscotti-btn { min-width: 100px; padding: 10px 16px; font-size: 13px; }
+        .biscotti-bar-mode .biscotti-settings-link { font-size: 13px; }
+        .biscotti-bar-mode .biscotti-footer { margin-top: 8px; }
+        @media (min-width: 768px) {
+          .biscotti-bar-mode { display: flex; align-items: center; gap: 24px; flex-wrap: wrap; }
+          .biscotti-bar-mode .biscotti-banner-content { flex: 1; min-width: 0; }
+          .biscotti-bar-mode .biscotti-banner-actions { flex-shrink: 0; display: flex; flex-direction: column; gap: 8px; align-items: center; }
+          .biscotti-bar-mode .biscotti-banner-buttons { flex-direction: column; }
+          .biscotti-bar-mode .biscotti-btn { width: 180px; min-width: 180px; }
+          .biscotti-bar-mode .biscotti-footer { width: 100%; }
+        }
+        /* ===== END TCF COMPLIANCE ===== */
+        
+        .biscotti-footer {
+          padding-bottom: 8px;
+          display: block !important;
+        }
+        .biscotti-settings-link {
+          display: block;
+          text-align: center;
+          margin-top: 16px;
+          font-size: 13px;
+          color: #9B6B3C;
+          cursor: pointer;
+          text-decoration: none;
+        }
+        .biscotti-settings-link:hover {
+          text-decoration: underline;
+        }
+        .biscotti-settings-panel {
+          max-height: 0;
+          overflow: hidden;
+          transition: max-height 0.3s ease-out;
+        }
+        .biscotti-settings-panel.open {
+          max-height: none;
+          overflow-y: visible;
+          margin-top: 20px;
+          padding-top: 20px;
+          border-top: 1px solid rgba(255, 255, 255, 0.1);
+        }
+        .biscotti-category {
+          padding: 12px 0;
+          border-bottom: 1px solid rgba(255, 255, 255, 0.05);
+        }
+        .biscotti-category:last-child {
+          border-bottom: none;
+        }
+        .biscotti-category-header {
+          display: flex;
+          justify-content: space-between;
+          align-items: center;
+          cursor: pointer;
+        }
+        .biscotti-category-info {
+          flex: 1;
+        }
+        .biscotti-category-name {
+          font-size: 14px;
+          font-weight: 600;
+          margin-bottom: 0;
+          display: flex;
+          align-items: center;
+          gap: 8px;
+        }
+        .biscotti-expand-icon {
+          font-size: 10px;
+          transition: transform 0.3s;
+          color: #595959;
+          display: inline-block;
+        }
+        .biscotti-category.expanded .biscotti-expand-icon {
+          transform: rotate(180deg);
+        }
+        .biscotti-category-desc {
+          font-size: 12px;
+          color: #595959;
+          line-height: 1.4;
+        }
+        .biscotti-services-list {
+          max-height: 0;
+          overflow: hidden;
+          transition: max-height 0.3s ease-out;
+        }
+        .biscotti-category.expanded .biscotti-services-list {
+          max-height: 1500px;
+          margin-top: 12px;
+        }
+        .biscotti-service-item {
+          display: flex;
+          justify-content: space-between;
+          align-items: center;
+          padding: 8px 0;
+          border-bottom: 1px solid rgba(255, 255, 255, 0.03);
+        }
+        .biscotti-service-item:last-child {
+          border-bottom: none;
+        }
+        .biscotti-service-name {
+          font-size: 13px;
+          font-weight: 500;
+          color: var(--biscotti-text-color, #333);
+        }
+        .biscotti-service-desc {
+          font-size: 11px;
+          color: var(--biscotti-text-muted, #595959);
+        }
+        .biscotti-service-header {
+          display: flex;
+          justify-content: space-between;
+          align-items: center;
+          gap: 8px;
+          width: 100%;
+        }
+        .biscotti-service-info {
+          flex: 1;
+          min-width: 0;
+        }
+        .biscotti-service-details-link {
+          font-size: 10px;
+          color: var(--biscotti-primary-color);
+          text-decoration: none;
+          cursor: pointer;
+          white-space: nowrap;
+          flex-shrink: 0;
+          margin-left: auto;
+        }
+        .biscotti-service-details-link:hover {
+          text-decoration: underline;
+        }
+        .biscotti-service-details {
+          max-height: 0;
+          overflow: hidden;
+          transition: max-height 0.3s ease-out;
+          background: rgba(0, 0, 0, 0.05);
+          border-radius: 8px;
+          margin-top: 0;
+          border: 1px solid rgba(0, 0, 0, 0.1);
+        }
+        .biscotti-service-details.open {
+          max-height: 300px;
+          margin-top: 8px;
+          padding: 10px;
+        }
+        .biscotti-details-table {
+          width: 100%;
+          font-size: 11px;
+          border-collapse: collapse;
+        }
+        .biscotti-details-table tr {
+          border-bottom: 1px solid rgba(0, 0, 0, 0.08);
+        }
+        .biscotti-details-table tr:last-child {
+          border-bottom: none;
+        }
+        .biscotti-details-table td {
+          padding: 6px 4px;
+          vertical-align: top;
+        }
+        .biscotti-details-table td:first-child {
+          font-weight: 600;
+          color: var(--biscotti-text-color, #333);
+          width: 35%;
+          white-space: nowrap;
+        }
+        .biscotti-details-table td:last-child {
+          color: var(--biscotti-text-muted, #555);
+        }
+        .biscotti-toggle-small {
+          width: 36px;
+          height: 20px;
+        }
+        .biscotti-toggle-small .biscotti-toggle-slider:before {
+          height: 14px;
+          width: 14px;
+        }
+        .biscotti-toggle-small[aria-checked="true"] .biscotti-toggle-slider:before {
+          transform: translateX(14px);
+        }
+        .biscotti-toggle {
+          position: relative;
+          width: 48px;
+          height: 26px;
+          flex-shrink: 0;
+          margin-left: 16px;
+          cursor: pointer;
+        }
+        .biscotti-toggle-slider {
+          position: absolute;
+          cursor: pointer;
+          inset: 0;
+          background: #cccccc;
+          border-radius: 26px;
+          transition: 0.3s;
+        }
+        .biscotti-toggle-slider:before {
+          position: absolute;
+          content: "";
+          height: 20px;
+          width: 20px;
+          left: 3px;
+          bottom: 3px;
+          background: white;
+          border-radius: 50%;
+          transition: 0.3s;
+          box-shadow: 0 2px 4px rgba(0, 0, 0, 0.2);
+        }
+        .biscotti-toggle[aria-checked="true"] .biscotti-toggle-slider {
+          background: linear-gradient(135deg, var(--biscotti-primary-color) 0%, var(--biscotti-primary-dark) 100%);
+        }
+        .biscotti-toggle[aria-checked="true"] .biscotti-toggle-slider:before {
+          transform: translateX(22px);
+        }
+        .biscotti-toggle[aria-disabled="true"] .biscotti-toggle-slider {
+          opacity: 0.6;
+          cursor: not-allowed;
+        }
+        .biscotti-toggle-small[aria-checked="true"] .biscotti-toggle-slider {
+          background: linear-gradient(135deg, var(--biscotti-primary-color) 0%, var(--biscotti-primary-dark) 100%);
+        }
+        .biscotti-toggle input {
+          opacity: 0;
+          width: 0;
+          height: 0;
+          position: absolute;
+        }
+        .biscotti-toggle input:checked + .biscotti-toggle-slider {
+          background: linear-gradient(135deg, var(--biscotti-primary-color) 0%, var(--biscotti-primary-dark) 100%);
+        }
+        .biscotti-toggle input:checked + .biscotti-toggle-slider:before {
+          transform: translateX(22px);
+        }
+        .biscotti-toggle-small input:checked + .biscotti-toggle-slider:before {
+          transform: translateX(14px);
+        }
+        .biscotti-toggle input:disabled + .biscotti-toggle-slider {
+          opacity: 0.6;
+          cursor: not-allowed;
+        }
+        .biscotti-save-row {
+          margin-top: 16px;
+        }
+        .biscotti-branding {
+          margin-top: 16px;
+          padding-top: 12px;
+          border-top: 1px solid rgba(0, 0, 0, 0.08);
+          text-align: center;
+          font-size: 11px;
+          color: var(--biscotti-text-muted, #595959);
+        }
+        .biscotti-branding a {
+          color: var(--biscotti-primary-color, #9B6B3C);
+          text-decoration: none;
+        }
+        .biscotti-branding a:hover {
+          text-decoration: underline;
+        }
+        .biscotti-branding.hidden {
+          display: none;
+        }
+        @media (max-width: 768px) {
+          #biscotti-banner {
+            top: 50% !important;
+            bottom: auto !important;
+            left: 50% !important;
+            right: auto !important;
+            transform: translateX(-50%) translateY(-50%) scale(0.95) !important;
+            width: calc(100% - 24px) !important;
+            max-width: 100% !important;
+            max-height: 85vh !important;
+            border-radius: var(--biscotti-border-radius, 16px) !important;
+            display: flex !important;
+            flex-direction: column !important;
+            overflow: hidden !important;
+          }
+          #biscotti-banner.visible {
+            transform: translateX(-50%) translateY(-50%) scale(1) !important;
+            opacity: 1;
+          }
+          #biscotti-banner > .biscotti-banner-inner {
+            flex: 1 !important;
+            min-height: 0 !important;
+            max-height: none !important;
+            overflow-y: auto !important;
+            -webkit-overflow-scrolling: touch;
+            padding: 20px 16px 0 16px !important;
+          }
+          .biscotti-banner-actions {
+            position: sticky !important;
+            bottom: 0 !important;
+            background: var(--biscotti-bg-color, #fff) !important;
+            padding: 12px 16px 16px 16px !important;
+            margin: 0 !important;
+            z-index: 2 !important;
+            border-top: 1px solid rgba(0,0,0,0.1) !important;
+            flex-shrink: 0 !important;
+          }
+          .biscotti-banner-buttons {
+            padding: 0 !important;
+            margin: 0 0 8px 0 !important;
+          }
+          .biscotti-settings-link {
+            display: flex !important;
+            justify-content: center !important;
+            width: 100% !important;
+            padding: 8px 0 0 0 !important;
+            margin: 0 !important;
+          }
+          .biscotti-btn {
+            flex: 1 1 100% !important;
+            padding: 14px 16px !important;
+          }
+          .biscotti-banner-text {
+            font-size: 13px !important;
+            margin-bottom: 12px !important;
+          }
+          /* TCF: Consistent font size for purposes list and intro text */
+          .biscotti-tcf-initial-layer,
+          .biscotti-tcf-initial-layer p,
+          .biscotti-tcf-initial-layer span {
+            font-size: 13px !important;
+            line-height: 1.5 !important;
+          }
+          .biscotti-tcf-initial-layer ul {
+            font-size: 13px !important;
+            padding-left: 20px !important;
+            margin: 8px 0 !important;
+          }
+          .biscotti-tcf-initial-layer li {
+            margin-bottom: 4px !important;
+            font-size: 13px !important;
+          }
+        }
+        @media (max-width: 480px) {
+          #biscotti-banner {
+            width: calc(100% - 16px) !important;
+          }
+          .biscotti-btn {
+            flex: 1 1 100% !important;
+          }
+        }
+      `;
+      document.head.appendChild(style);
+
+      // Inject customCss from theme or white-label branding
+      const customCss = theme.customCss || this.engine?.config?.banner?.branding?.customCss;
+      if (customCss) {
+        const customStyle = document.createElement('style');
+        customStyle.id = 'biscotti-custom-css';
+        customStyle.textContent = customCss;
+        document.head.appendChild(customStyle);
+      }
+    }
+
+    show() {
+      // Suppress banner for NO_REQUIREMENT jurisdictions unless customer opted to always show
+      if (this.engine?.jurisdiction?.consentModel === 'NO_REQUIREMENT' && !this.engine?.config?.forceShowBanner) {
+          this.engine?._log?.('Banner suppressed: NO_REQUIREMENT jurisdiction (' + (this.engine.jurisdiction.code || 'unknown') + ')');
+          return;
+      }
+
+      // Sync UI state with ConsentState or opt-out defaults prior to rendering
+      if (this.engine && this.engine.consentState) {
+        if (this.engine.consentState.hasUserChoice()) {
+          this.categoryStates.functional = !!this.engine.consentState.categories.functional;
+          this.categoryStates.analytics = !!this.engine.consentState.categories.analytics;
+          this.categoryStates.marketing = !!this.engine.consentState.categories.marketing;
+        } else if (this.engine.config && this.engine.config.consentMode === 'opt-out') {
+          this.categoryStates.functional = true;
+          this.categoryStates.analytics = true;
+          this.categoryStates.marketing = true;
+        }
+      }
+
+      if (this.container) {
+        // Re-render banner HTML to pick up state changes (e.g. Withdraw All button after Accept All)
+        this._listenersAttached = false; // Reset so event listeners are re-attached
+        this.container.innerHTML = this._renderBanner();
+        this._renderConsentIdElement(); // Update consent ID element (inside banner container)
+        this._attachEventListeners();
+        this._injectTestBadge();
+        this.container.classList.add('visible');
+        document.getElementById('biscotti-banner-overlay')?.classList.add('visible');
+        // Show consent ID element
+        const consentIdEl = this.container.querySelector('#biscotti-consent-id-standalone');
+        if (consentIdEl) consentIdEl.style.display = 'block';
+        // Re-initialize accessibility on re-show
+        this._initAccessibility();
+        return;
+      }
+
+      this.createStyles();
+
+      // Overlay
+      const overlay = document.createElement('div');
+      overlay.id = 'biscotti-banner-overlay';
+      // Click on overlay dismisses banner (accept essential only)
+      overlay.addEventListener('click', () => {
+        this.engine.acceptEssential();
+        this.hide();
+      });
+      document.body.appendChild(overlay);
+
+      // Banner container
+      this.container = document.createElement('div');
+      this.container.id = 'biscotti-banner';
+      this.container.setAttribute('role', 'dialog');
+      this.container.setAttribute('aria-modal', 'true');
+      this.container.setAttribute('aria-labelledby', 'biscotti-title');
+      this.container.setAttribute('aria-describedby', 'biscotti-description');
+
+      // Set lang attribute on banner container (WCAG 3.1.1, 3.1.2)
+      if (this.language) {
+        this.container.setAttribute('lang', this.language);
+      }
+
+      // RTL support for Arabic, Hebrew, Persian, Urdu (WCAG 1.3.4)
+      if (A11Y_RTL_LANGS.includes(this.language)) {
+        this.container.setAttribute('dir', 'rtl');
+        overlay.setAttribute('dir', 'rtl');
+      }
+      
+      // DSA Compliance: Ethical UI Mode - equal buttons, no dark patterns
+      if (this.engine.config.ethicalUiMode || this.engine.config.theme?.ethicalUiMode) {
+        this.container.classList.add('biscotti-ethical-mode');
+      }
+      
+      // TCF Compliance: matching CTA text treatment and ≥5:1 contrast (Appendix B, C.g)
+      if (this.engine?.config?.tcfEnabled) {
+        this.container.classList.add('biscotti-tcf-mode');
+      }
+      
+      // Bar mode: horizontal layout
+      const bannerPosition = this.engine?.config?.theme?.position || 'bottom-center';
+      if (bannerPosition.includes('bar')) {
+        this.container.classList.add('biscotti-bar-mode');
+      }
+      
+      this.container.innerHTML = this._renderBanner();
+      document.body.appendChild(this.container);
+
+      // Consent ID element: rendered INSIDE #biscotti-banner before the footer
+      // Protected by !important styles against whitelabel/custom CSS (Requirement 3.6)
+      this._renderConsentIdElement();
+
+      // Add event listeners
+      this._attachEventListeners();
+      this._injectTestBadge();
+
+      // Show with animation
+      requestAnimationFrame(() => {
+        overlay.classList.add('visible');
+        this.container.classList.add('visible');
+      });
+
+      // === Accessibility: Wire up modules after DOM insertion ===
+      this._initAccessibility();
+    }
+
+    /**
+     * Initialize accessibility modules after banner is rendered and in the DOM.
+     * Sets up focus trap, ARIA management, live region announcer, and reduced motion.
+     * @private
+     */
+    _initAccessibility() {
+      if (!this.container) return;
+
+      // AriaManager: manage sibling hiding and toggle semantics
+      this._ariaManager = new AriaManager(this.container);
+      this._ariaManager.hideSiblings();
+
+      // Set language and direction attributes via AriaManager
+      const isRtl = A11Y_RTL_LANGS.includes(this.language);
+      this._ariaManager.setLanguageAttributes(this.language, isRtl);
+
+      // Settings panel: role="group" and aria-label
+      const settingsPanel = this.container.querySelector('#biscotti-settings');
+      if (settingsPanel) {
+        settingsPanel.setAttribute('role', 'group');
+        settingsPanel.setAttribute('aria-label', this.t('banner.settings') || 'Consent categories');
+      }
+
+      // Configure category toggles as role="switch" with proper ARIA
+      this._configureToggles();
+
+      // Set aria-expanded on settings toggle link
+      const settingsLink = this.container.querySelector('[data-action="toggle-settings"]');
+      if (settingsLink) {
+        settingsLink.setAttribute('aria-expanded', String(this.settingsOpen));
+      }
+
+      // Ensure all buttons have accessible names
+      this._ensureButtonAccessibleNames();
+
+      // Add "opens in new window" to external links
+      this._labelExternalLinks();
+
+      // Add keyboard handler for toggle activation (Space/Enter)
+      this._addToggleKeyboardHandlers();
+
+      // LiveRegionAnnouncer: create live regions for status/alert messages
+      if (!this._liveAnnouncer) {
+        this._liveAnnouncer = new LiveRegionAnnouncer();
+      }
+
+      // ReducedMotionHandler: suppress animations if user prefers
+      this._reducedMotionHandler.watch(this.container);
+
+      // Inject TargetSizeEnforcer CSS
+      this._injectTargetSizeStyles();
+
+      // FocusTrapManager: trap focus within the banner dialog
+      this._focusTrap = new FocusTrapManager(this.container, {
+        onEscape: () => {
+          this.engine.acceptEssential();
+          this.hide();
+        }
+      });
+      this._focusTrap.activate();
+    }
+
+    /**
+     * Configure all category toggles with role="switch" and ARIA attributes.
+     * @private
+     */
+    _configureToggles() {
+      if (!this._ariaManager || !this.container) return;
+
+      this.container.querySelectorAll('.biscotti-toggle[role="switch"][data-category]').forEach(toggle => {
+        const category = toggle.dataset.category;
+        const categoryHeader = toggle.closest('.biscotti-category-header');
+        const categoryNameEl = categoryHeader?.querySelector('.biscotti-category-name');
+        const categoryName = categoryNameEl ? categoryNameEl.textContent.trim() : category;
+
+        // Find the description element for this category
+        const categoryEl = toggle.closest('.biscotti-category');
+        const descEl = categoryEl?.querySelector('.biscotti-category-desc');
+        const descId = descEl ? `biscotti-cat-desc-${category}` : null;
+        if (descEl && !descEl.id) {
+          descEl.id = `biscotti-cat-desc-${category}`;
+        }
+
+        // Configure the toggle as a switch (aria-label, aria-describedby)
+        this._ariaManager.configureSwitch(
+          toggle,
+          categoryName,
+          descId,
+          this.categoryStates[category] || false
+        );
+      });
+    }
+
+    /**
+     * Ensure all buttons within the banner have accessible names.
+     * Uses textContent or aria-label as fallback.
+     * @private
+     */
+    _ensureButtonAccessibleNames() {
+      if (!this.container) return;
+
+      this.container.querySelectorAll('button').forEach(btn => {
+        const hasName = btn.textContent.trim() ||
+          btn.getAttribute('aria-label') ||
+          btn.getAttribute('aria-labelledby');
+        if (!hasName) {
+          // Fallback: use data-action as aria-label
+          const action = btn.dataset.action;
+          if (action) {
+            btn.setAttribute('aria-label', action.replace(/-/g, ' '));
+          }
+        }
+      });
+    }
+
+    /**
+     * Add "opens in new window" indication to external links.
+     * @private
+     */
+    _labelExternalLinks() {
+      if (!this.container) return;
+
+      this.container.querySelectorAll('a[target="_blank"]').forEach(link => {
+        const currentLabel = link.getAttribute('aria-label');
+        const linkText = link.textContent.trim();
+        const newWindowText = '(opens in new window)';
+
+        if (currentLabel) {
+          if (!currentLabel.includes(newWindowText)) {
+            link.setAttribute('aria-label', `${currentLabel} ${newWindowText}`);
+          }
+        } else if (linkText) {
+          link.setAttribute('aria-label', `${linkText} ${newWindowText}`);
+        }
+      });
+    }
+
+    /**
+     * Add keyboard handlers (Space/Enter) for Category_Toggle activation.
+     * Toggles operate directly via aria-checked on the role="switch" div.
+     * @private
+     */
+    _addToggleKeyboardHandlers() {
+      if (!this.container) return;
+
+      this.container.querySelectorAll('.biscotti-toggle[role="switch"]').forEach(toggle => {
+        toggle.addEventListener('keydown', (e) => {
+          if (e.key === ' ' || e.key === 'Enter') {
+            e.preventDefault();
+            if (toggle.getAttribute('aria-disabled') === 'true') return;
+            const category = toggle.dataset.category;
+            if (category) {
+              const newState = toggle.getAttribute('aria-checked') !== 'true';
+              toggle.setAttribute('aria-checked', String(newState));
+              this.categoryStates[category] = newState;
+              // Sync service toggles with category state
+              this.container.querySelectorAll(`[data-service-category="${category}"]`).forEach(serviceToggle => {
+                serviceToggle.setAttribute('aria-checked', String(newState));
+              });
+            }
+          }
+        });
+      });
+    }
+
+    /**
+     * Inject TargetSizeEnforcer CSS via the existing style injection mechanism.
+     * @private
+     */
+    _injectTargetSizeStyles() {
+      const styleId = 'biscotti-target-size-styles';
+      if (document.getElementById(styleId)) return;
+
+      const style = document.createElement('style');
+      style.id = styleId;
+      style.textContent = TARGET_SIZE_CSS;
+      document.head.appendChild(style);
+    }
+
+    /**
+     * Announce consent save status via live region.
+     * Called by the engine after consent is saved.
+     * @param {string} message - The status message to announce
+     */
+    announceStatus(message) {
+      if (this._liveAnnouncer) {
+        this._liveAnnouncer.announceStatus(message);
+      }
+    }
+
+    /**
+     * Announce an error via live region.
+     * @param {string} message - The error message to announce
+     */
+    announceAlert(message) {
+      if (this._liveAnnouncer) {
+        this._liveAnnouncer.announceAlert(message);
+      }
+    }
+
+    _injectTestBadge() {
+      if (!this.engine?.config?.isTestDomain || !this.container) return;
+      // Remove existing badge if present (re-render safe)
+      this.container.querySelector('#biscotti-test-badge')?.remove();
+      // Ensure container is positioned for absolute child
+      if (getComputedStyle(this.container).position === 'static') {
+        this.container.style.position = 'relative';
+      }
+      const badge = document.createElement('span');
+      badge.id = 'biscotti-test-badge';
+      badge.textContent = 'TEST';
+      badge.style.cssText = 'position:absolute;top:8px;right:8px;background:#f59e0b;color:#fff;font-weight:700;font-size:11px;padding:2px 8px;border-radius:4px;z-index:999999;letter-spacing:1px;';
+      this.container.appendChild(badge);
+    }
+
+    /**
+     * Render consent ID element INSIDE the banner container, before the footer.
+     * The element uses !important styles for Whitelabel CSS protection (Requirement 3.6).
+     */
+    _renderConsentIdElement() {
+      if (!this.container) return;
+
+      // Remove existing if re-rendering
+      this.container.querySelector('#biscotti-cmp-storage-disclosure')?.remove();
+      this.container.querySelector('#biscotti-consent-id-standalone')?.remove();
+
+      const consentId = this.engine._getVisitorToken ? this.engine._getVisitorToken() :
+        (CrossDomainAPI.visitorToken || localStorage.getItem('biscotti_visitor_token') || 'N/A');
+
+      const now = new Date();
+      const timeStr = now.toLocaleTimeString(this.language || 'en', { hour: '2-digit', minute: '2-digit', hour12: false });
+      const tzAbbr = now.toLocaleTimeString(this.language || 'en', { timeZoneName: 'short' }).split(' ').pop();
+      const apiBase = this.engine?.config?.apiEndpoint?.replace('/api/v1', '') || 'https://app.biscotti-cmp.com';
+      const lookupUrl = `${apiBase}/consent/lookup?id=${encodeURIComponent(consentId)}&lang=${this.language || 'en'}`;
+
+      // CMP Storage Disclosure — Layer 1 (IAB TCF Policy Appendix B, C(d)(VII))
+      const cmpCookieName = typeof COOKIE_NAME !== 'undefined' ? COOKIE_NAME : 'biscotti_consent';
+      const cmpCookieDays = typeof COOKIE_DAYS !== 'undefined' ? COOKIE_DAYS : 180;
+      const lang = this.language || 'en';
+      const cmpStorageTexts = {
+        de: `Biscotti CMP speichert Ihre Einwilligung im lokalen Speicher Ihres Browsers (bis zu ${cmpCookieDays} Tage).`,
+        en: `Biscotti CMP stores your consent choice in your browser's local storage (up to ${cmpCookieDays} days).`,
+        fr: `Biscotti CMP stocke votre choix de consentement dans le stockage local de votre navigateur (jusqu'à ${cmpCookieDays} jours).`,
+        es: `Biscotti CMP almacena su elección de consentimiento en el almacenamiento local de su navegador (hasta ${cmpCookieDays} días).`,
+        it: `Biscotti CMP memorizza la tua scelta di consenso nella memoria locale del browser (fino a ${cmpCookieDays} giorni).`,
+        nl: `Biscotti CMP slaat uw toestemmingskeuze op in de lokale opslag van uw browser (tot ${cmpCookieDays} dagen).`,
+        pl: `Biscotti CMP przechowuje Twój wybór zgody w lokalnej pamięci przeglądarki (do ${cmpCookieDays} dni).`,
+        pt: `Biscotti CMP armazena sua escolha de consentimento no armazenamento local do navegador (até ${cmpCookieDays} dias).`,
+        da: `Biscotti CMP gemmer dit samtykkevalg i din browsers lokale lager (op til ${cmpCookieDays} dage).`
+      };
+      const tcStringTexts = {
+        de: 'TC-String: Wird lokal gespeichert, um Datenschutzentscheidungen an Partner zu übermitteln',
+        en: 'TC String: Stored locally to communicate privacy choices to partners',
+        fr: 'TC String : Stocké localement pour communiquer les choix de confidentialité aux partenaires',
+        es: 'TC String: Almacenado localmente para comunicar las opciones de privacidad a los socios',
+        it: 'TC String: Memorizzato localmente per comunicare le scelte sulla privacy ai partner',
+        nl: 'TC String: Lokaal opgeslagen om privacykeuzes aan partners te communiceren',
+        pl: 'TC String: Przechowywany lokalnie w celu przekazywania wyborów prywatności partnerom',
+        pt: 'TC String: Armazenado localmente para comunicar escolhas de privacidade aos parceiros',
+        da: 'TC String: Gemt lokalt for at kommunikere privatlivsvalg til partnere'
+      };
+      const storageText = cmpStorageTexts[lang] || cmpStorageTexts['en'];
+      const tcStringText = tcStringTexts[lang] || tcStringTexts['en'];
+
+      const storageEl = document.createElement('div');
+      storageEl.id = 'biscotti-cmp-storage-disclosure';
+      storageEl.style.cssText = 'display:block;font-size:9px;color:#767676;text-align:center;padding:8px 16px 4px;line-height:1.3;background:transparent;';
+      storageEl.innerHTML = `🍪 ${storageText} · 🔑 <code style="font-family:monospace;font-size:9px;">${cmpCookieName}</code> (${cmpCookieDays}d)`;
+
+      // Consent ID element
+      const el = document.createElement('div');
+      el.id = 'biscotti-consent-id-standalone';
+      el.className = 'biscotti-consent-id';
+      el.style.cssText = 'display:block !important;visibility:visible !important;opacity:1 !important;font-size:10px !important;color:#595959 !important;text-align:center !important;word-break:break-all !important;padding:4px 8px 6px !important;z-index:2147483646 !important;background:transparent !important;pointer-events:auto !important;';
+      el.innerHTML = `${this.t('details.consentId')} <a href="${lookupUrl}" target="_blank" rel="noopener" style="font-family:monospace;color:inherit;text-decoration:underline dotted;cursor:pointer;" title="${this.t('details.lookupTitle') || 'Look up your consent data'}">${consentId}</a> | ${timeStr} ${tzAbbr}`;
+
+      const footer = this.container.querySelector('.biscotti-footer');
+      if (footer && footer.parentNode) {
+        footer.parentNode.insertBefore(el, footer);
+        footer.parentNode.insertBefore(storageEl, el);
+      } else {
+        this.container.appendChild(storageEl);
+        this.container.appendChild(el);
+      }
+    }
+
+    hide() {
+      if (this.container) {
+        this.container.classList.remove('visible');
+        document.getElementById('biscotti-banner-overlay')?.classList.remove('visible');
+        // Hide consent ID element when banner is hidden
+        const consentIdEl = this.container.querySelector('#biscotti-consent-id-standalone');
+        if (consentIdEl) consentIdEl.style.display = 'none';
+      }
+
+      // Accessibility: deactivate focus trap and restore siblings
+      if (this._focusTrap) {
+        this._focusTrap.deactivate();
+        this._focusTrap = null;
+      }
+      if (this._ariaManager) {
+        this._ariaManager.restoreSiblings();
+      }
+    }
+
+    /**
+     * Show the banner with the settings panel already open
+     * Called when user clicks "Cookie Settings" button in privacy policy
+     */
+    showSettings() {
+      this.show(); // First show the banner
+      // Then immediately open settings
+      requestAnimationFrame(() => {
+        this._toggleSettings();
+      });
+    }
+
+    destroy() {
+      // Accessibility cleanup
+      if (this._focusTrap) {
+        this._focusTrap.deactivate();
+        this._focusTrap = null;
+      }
+      if (this._ariaManager) {
+        this._ariaManager.restoreSiblings();
+        this._ariaManager = null;
+      }
+      if (this._liveAnnouncer) {
+        this._liveAnnouncer.destroy();
+        this._liveAnnouncer = null;
+      }
+      if (this._reducedMotionHandler) {
+        this._reducedMotionHandler.unwatch();
+        this._reducedMotionHandler.removeSuppressionStyles();
+      }
+
+      if (this.container) {
+        this.container.remove();
+        this.container = null;
+      }
+      document.getElementById('biscotti-banner-overlay')?.remove();
+      document.getElementById('biscotti-target-size-styles')?.remove();
+    }
+
+    _renderBanner() {
+      // Get Consent ID to display (visitorToken is used as unique consent identifier)
+      const consentId = this.engine._getVisitorToken ? this.engine._getVisitorToken() : 
+                        (CrossDomainAPI.visitorToken || localStorage.getItem('biscotti_visitor_token') || 'N/A');
+      
+      // TCF/GDPR disclosure: partner count (IAB TCF Appendix B, C(b)(III))
+      // Use vendorCounts from Config API if available, otherwise fall back to local counting
+      const configVendorCounts = this.engine?.config?.vendorCounts;
+      let iabVendorCount = 0;
+      let nonIabVendorCount = 0;
+      
+      if (configVendorCounts && typeof configVendorCounts === 'object') {
+        // Config API provides authoritative counts — backward compat: default missing fields to 0
+        iabVendorCount = configVendorCounts.iabVendorCount || 0;
+        nonIabVendorCount = configVendorCounts.nonIabVendorCount || 0;
+      } else if (this.engine?.configLoaded) {
+        // Config loaded but no vendorCounts (legacy API) — count locally
+        const detectedServices = this._detectActiveServices();
+        for (const [category, services] of Object.entries(detectedServices)) {
+          if (category === 'essential') continue;
+          for (const [key, svc] of Object.entries(services)) {
+            if (key === 'biscotti_cmp') continue;
+            if (svc.gvlVendorId != null) {
+              iabVendorCount++;
+            } else {
+              nonIabVendorCount++;
+            }
+          }
+        }
+      }
+      // If config not yet loaded, counts stay 0 — partner text will appear after re-render
+      
+      const vendorCount = iabVendorCount + nonIabVendorCount;
+      const tcfData = this.engine?.config?.tcfData;
+      
+      // Build full TCF Initial Layer disclosure (Appendix B compliance)
+      const tcfDisclosure = this._buildTCFInitialLayerDisclosure(iabVendorCount, nonIabVendorCount, tcfData);
+
+      // Legal links (Datenschutzerklärung / Impressum) — localized for all 39 languages
+      const legalLinksHtml = (() => {
+        const privacyUrl = this.engine?.config?.privacyUrl;
+        const imprintUrl = this.engine?.config?.imprintUrl;
+        if (!privacyUrl && !imprintUrl) return '';
+        // Impressum label localized per language
+        const imprintLabels = { de: 'Impressum', en: 'Legal Notice', fr: 'Mentions légales', es: 'Aviso legal', it: 'Note legali', nl: 'Colofon', pl: 'Nota prawna', pt: 'Aviso legal', da: 'Juridisk meddelelse', ar: 'إشعار قانوني', bg: 'Правна информация', bs: 'Pravna napomena', ca: 'Avís legal', cs: 'Právní upozornění', el: 'Νομική σημείωση', eu: 'Lege-oharra', fi: 'Oikeudellinen huomautus', gl: 'Aviso legal', he: 'הודעה משפטית', hi: 'कानूनी सूचना', hr: 'Pravna napomena', hu: 'Jogi közlemény', id: 'Pemberitahuan hukum', ja: '法的通知', lt: 'Teisinė informacija', mr: 'कायदेशीर सूचना', nb: 'Juridisk merknad', ro: 'Notă juridică', ru: 'Правовая информация', sk: 'Právne upozornenie', sl: 'Pravno obvestilo', sr: 'Правно обавештење', sv: 'Juridisk information', th: 'ประกาศทางกฎหมาย', tr: 'Yasal bildirim', uk: 'Правова інформація', vi: 'Thông báo pháp lý', zh: '法律声明', 'zh-TW': '法律聲明' };
+        const imprintLabel = imprintLabels[this.language] || imprintLabels['en'] || 'Legal Notice';
+        return `<div style="display:flex;gap:12px;font-size:12px;margin:4px 0 2px 0;">
+          ${privacyUrl ? `<a href="${privacyUrl}" target="_blank" rel="noopener" style="color:var(--biscotti-primary-color, #9B6B3C);text-decoration:underline;">${this.t('details.privacyLink')}</a>` : ''}
+          ${imprintUrl ? `<a href="${imprintUrl}" target="_blank" rel="noopener" style="color:var(--biscotti-primary-color, #9B6B3C);text-decoration:underline;">${imprintLabel}</a>` : ''}
+        </div>`;
+      })();
+      
+      return `
+        <div class="biscotti-banner-inner">
+        <div class="biscotti-banner-content">
+        <div class="biscotti-banner-header">
+          <span class="biscotti-banner-icon" data-icon="${this._getThemeIcon()}"></span>
+          <h2 class="biscotti-banner-title" id="biscotti-title">${this.t('banner.title')}</h2>
+          <button class="biscotti-banner-close" data-action="reject-all" aria-label="${this.t('banner.close') || 'Close'}">&times;</button>
+        </div>
+
+        ${this.engine?.config?.tcfEnabled ? '' : `<p class="biscotti-banner-text" id="biscotti-description">${this.t('banner.text')}</p>`}
+        ${this.engine?.config?.tcfEnabled ? tcfDisclosure.replace('class="biscotti-tcf-initial-layer"', 'id="biscotti-description" class="biscotti-tcf-initial-layer"') : ''}
+        <div style="text-align:center;margin:12px 0;">${legalLinksHtml}</div>
+        </div>
+
+        <div class="biscotti-banner-actions">
+        ${this._renderConsentButtons()}
+        </div>
+
+        <div class="biscotti-settings-panel" id="biscotti-settings">
+          ${this._renderCategories()}
+          <div class="biscotti-save-row">
+            <button class="biscotti-btn biscotti-btn-primary" style="width:100%" data-action="save">
+              ${this.t('banner.save')}
+            </button>
+          </div>
+        </div>
+        <div class="biscotti-footer">
+          ${this._renderBranding()}
+        </div>
+        </div>
+      `;
+    }
+
+    /**
+     * Render branding footer based on plan
+     * Visible: free, starter
+     * Branding Logic (v2.0):
+     * - Uses server-provided branding config from FeatureService
+     * - Fallback: plan-based logic for backwards compatibility
+     * - Free/Starter without config: Show "Biscotti-CMP" branding
+     * - Starter+: Hide branding
+     * - Business/Agency: Custom logo support
+     */
+    /**
+     * Get banner icon based on theme.iconStyle setting
+     */
+    _getThemeIcon() {
+      const theme = this.engine?.config?.theme || this.engine?.config?.banner?.theme || {};
+      const style = theme.iconStyle || 'cookie';
+      // Custom uploaded icon (base64 data URL or external URL)
+      if (style === 'custom' && theme.customBannerIcon) {
+        return `<img src="${theme.customBannerIcon}" alt="" style="width:24px;height:24px;object-fit:contain;vertical-align:middle;">`;
+      }
+      const icons = {
+        'cookie': '🍪',
+        'shield': '🛡️',
+        'lock': '🔒',
+        'fingerprint': '🔐',
+        'privacy': '👁️',
+        'checkmark': '✅',
+        'info': 'ℹ️',
+        'bell': '🔔',
+        'none': ''
+      };
+      return icons[style] ?? icons['cookie'];
+    }
+
+    /**
+     * Render "Withdraw All" button when the banner is resurfaced and user previously accepted all.
+     * TCF Req 17.2: If the Initial Layer included an "Accept All" CTA, the resurfaced UI
+     * SHALL include an equivalent "Withdraw All" CTA (Appendix B, C.f).
+     */
+    _renderWithdrawAllButton() {
+      const cs = this.engine?.consentState;
+      if (!cs || !cs.hasUserChoice()) return '';
+
+      // Check if user previously accepted all non-essential categories
+      const allGranted = Object.entries(cs.categories)
+        .filter(([k]) => k !== 'essential')
+        .every(([_, v]) => v === true);
+
+      if (!allGranted) return '';
+
+      return `<button class="biscotti-btn biscotti-btn-secondary" data-action="withdraw-all" style="font-size:14px;font-weight:600;font-style:normal;">
+            ${this.t('banner.withdrawAll')}
+          </button>`;
+    }
+
+    /**
+     * Render consent buttons based on jurisdiction consent model.
+     * Each model has different required buttons per legal requirements.
+     */
+    _renderConsentButtons() {
+      const cm = this.engine?.jurisdiction?.consentModel || 'OPT_IN';
+      const btnStyle = 'font-size:14px;font-weight:600;font-style:normal;';
+      
+      // Do Not Sell link for OPT_OUT jurisdictions (CCPA/US states)
+      const dnsLink = cm === 'OPT_OUT' 
+        ? `<a href="#" data-action="opt-out-sale" style="font-size:12px;color:var(--biscotti-primary-color, #9B6B3C);text-decoration:underline;display:block;text-align:center;margin-top:8px;">${this.t('banner.doNotSell')}</a>` 
+        : '';
+
+      if (cm === 'STRICT_OPT_IN') {
+        // EU/GDPR: Accept All + Reject All (equal prominence) + Settings
+        return `
+          <div class="biscotti-banner-buttons">
+            <button class="biscotti-btn biscotti-btn-primary" data-action="accept-all" style="${btnStyle}">${this.t('banner.accept')}</button>
+            <button class="biscotti-btn biscotti-btn-secondary" data-action="reject-all" style="${btnStyle}">${this.t('banner.reject')}</button>
+            ${this._renderWithdrawAllButton()}
+          </div>
+          <a href="#" class="biscotti-settings-link" data-action="toggle-settings" style="${btnStyle}">${this.t('banner.settings')} →</a>`;
+      }
+      
+      if (cm === 'HYBRID') {
+        // UK/CH/CA: Accept All + Reject All (equal) + Manage Settings
+        return `
+          <div class="biscotti-banner-buttons">
+            <button class="biscotti-btn biscotti-btn-primary" data-action="accept-all" style="${btnStyle}">${this.t('banner.accept')}</button>
+            <button class="biscotti-btn biscotti-btn-secondary" data-action="reject-all" style="${btnStyle}">${this.t('banner.reject')}</button>
+            ${this._renderWithdrawAllButton()}
+          </div>
+          <a href="#" class="biscotti-settings-link" data-action="toggle-settings" style="${btnStyle}">${this.t('banner.settings')} →</a>`;
+      }
+      
+      if (cm === 'OPT_OUT') {
+        // US/CCPA: Just OK/Dismiss + Do Not Sell link
+        return `
+          <div class="biscotti-banner-buttons">
+            <button class="biscotti-btn biscotti-btn-primary" data-action="accept-all" style="${btnStyle}">${this.t('banner.ok')}</button>
+          </div>
+          ${dnsLink}
+          <a href="#" class="biscotti-settings-link" data-action="toggle-settings" style="${btnStyle}">${this.t('banner.managePrivacy')} →</a>`;
+      }
+      
+      if (cm === 'NOTICE') {
+        // Notice-only: Just Accept/OK button, no reject needed
+        return `
+          <div class="biscotti-banner-buttons">
+            <button class="biscotti-btn biscotti-btn-primary" data-action="accept-all" style="${btnStyle}">${this.t('banner.ok')}</button>
+          </div>`;
+      }
+      
+      if (cm === 'NO_REQUIREMENT') {
+        return ''; // No banner needed
+      }
+      
+      // Default: OPT_IN — Accept + optional Decline + Settings
+      return `
+        <div class="biscotti-banner-buttons">
+          <button class="biscotti-btn biscotti-btn-primary" data-action="accept-all" style="${btnStyle}">${this.t('banner.accept')}</button>
+          <button class="biscotti-btn biscotti-btn-secondary" data-action="reject-all" style="${btnStyle}">${this.t('banner.reject')}</button>
+          ${this._renderWithdrawAllButton()}
+        </div>
+        <a href="#" class="biscotti-settings-link" data-action="toggle-settings" style="${btnStyle}">${this.t('banner.settings')} →</a>`;
+    }
+
+    _renderBranding() {
+      // v2.0: Use server-provided branding config if available
+      const serverBranding = this.engine.config?.branding;
+      
+      // White label data comes from the API in banner.branding (set by WhiteLabelService)
+      const bannerBranding = this.engine.config?.banner?.branding;
+      
+      // Check banner.branding first (this is where WhiteLabelService puts the data)
+      if (bannerBranding) {
+        // If hidePoweredBy is set, hide branding completely or show custom logo/brand name only
+        if (bannerBranding.hidePoweredBy) {
+          if (bannerBranding.logoUrl) {
+            return `
+              <div class="biscotti-branding">
+                <img src="${bannerBranding.logoUrl}" alt="${bannerBranding.brandName || ''}" style="max-height: 20px; opacity: 0.7;" />
+              </div>
+            `;
+          }
+          if (bannerBranding.brandName) {
+            return `
+              <div class="biscotti-branding" style="opacity: 0.6; font-size: 12px;">
+                ${bannerBranding.brandName}
+              </div>
+            `;
+          }
+          // hidePoweredBy = true and no custom logo/brand name => hide completely
+          return '';
+        }
+        
+        // White label active with brandName: replace "Biscotti" with custom brand
+        if (bannerBranding.brandName) {
+          if (bannerBranding.logoUrl) {
+            return `
+              <div class="biscotti-branding">
+                <img src="${bannerBranding.logoUrl}" alt="${bannerBranding.brandName}" style="max-height: 20px; opacity: 0.7;" />
+                <span style="margin-left: 4px;">${bannerBranding.brandName}</span>
+              </div>
+            `;
+          }
+          return `
+            <div class="biscotti-branding">
+              ${bannerBranding.brandName}
+            </div>
+          `;
+        }
+      }
+      
+      if (serverBranding) {
+        // Check for custom logo first (Business/Agency) - legacy path
+        const customLogo = this.engine.config?.whiteLabel?.logo || bannerBranding?.logoUrl;
+        if (customLogo && serverBranding.customLogo) {
+          return `
+            <div class="biscotti-branding">
+              <img src="${customLogo}" alt="" style="max-height: 20px; opacity: 0.7;" />
+            </div>
+          `;
+        }
+        
+        // Check server-provided branding flag
+        if (!serverBranding.showBiscotti) {
+          return '';
+        }
+      } else {
+        // Fallback: Legacy plan-based logic
+        const plan = this.engine.config?.plan || this.engine.config?.accountPlan || 'free';
+        const hiddenPlans = ['starter', 'growth', 'business', 'agency', 'lifetime', 'ltd_growth', 'ltd_business', 'ltd_agency'];
+        const showBranding = !hiddenPlans.includes(plan.toLowerCase());
+        
+        // Check for white-label custom logo (business/agency only)
+        const customLogo = this.engine.config?.whiteLabel?.logo;
+        if (customLogo) {
+          return `
+            <div class="biscotti-branding">
+              <img src="${customLogo}" alt="" style="max-height: 20px; opacity: 0.7;" />
+            </div>
+          `;
+        }
+        
+        if (!showBranding) {
+          return '';
+        }
+      }
+      
+      return `
+        <div class="biscotti-branding">
+          Biscotti-CMP. Made by <a href="https://www.campcruisers.com" target="_blank" rel="noopener">Campcruisers</a>
+        </div>
+      `;
+    }
+
+    _renderCategories() {
+      // Use API categories if available, otherwise fall back to hardcoded
+      let apiCategories = this.engine?.config?.categories;
+      
+      // The server sends categories as {de: [...], en: [...], ...} keyed by language.
+      // Resolve the correct language array before using it.
+      if (apiCategories && !Array.isArray(apiCategories) && typeof apiCategories === 'object') {
+        const lang = this.language || 'en';
+        apiCategories = apiCategories[lang] || apiCategories['en'] || Object.values(apiCategories)[0];
+      }
+      
+      const categories = apiCategories && Array.isArray(apiCategories) && apiCategories.length > 0
+        ? apiCategories.map(c => ({ key: c.id, disabled: c.required === true, name: c.name, description: c.description }))
+        : [
+            { key: 'essential', disabled: true },
+            { key: 'functional', disabled: false },
+            { key: 'analytics', disabled: false },
+            { key: 'marketing', disabled: false },
+            { key: 'ai', disabled: false }
+          ];
+
+      // Get services from _detectActiveServices() which already handles:
+      // 1. Hardcoded essential services (Biscotti CMP, WordPress)
+      // 2. PROVIDER_DATABASE detection (pattern matching)
+      // 3. API service merging with deduplication
+      // No need to merge API services again here - that would cause duplicates!
+      const detectedServices = this._detectActiveServices();
+      
+      // Group ALL services by category (already deduplicated)
+      const servicesByCategory = {};
+      
+      // Add detected services (already includes API services properly merged)
+      if (detectedServices) {
+        for (const [cat, services] of Object.entries(detectedServices)) {
+          if (!servicesByCategory[cat]) servicesByCategory[cat] = {};
+          for (const [id, svc] of Object.entries(services)) {
+            servicesByCategory[cat][id] = {
+              ...svc,
+              id: id,
+              fromDetection: true
+            };
+          }
+        }
+      }
+
+      // Localize essential service descriptions at render time
+      if (servicesByCategory.essential?.biscotti_cmp) {
+        servicesByCategory.essential.biscotti_cmp.description = this.t('services.biscottiDesc');
+        servicesByCategory.essential.biscotti_cmp.purpose = this.t('services.biscottiPurpose');
+      }
+      if (servicesByCategory.essential?.wordpress_core) {
+        servicesByCategory.essential.wordpress_core.description = this.t('services.wordpressDesc');
+        servicesByCategory.essential.wordpress_core.purpose = this.t('services.wordpressPurpose');
+      }
+
+      console.log('[Biscotti] UI rendering categories with services count:', 
+        Object.fromEntries(Object.entries(servicesByCategory).map(([k, v]) => [k, Object.keys(v).length]))
+      );
+
+      const showGranular = this.engine?.config?.showGranularView ?? this.engine?.config?.banner?.showGranularView ?? true;
+
+      return categories.map(cat => {
+        // Get services for this category from API
+        const categoryKey = cat.key;
+
+        const services = servicesByCategory[categoryKey]
+          ? Object.entries(servicesByCategory[categoryKey])
+          : [];
+
+        const hasServices = services.length > 0;
+
+        // Hide empty non-essential categories entirely
+        if (!hasServices && cat.key !== 'essential') return '';
+
+        return `
+        <div class="biscotti-category">
+          <div class="biscotti-category-header" data-expand="${cat.key}">
+            <div class="biscotti-category-name">
+              <span class="biscotti-expand-icon" data-cat="${cat.key}">▼</span>
+              ${this.t('categories.' + cat.key) || cat.name || cat.key}
+            </div>
+            
+            <div style="display:flex; align-items:center; gap: 8px;">
+               ${cat.key === 'essential' ? `<span style="font-size: 11px; font-weight: 600; color: #4caf50;">${this.t('categories.alwaysActive')}</span>` : ''}
+              <div class="biscotti-toggle" role="switch" aria-checked="${this.categoryStates[cat.key] ? 'true' : 'false'}" data-category="${cat.key}" tabindex="0" ${cat.key === 'essential' ? 'aria-disabled="true"' : ''} onclick="event.stopPropagation()">
+                <span class="biscotti-toggle-slider"></span>
+              </div>
+            </div>
+          </div>
+          <div class="biscotti-services-list" id="biscotti-services-${cat.key}">
+            <div class="biscotti-category-desc" style="margin-bottom: 12px; padding: 0 12px;">${this.t('categories.' + cat.key + 'Desc') || cat.description || ''}</div>
+            ${hasServices ? `
+              ${services.map(([serviceKey, service]) => {
+                // Suppress empty service shells (no vendor, no privacy URL, no duration, no PROVIDER_DATABASE match)
+                if (!service.vendor && !service.recipient && !service.privacyPolicyUrl && 
+                    !service.storageDuration && !service.duration && !service.fromDetection) {
+                  console.warn('[Biscotti] Suppressing empty service:', serviceKey);
+                  return ''; // Skip rendering
+                }
+                return `
+                <div class="biscotti-service-item" style="background: rgba(0,0,0,0.02); border-radius: 6px; padding: 12px; margin-bottom: 8px; flex-direction: column; align-items: stretch; gap: 8px;">
+                  <div class="biscotti-service-header">
+                    <div class="biscotti-service-name">
+                      ${service.name}
+                      ${service.gvlVendorId != null ? `<span style="display:inline-block;font-size:9px;font-weight:600;color:#fff;background:#0073b1;padding:1px 5px;border-radius:3px;margin-left:6px;vertical-align:middle;">IAB TCF</span>` : ''}
+                    </div>
+                    <div style="display: flex; gap: 12px; align-items: center;">
+                       <a href="#" class="biscotti-service-details-link" data-details="${serviceKey}" onclick="event.preventDefault();event.stopPropagation();">${this.t('details.details')} ▼</a>
+                        ${showGranular ? `
+                        <div class="biscotti-toggle biscotti-toggle-small">
+                          <input type="checkbox" 
+                                 data-service="${serviceKey}"
+                                 data-service-category="${cat.key}"
+                                 ${cat.key === 'essential' ? 'checked disabled' : ''}
+                                 ${this.categoryStates[cat.key] ? 'checked' : ''}
+                                 aria-label="${service.name || serviceKey}"
+                                 style="position:absolute;opacity:0;width:0;height:0;" aria-hidden="true">
+                          <span class="biscotti-toggle-slider"></span>
+                        </div>
+                        ` : ''}
+                    </div>
+                  </div>
+                  <div class="biscotti-service-desc">${this._l(service.description)}</div>
+                  <!-- GDPR Details Panel -->
+                  <div class="biscotti-service-details" id="biscotti-details-${serviceKey}">
+                    <table class="biscotti-details-table">
+                      ${(() => {
+                        const detectedCountry = this.engine?.config?.detectedCountry;
+                        const isEU = detectedCountry && EU_EEA_COUNTRIES.has(detectedCountry.toUpperCase());
+                        let displayVendor = isEU && service.euEntity ? (service.euEntity.recipient || service.euEntity.name) : (service.vendor || service.recipient);
+                        let displayLocation = isEU && service.euEntity ? (service.euEntity.vendorLocation || service.euEntity.address) : (service.vendorLocation || null);
+                        // If still no vendor, fall back to website operator's legal entity
+                        if (!displayVendor) {
+                          const legalEntity = this.engine?.config?.legalEntity;
+                          if (legalEntity) {
+                            displayVendor = legalEntity.companyName || legalEntity.name || this.t('details.notSpecified');
+                            displayLocation = legalEntity.address || null;
+                          }
+                        }
+                        return (displayVendor ? `<tr><td>${this.t('details.provider')}</td><td>${this._l(displayVendor)}</td></tr>` : `<tr><td>${this.t('details.provider')}</td><td>${this.t('details.notSpecified')}</td></tr>`) +
+                          (displayLocation ? `<tr><td>${this.t('details.location')}</td><td>${this._l(displayLocation)}</td></tr>` : '');
+                      })()}
+                      <tr><td>${this.t('details.duration')}</td><td>${this._l(service.storageDuration) || this._l(service.duration) || this.t('details.notSpecified')}</td></tr>
+                      <tr><td>${this.t('details.purpose')}</td><td>${this._l(service.purpose) || this._l(service.description)}</td></tr>
+                      <tr><td>${this.t('details.legalBasis')}</td><td>${(() => {
+                        const raw = this._l(service.legalBasis);
+                        if (raw && typeof raw === 'object') return raw;
+                        const mapped = LEGAL_BASIS_MAP[raw];
+                        if (mapped) return mapped[this.language] || mapped['en'] || raw;
+                        return raw || 'Art. 6(1)(a) GDPR';
+                      })()}</td></tr>
+                      <tr><td>${this.t('details.privacy')}</td><td>${(() => { const url = (service._privacyUrls && service._privacyUrls[this.language]) || service.privacyPolicyUrl; return url ? `<a href="${url}" target="_blank" rel="noopener">${this.t('details.privacyLink')} ↗</a>` : this.t('details.notSpecified'); })()}</td></tr>
+                      <tr><td>${this.t('details.transfer')}</td><td>${this._l(service.transferSafeguard) || this.t('details.notSpecified')}</td></tr>
+                    </table>
+                  </div>
+                </div>
+              `;}).join('')}
+            ` : ''}
+          </div>
+        </div>
+      `}).join('') + this._renderTcfTabs();
+    }
+
+    /**
+     * Render full IAB TCF tabbed interface (Purposes, Features, Vendors)
+     * Uses tcfData from GVL (populated by _loadConfigFromAPI) and/or
+     * tcfPurposes from API config
+     */
+    _renderTcfTabs() {
+      // If TCF is explicitly disabled by server config, render nothing
+      if (this.engine?.config?.tcfEnabled === false) {
+        return '';
+      }
+      
+      const tcfData = this.engine?.config?.tcfData;
+      const tcfPurposes = this.engine?.config?.tcfPurposes;
+      
+      // If we have full GVL data, use it for the tabbed interface
+      if (tcfData && tcfData.purposes && Object.keys(tcfData.purposes).length > 0) {
+        return this._renderFullTcfTabs(tcfData);
+      }
+      
+      // Fallback: use simple tcfPurposes from API if no full GVL
+      if (!tcfPurposes) return '';
+      const lang = this.language;
+      const purposes = Array.isArray(tcfPurposes) ? tcfPurposes : (tcfPurposes[lang] || tcfPurposes['en'] || tcfPurposes['de'] || []);
+      if (purposes.length === 0) return '';
+
+      const tcfHeadings = {
+        de: 'IAB TCF 2.3 – Verarbeitungszwecke',
+        en: 'IAB TCF 2.3 – Processing Purposes',
+        fr: 'IAB TCF 2.3 – Finalités du traitement',
+        es: 'IAB TCF 2.3 – Finalidades del tratamiento',
+        it: 'IAB TCF 2.3 – Finalità del trattamento',
+        nl: 'IAB TCF 2.3 – Verwerkingsdoeleinden',
+        pl: 'IAB TCF 2.3 – Cele przetwarzania',
+        pt: 'IAB TCF 2.3 – Finalidades de tratamento',
+        da: 'IAB TCF 2.3 – Behandlingsformål',
+        ar: 'IAB TCF 2.3 – أغراض المعالجة',
+        bg: 'IAB TCF 2.3 – Цели на обработка',
+        bs: 'IAB TCF 2.3 – Svrhe obrade',
+        ca: 'IAB TCF 2.3 – Finalitats del tractament',
+        cs: 'IAB TCF 2.3 – Účely zpracování',
+        el: 'IAB TCF 2.3 – Σκοποί επεξεργασίας',
+        eu: 'IAB TCF 2.3 – Tratamendu helburuak',
+        fi: 'IAB TCF 2.3 – Käsittelyn tarkoitukset',
+        gl: 'IAB TCF 2.3 – Finalidades do tratamento',
+        he: 'IAB TCF 2.3 – מטרות עיבוד',
+        hi: 'IAB TCF 2.3 – प्रसंस्करण उद्देश्य',
+        hr: 'IAB TCF 2.3 – Svrhe obrade',
+        hu: 'IAB TCF 2.3 – Feldolgozási célok',
+        id: 'IAB TCF 2.3 – Tujuan pemrosesan',
+        ja: 'IAB TCF 2.3 – 処理目的',
+        lt: 'IAB TCF 2.3 – Apdorojimo tikslai',
+        mr: 'IAB TCF 2.3 – प्रक्रिया उद्देश',
+        nb: 'IAB TCF 2.3 – Behandlingsformål',
+        ro: 'IAB TCF 2.3 – Scopurile prelucrării',
+        ru: 'IAB TCF 2.3 – Цели обработки',
+        sk: 'IAB TCF 2.3 – Účely spracovania',
+        sl: 'IAB TCF 2.3 – Nameni obdelave',
+        sr: 'IAB TCF 2.3 – Сврхе обраде',
+        sv: 'IAB TCF 2.3 – Behandlingsändamål',
+        th: 'IAB TCF 2.3 – วัตถุประสงค์การประมวลผล',
+        tr: 'IAB TCF 2.3 – İşleme amaçları',
+        uk: 'IAB TCF 2.3 – Цілі обробки',
+        vi: 'IAB TCF 2.3 – Mục đích xử lý',
+        zh: 'IAB TCF 2.3 – 处理目的',
+        'zh-TW': 'IAB TCF 2.3 – 處理目的'
+      };
+      const headerText = tcfHeadings[lang] || tcfHeadings['en'];
+
+      return `
+        <div class="biscotti-tcf-section" style="margin-top:16px;padding-top:16px;border-top:2px solid var(--biscotti-primary-color, #9B6B3C);">
+          <div style="font-weight:700;font-size:14px;margin-bottom:12px;color:var(--biscotti-text-color, #1a1a1a);">
+            ${headerText}
+          </div>
+          ${purposes.map(p => `
+            <div class="biscotti-category">
+              <div class="biscotti-category-header" data-expand="tcf-${p.id}">
+                <div class="biscotti-category-info">
+                  <div class="biscotti-category-name">${p.name}</div>
+                  <div class="biscotti-category-desc">${p.description}</div>
+                </div>
+                <div class="biscotti-toggle" onclick="event.stopPropagation()">
+                  <input type="checkbox" data-tcf-purpose="${p.id}" style="position:absolute;opacity:0;width:0;height:0;" aria-hidden="true">
+                  <span class="biscotti-toggle-slider"></span>
+                </div>
+              </div>
+            </div>
+          `).join('')}
+        </div>
+      `;
+    }
+
+    /**
+     * Render the full tabbed TCF interface with Purposes, Features, and Vendors
+     * Uses GVL data for comprehensive vendor/feature information
+     */
+    _renderFullTcfTabs(tcfData) {
+      const lang = this.language;
+      const purposes = Object.values(tcfData.purposes || {}).sort((a,b) => a.id - b.id);
+      const specialPurposes = Object.values(tcfData.specialPurposes || {}).sort((a,b) => a.id - b.id);
+      const features = Object.values(tcfData.features || {}).sort((a,b) => a.id - b.id);
+      const specialFeatures = Object.values(tcfData.specialFeatures || {}).sort((a,b) => a.id - b.id);
+      const vendors = tcfData.vendors || [];
+      
+      // Build raw GVL vendor map for storage disclosures (Policy Check 24)
+      const rawVendors = this.engine?.config?.rawGvlJson?.vendors || {};
+      
+      // TCF Tab Labels per language
+      const tcfLabels = {
+        de: { purposes: 'Zwecke', features: 'Funktionen', vendors: 'Partner', search: 'Partner suchen...', loadMore: 'Mehr laden...', legInt: 'Berechtigtes Interesse', alwaysActive: 'Immer aktiv', specialPurposes: 'Besondere Zwecke', featuresHeader: 'Funktionen', specialFeatures: 'Besondere Funktionen', privacyPolicy: 'Datenschutz', consentPurposes: 'Einwilligung: Zwecke', none: 'Keine', legIntPurposes: 'Berechtigtes Interesse: Zwecke', vendorId: 'ID:', otherPartners: 'Andere Partner' },
+        en: { purposes: 'Purposes', features: 'Features', vendors: 'Vendors', search: 'Search vendors...', loadMore: 'Load more...', legInt: 'Legitimate Interest', alwaysActive: 'Always active', specialPurposes: 'Special Purposes', featuresHeader: 'Features', specialFeatures: 'Special Features', privacyPolicy: 'Privacy Policy', consentPurposes: 'Consent: Purposes', none: 'None', legIntPurposes: 'Legitimate Interest: Purposes', vendorId: 'ID:', otherPartners: 'Other Partners' },
+        fr: { purposes: 'Finalités', features: 'Fonctionnalités', vendors: 'Partenaires', search: 'Rechercher des partenaires...', loadMore: 'Charger plus...', legInt: 'Intérêt légitime', alwaysActive: 'Toujours actif', specialPurposes: 'Finalités spéciales', featuresHeader: 'Fonctionnalités', specialFeatures: 'Fonctionnalités spéciales', privacyPolicy: 'Politique de confidentialité', consentPurposes: 'Consentement : Finalités', none: 'Aucun', legIntPurposes: 'Intérêt légitime : Finalités', vendorId: 'ID :', otherPartners: 'Autres partenaires' },
+        es: { purposes: 'Finalidades', features: 'Funcionalidades', vendors: 'Socios', search: 'Buscar socios...', loadMore: 'Cargar más...', legInt: 'Interés legítimo', alwaysActive: 'Siempre activo', specialPurposes: 'Finalidades especiales', featuresHeader: 'Funcionalidades', specialFeatures: 'Funcionalidades especiales', privacyPolicy: 'Política de privacidad', consentPurposes: 'Consentimiento: Finalidades', none: 'Ninguno', legIntPurposes: 'Interés legítimo: Finalidades', vendorId: 'ID:', otherPartners: 'Otros socios' },
+        it: { purposes: 'Finalità', features: 'Funzionalità', vendors: 'Partner', search: 'Cerca partner...', loadMore: 'Carica altri...', legInt: 'Interesse legittimo', alwaysActive: 'Sempre attivo', specialPurposes: 'Finalità speciali', featuresHeader: 'Funzionalità', specialFeatures: 'Funzionalità speciali', privacyPolicy: 'Informativa sulla privacy', consentPurposes: 'Consenso: Finalità', none: 'Nessuno', legIntPurposes: 'Interesse legittimo: Finalità', vendorId: 'ID:', otherPartners: 'Altri partner' },
+        nl: { purposes: 'Doeleinden', features: 'Functies', vendors: 'Partners', search: 'Partners zoeken...', loadMore: 'Meer laden...', legInt: 'Gerechtvaardigd belang', alwaysActive: 'Altijd actief', specialPurposes: 'Speciale doeleinden', featuresHeader: 'Functies', specialFeatures: 'Speciale functies', privacyPolicy: 'Privacybeleid', consentPurposes: 'Toestemming: Doeleinden', none: 'Geen', legIntPurposes: 'Gerechtvaardigd belang: Doeleinden', vendorId: 'ID:', otherPartners: 'Andere partners' },
+        pl: { purposes: 'Cele', features: 'Funkcje', vendors: 'Partnerzy', search: 'Szukaj partnerów...', loadMore: 'Załaduj więcej...', legInt: 'Uzasadniony interes', alwaysActive: 'Zawsze aktywne', specialPurposes: 'Cele specjalne', featuresHeader: 'Funkcje', specialFeatures: 'Funkcje specjalne', privacyPolicy: 'Polityka prywatności', consentPurposes: 'Zgoda: Cele', none: 'Brak', legIntPurposes: 'Uzasadniony interes: Cele', vendorId: 'ID:', otherPartners: 'Inni partnerzy' },
+        pt: { purposes: 'Finalidades', features: 'Funcionalidades', vendors: 'Parceiros', search: 'Pesquisar parceiros...', loadMore: 'Carregar mais...', legInt: 'Interesse legítimo', alwaysActive: 'Sempre ativo', specialPurposes: 'Finalidades especiais', featuresHeader: 'Funcionalidades', specialFeatures: 'Funcionalidades especiais', privacyPolicy: 'Política de privacidade', consentPurposes: 'Consentimento: Finalidades', none: 'Nenhum', legIntPurposes: 'Interesse legítimo: Finalidades', vendorId: 'ID:', otherPartners: 'Outros parceiros' },
+        da: { purposes: 'Formål', features: 'Funktioner', vendors: 'Partnere', search: 'Søg partnere...', loadMore: 'Indlæs flere...', legInt: 'Berettiget interesse', alwaysActive: 'Altid aktiv', specialPurposes: 'Særlige formål', featuresHeader: 'Funktioner', specialFeatures: 'Særlige funktioner', privacyPolicy: 'Privatlivspolitik', consentPurposes: 'Samtykke: Formål', none: 'Ingen', legIntPurposes: 'Berettiget interesse: Formål', vendorId: 'ID:', otherPartners: 'Andre partnere' },
+        ar: { purposes: 'الأغراض', features: 'الميزات', vendors: 'الشركاء', search: 'بحث الشركاء...', loadMore: 'تحميل المزيد...', legInt: 'المصلحة المشروعة', alwaysActive: 'نشط دائمًا', specialPurposes: 'أغراض خاصة', featuresHeader: 'الميزات', specialFeatures: 'ميزات خاصة', privacyPolicy: 'سياسة الخصوصية', consentPurposes: 'الموافقة: الأغراض', none: 'لا شيء', legIntPurposes: 'المصلحة المشروعة: الأغراض', vendorId: 'المعرف:', otherPartners: 'شركاء آخرون' },
+        bg: { purposes: 'Цели', features: 'Функции', vendors: 'Партньори', search: 'Търсене на партньори...', loadMore: 'Зареди още...', legInt: 'Легитимен интерес', alwaysActive: 'Винаги активно', specialPurposes: 'Специални цели', featuresHeader: 'Функции', specialFeatures: 'Специални функции', privacyPolicy: 'Политика за поверителност', consentPurposes: 'Съгласие: Цели', none: 'Няма', legIntPurposes: 'Легитимен интерес: Цели', vendorId: 'ID:', otherPartners: 'Други партньори' },
+        bs: { purposes: 'Svrhe', features: 'Funkcije', vendors: 'Partneri', search: 'Pretraži partnere...', loadMore: 'Učitaj više...', legInt: 'Legitimni interes', alwaysActive: 'Uvijek aktivno', specialPurposes: 'Posebne svrhe', featuresHeader: 'Funkcije', specialFeatures: 'Posebne funkcije', privacyPolicy: 'Politika privatnosti', consentPurposes: 'Pristanak: Svrhe', none: 'Nema', legIntPurposes: 'Legitimni interes: Svrhe', vendorId: 'ID:', otherPartners: 'Ostali partneri' },
+        ca: { purposes: 'Finalitats', features: 'Funcionalitats', vendors: 'Socis', search: 'Cercar socis...', loadMore: 'Carregar més...', legInt: 'Interès legítim', alwaysActive: 'Sempre actiu', specialPurposes: 'Finalitats especials', featuresHeader: 'Funcionalitats', specialFeatures: 'Funcionalitats especials', privacyPolicy: 'Política de privadesa', consentPurposes: 'Consentiment: Finalitats', none: 'Cap', legIntPurposes: 'Interès legítim: Finalitats', vendorId: 'ID:', otherPartners: 'Altres socis' },
+        cs: { purposes: 'Účely', features: 'Funkce', vendors: 'Partneři', search: 'Hledat partnery...', loadMore: 'Načíst více...', legInt: 'Oprávněný zájem', alwaysActive: 'Vždy aktivní', specialPurposes: 'Zvláštní účely', featuresHeader: 'Funkce', specialFeatures: 'Zvláštní funkce', privacyPolicy: 'Zásady ochrany soukromí', consentPurposes: 'Souhlas: Účely', none: 'Žádné', legIntPurposes: 'Oprávněný zájem: Účely', vendorId: 'ID:', otherPartners: 'Ostatní partneři' },
+        el: { purposes: 'Σκοποί', features: 'Χαρακτηριστικά', vendors: 'Συνεργάτες', search: 'Αναζήτηση συνεργατών...', loadMore: 'Φόρτωση περισσότερων...', legInt: 'Έννομο συμφέρον', alwaysActive: 'Πάντα ενεργό', specialPurposes: 'Ειδικοί σκοποί', featuresHeader: 'Χαρακτηριστικά', specialFeatures: 'Ειδικά χαρακτηριστικά', privacyPolicy: 'Πολιτική απορρήτου', consentPurposes: 'Συγκατάθεση: Σκοποί', none: 'Κανένα', legIntPurposes: 'Έννομο συμφέρον: Σκοποί', vendorId: 'ID:', otherPartners: 'Άλλοι συνεργάτες' },
+        eu: { purposes: 'Helburuak', features: 'Ezaugarriak', vendors: 'Bazkideak', search: 'Bazkideak bilatu...', loadMore: 'Gehiago kargatu...', legInt: 'Interes legitimoa', alwaysActive: 'Beti aktibo', specialPurposes: 'Helburu bereziak', featuresHeader: 'Ezaugarriak', specialFeatures: 'Ezaugarri bereziak', privacyPolicy: 'Pribatutasun politika', consentPurposes: 'Baimena: Helburuak', none: 'Bat ere ez', legIntPurposes: 'Interes legitimoa: Helburuak', vendorId: 'ID:', otherPartners: 'Beste bazkideak' },
+        fi: { purposes: 'Tarkoitukset', features: 'Ominaisuudet', vendors: 'Kumppanit', search: 'Hae kumppaneita...', loadMore: 'Lataa lisää...', legInt: 'Oikeutettu etu', alwaysActive: 'Aina aktiivinen', specialPurposes: 'Erityistarkoitukset', featuresHeader: 'Ominaisuudet', specialFeatures: 'Erityisominaisuudet', privacyPolicy: 'Tietosuojakäytäntö', consentPurposes: 'Suostumus: Tarkoitukset', none: 'Ei mitään', legIntPurposes: 'Oikeutettu etu: Tarkoitukset', vendorId: 'ID:', otherPartners: 'Muut kumppanit' },
+        gl: { purposes: 'Finalidades', features: 'Funcionalidades', vendors: 'Socios', search: 'Buscar socios...', loadMore: 'Cargar máis...', legInt: 'Interese lexítimo', alwaysActive: 'Sempre activo', specialPurposes: 'Finalidades especiais', featuresHeader: 'Funcionalidades', specialFeatures: 'Funcionalidades especiais', privacyPolicy: 'Política de privacidade', consentPurposes: 'Consentimento: Finalidades', none: 'Ningún', legIntPurposes: 'Interese lexítimo: Finalidades', vendorId: 'ID:', otherPartners: 'Outros socios' },
+        he: { purposes: 'מטרות', features: 'תכונות', vendors: 'שותפים', search: 'חיפוש שותפים...', loadMore: 'טען עוד...', legInt: 'אינטרס לגיטימי', alwaysActive: 'פעיל תמיד', specialPurposes: 'מטרות מיוחדות', featuresHeader: 'תכונות', specialFeatures: 'תכונות מיוחדות', privacyPolicy: 'מדיניות פרטיות', consentPurposes: 'הסכמה: מטרות', none: 'אין', legIntPurposes: 'אינטרס לגיטימי: מטרות', vendorId: 'מזהה:', otherPartners: 'שותפים אחרים' },
+        hi: { purposes: 'उद्देश्य', features: 'विशेषताएं', vendors: 'भागीदार', search: 'भागीदार खोजें...', loadMore: 'और लोड करें...', legInt: 'वैध हित', alwaysActive: 'हमेशा सक्रिय', specialPurposes: 'विशेष उद्देश्य', featuresHeader: 'विशेषताएं', specialFeatures: 'विशेष विशेषताएं', privacyPolicy: 'गोपनीयता नीति', consentPurposes: 'सहमति: उद्देश्य', none: 'कोई नहीं', legIntPurposes: 'वैध हित: उद्देश्य', vendorId: 'ID:', otherPartners: 'अन्य भागीदार' },
+        hr: { purposes: 'Svrhe', features: 'Značajke', vendors: 'Partneri', search: 'Pretraži partnere...', loadMore: 'Učitaj više...', legInt: 'Legitimni interes', alwaysActive: 'Uvijek aktivno', specialPurposes: 'Posebne svrhe', featuresHeader: 'Značajke', specialFeatures: 'Posebne značajke', privacyPolicy: 'Politika privatnosti', consentPurposes: 'Pristanak: Svrhe', none: 'Nema', legIntPurposes: 'Legitimni interes: Svrhe', vendorId: 'ID:', otherPartners: 'Ostali partneri' },
+        hu: { purposes: 'Célok', features: 'Funkciók', vendors: 'Partnerek', search: 'Partnerek keresése...', loadMore: 'Több betöltése...', legInt: 'Jogos érdek', alwaysActive: 'Mindig aktív', specialPurposes: 'Különleges célok', featuresHeader: 'Funkciók', specialFeatures: 'Különleges funkciók', privacyPolicy: 'Adatvédelmi irányelvek', consentPurposes: 'Hozzájárulás: Célok', none: 'Nincs', legIntPurposes: 'Jogos érdek: Célok', vendorId: 'ID:', otherPartners: 'Egyéb partnerek' },
+        id: { purposes: 'Tujuan', features: 'Fitur', vendors: 'Mitra', search: 'Cari mitra...', loadMore: 'Muat lebih banyak...', legInt: 'Kepentingan sah', alwaysActive: 'Selalu aktif', specialPurposes: 'Tujuan khusus', featuresHeader: 'Fitur', specialFeatures: 'Fitur khusus', privacyPolicy: 'Kebijakan privasi', consentPurposes: 'Persetujuan: Tujuan', none: 'Tidak ada', legIntPurposes: 'Kepentingan sah: Tujuan', vendorId: 'ID:', otherPartners: 'Mitra lainnya' },
+        ja: { purposes: '目的', features: '機能', vendors: 'パートナー', search: 'パートナーを検索...', loadMore: 'さらに読み込む...', legInt: '正当な利益', alwaysActive: '常にアクティブ', specialPurposes: '特別な目的', featuresHeader: '機能', specialFeatures: '特別な機能', privacyPolicy: 'プライバシーポリシー', consentPurposes: '同意：目的', none: 'なし', legIntPurposes: '正当な利益：目的', vendorId: 'ID:', otherPartners: 'その他のパートナー' },
+        lt: { purposes: 'Tikslai', features: 'Funkcijos', vendors: 'Partneriai', search: 'Ieškoti partnerių...', loadMore: 'Įkelti daugiau...', legInt: 'Teisėtas interesas', alwaysActive: 'Visada aktyvus', specialPurposes: 'Specialūs tikslai', featuresHeader: 'Funkcijos', specialFeatures: 'Specialios funkcijos', privacyPolicy: 'Privatumo politika', consentPurposes: 'Sutikimas: Tikslai', none: 'Nėra', legIntPurposes: 'Teisėtas interesas: Tikslai', vendorId: 'ID:', otherPartners: 'Kiti partneriai' },
+        mr: { purposes: 'उद्देश', features: 'वैशिष्ट्ये', vendors: 'भागीदार', search: 'भागीदार शोधा...', loadMore: 'अधिक लोड करा...', legInt: 'कायदेशीर हित', alwaysActive: 'नेहमी सक्रिय', specialPurposes: 'विशेष उद्देश', featuresHeader: 'वैशिष्ट्ये', specialFeatures: 'विशेष वैशिष्ट्ये', privacyPolicy: 'गोपनीयता धोरण', consentPurposes: 'संमती: उद्देश', none: 'काहीही नाही', legIntPurposes: 'कायदेशीर हित: उद्देश', vendorId: 'ID:', otherPartners: 'इतर भागीदार' },
+        nb: { purposes: 'Formål', features: 'Funksjoner', vendors: 'Partnere', search: 'Søk partnere...', loadMore: 'Last inn flere...', legInt: 'Berettiget interesse', alwaysActive: 'Alltid aktiv', specialPurposes: 'Spesielle formål', featuresHeader: 'Funksjoner', specialFeatures: 'Spesielle funksjoner', privacyPolicy: 'Personvernerklæring', consentPurposes: 'Samtykke: Formål', none: 'Ingen', legIntPurposes: 'Berettiget interesse: Formål', vendorId: 'ID:', otherPartners: 'Andre partnere' },
+        ro: { purposes: 'Scopuri', features: 'Funcționalități', vendors: 'Parteneri', search: 'Căutare parteneri...', loadMore: 'Încarcă mai mult...', legInt: 'Interes legitim', alwaysActive: 'Întotdeauna activ', specialPurposes: 'Scopuri speciale', featuresHeader: 'Funcționalități', specialFeatures: 'Funcționalități speciale', privacyPolicy: 'Politica de confidențialitate', consentPurposes: 'Consimțământ: Scopuri', none: 'Niciuna', legIntPurposes: 'Interes legitim: Scopuri', vendorId: 'ID:', otherPartners: 'Alți parteneri' },
+        ru: { purposes: 'Цели', features: 'Функции', vendors: 'Партнёры', search: 'Поиск партнёров...', loadMore: 'Загрузить ещё...', legInt: 'Законный интерес', alwaysActive: 'Всегда активно', specialPurposes: 'Особые цели', featuresHeader: 'Функции', specialFeatures: 'Особые функции', privacyPolicy: 'Политика конфиденциальности', consentPurposes: 'Согласие: Цели', none: 'Нет', legIntPurposes: 'Законный интерес: Цели', vendorId: 'ID:', otherPartners: 'Другие партнёры' },
+        sk: { purposes: 'Účely', features: 'Funkcie', vendors: 'Partneri', search: 'Hľadať partnerov...', loadMore: 'Načítať viac...', legInt: 'Oprávnený záujem', alwaysActive: 'Vždy aktívne', specialPurposes: 'Špeciálne účely', featuresHeader: 'Funkcie', specialFeatures: 'Špeciálne funkcie', privacyPolicy: 'Zásady ochrany osobných údajov', consentPurposes: 'Súhlas: Účely', none: 'Žiadne', legIntPurposes: 'Oprávnený záujem: Účely', vendorId: 'ID:', otherPartners: 'Ostatní partneri' },
+        sl: { purposes: 'Nameni', features: 'Funkcije', vendors: 'Partnerji', search: 'Iskanje partnerjev...', loadMore: 'Naloži več...', legInt: 'Zakoniti interes', alwaysActive: 'Vedno aktivno', specialPurposes: 'Posebni nameni', featuresHeader: 'Funkcije', specialFeatures: 'Posebne funkcije', privacyPolicy: 'Politika zasebnosti', consentPurposes: 'Privolitev: Nameni', none: 'Nič', legIntPurposes: 'Zakoniti interes: Nameni', vendorId: 'ID:', otherPartners: 'Drugi partnerji' },
+        sr: { purposes: 'Сврхе', features: 'Функције', vendors: 'Партнери', search: 'Претражи партнере...', loadMore: 'Учитај још...', legInt: 'Легитимни интерес', alwaysActive: 'Увек активно', specialPurposes: 'Посебне сврхе', featuresHeader: 'Функције', specialFeatures: 'Посебне функције', privacyPolicy: 'Политика приватности', consentPurposes: 'Сагласност: Сврхе', none: 'Нема', legIntPurposes: 'Легитимни интерес: Сврхе', vendorId: 'ID:', otherPartners: 'Остали партнери' },
+        sv: { purposes: 'Ändamål', features: 'Funktioner', vendors: 'Partners', search: 'Sök partners...', loadMore: 'Ladda mer...', legInt: 'Berättigat intresse', alwaysActive: 'Alltid aktiv', specialPurposes: 'Särskilda ändamål', featuresHeader: 'Funktioner', specialFeatures: 'Särskilda funktioner', privacyPolicy: 'Integritetspolicy', consentPurposes: 'Samtycke: Ändamål', none: 'Ingen', legIntPurposes: 'Berättigat intresse: Ändamål', vendorId: 'ID:', otherPartners: 'Andra partners' },
+        th: { purposes: 'วัตถุประสงค์', features: 'คุณสมบัติ', vendors: 'พันธมิตร', search: 'ค้นหาพันธมิตร...', loadMore: 'โหลดเพิ่ม...', legInt: 'ผลประโยชน์โดยชอบ', alwaysActive: 'ใช้งานตลอด', specialPurposes: 'วัตถุประสงค์พิเศษ', featuresHeader: 'คุณสมบัติ', specialFeatures: 'คุณสมบัติพิเศษ', privacyPolicy: 'นโยบายความเป็นส่วนตัว', consentPurposes: 'ความยินยอม: วัตถุประสงค์', none: 'ไม่มี', legIntPurposes: 'ผลประโยชน์โดยชอบ: วัตถุประสงค์', vendorId: 'ID:', otherPartners: 'พันธมิตรอื่นๆ' },
+        tr: { purposes: 'Amaçlar', features: 'Özellikler', vendors: 'Ortaklar', search: 'Ortakları ara...', loadMore: 'Daha fazla yükle...', legInt: 'Meşru menfaat', alwaysActive: 'Her zaman aktif', specialPurposes: 'Özel amaçlar', featuresHeader: 'Özellikler', specialFeatures: 'Özel özellikler', privacyPolicy: 'Gizlilik politikası', consentPurposes: 'Onay: Amaçlar', none: 'Yok', legIntPurposes: 'Meşru menfaat: Amaçlar', vendorId: 'ID:', otherPartners: 'Diğer ortaklar' },
+        uk: { purposes: 'Цілі', features: 'Функції', vendors: 'Партнери', search: 'Шукати партнерів...', loadMore: 'Завантажити ще...', legInt: 'Законний інтерес', alwaysActive: 'Завжди активно', specialPurposes: 'Особливі цілі', featuresHeader: 'Функції', specialFeatures: 'Особливі функції', privacyPolicy: 'Політика конфіденційності', consentPurposes: 'Згода: Цілі', none: 'Немає', legIntPurposes: 'Законний інтерес: Цілі', vendorId: 'ID:', otherPartners: 'Інші партнери' },
+        vi: { purposes: 'Mục đích', features: 'Tính năng', vendors: 'Đối tác', search: 'Tìm đối tác...', loadMore: 'Tải thêm...', legInt: 'Lợi ích hợp pháp', alwaysActive: 'Luôn hoạt động', specialPurposes: 'Mục đích đặc biệt', featuresHeader: 'Tính năng', specialFeatures: 'Tính năng đặc biệt', privacyPolicy: 'Chính sách bảo mật', consentPurposes: 'Đồng ý: Mục đích', none: 'Không', legIntPurposes: 'Lợi ích hợp pháp: Mục đích', vendorId: 'ID:', otherPartners: 'Đối tác khác' },
+        zh: { purposes: '目的', features: '功能', vendors: '合作伙伴', search: '搜索合作伙伴...', loadMore: '加载更多...', legInt: '合法利益', alwaysActive: '始终启用', specialPurposes: '特殊目的', featuresHeader: '功能', specialFeatures: '特殊功能', privacyPolicy: '隐私政策', consentPurposes: '同意：目的', none: '无', legIntPurposes: '合法利益：目的', vendorId: 'ID:', otherPartners: '其他合作伙伴' },
+        'zh-TW': { purposes: '目的', features: '功能', vendors: '合作夥伴', search: '搜尋合作夥伴...', loadMore: '載入更多...', legInt: '合法利益', alwaysActive: '始終啟用', specialPurposes: '特殊目的', featuresHeader: '功能', specialFeatures: '特殊功能', privacyPolicy: '隱私權政策', consentPurposes: '同意：目的', none: '無', legIntPurposes: '合法利益：目的', vendorId: 'ID:', otherPartners: '其他合作夥伴' },
+        ko: { purposes: '목적', features: '기능', vendors: '파트너', search: '파트너 검색...', loadMore: '더 보기...', legInt: '정당한 이익', alwaysActive: '항상 활성', specialPurposes: '특수 목적', featuresHeader: '기능', specialFeatures: '특수 기능', privacyPolicy: '개인정보 처리방침', consentPurposes: '동의: 목적', none: '없음', legIntPurposes: '정당한 이익: 목적', vendorId: 'ID:', otherPartners: '기타 파트너' }
+      };
+      const l = tcfLabels[lang] || tcfLabels['en'];
+
+      // Get non-IAB services from config for the "Other Partners" tab
+      const allServices = this.engine?.config?.services || [];
+      const nonIabServices = allServices.filter(s => 
+        s.gvlVendorId == null && 
+        (s.name || '') !== 'Biscotti CMP'
+      );
+      const nonIabCount = nonIabServices.length;
+      
+      // Initialize TCF state tracking if not present
+      if (!this.tcfPurposeConsents) this.tcfPurposeConsents = {};
+      if (!this.tcfPurposeLIs) this.tcfPurposeLIs = {};
+      if (!this.tcfSpecialFeatures) this.tcfSpecialFeatures = {};
+      if (!this.tcfVendorConsents) this.tcfVendorConsents = {};
+      if (!this.tcfVendorLIs) this.tcfVendorLIs = {};
+      if (!this.activeTcfTab) this.activeTcfTab = 'purposes';
+      
+      let html = `
+        <div class="biscotti-tcf-section" style="margin-top:16px;padding-top:16px;border-top:2px solid var(--biscotti-primary-color, #9B6B3C);">
+          <div class="biscotti-tcf-tabs" tabindex="0" role="tablist" style="display:flex;gap:0;margin-bottom:16px;border-bottom:2px solid #e0e0e0;overflow-x:auto;-webkit-overflow-scrolling:touch;scrollbar-width:none;">
+            <div class="biscotti-tcf-tab ${this.activeTcfTab === 'purposes' ? 'active' : ''}" role="tab" aria-selected="${this.activeTcfTab === 'purposes'}" data-tcf-tab="purposes" style="padding:10px 16px;cursor:pointer;font-size:13px;font-weight:600;color:#595959;border-bottom:2px solid transparent;margin-bottom:-2px;white-space:nowrap;transition:all 0.2s;${this.activeTcfTab === 'purposes' ? 'color:var(--biscotti-primary-color, #9B6B3C);border-bottom-color:var(--biscotti-primary-color, #9B6B3C);' : ''}">${l.purposes}</div>
+            <div class="biscotti-tcf-tab ${this.activeTcfTab === 'features' ? 'active' : ''}" role="tab" aria-selected="${this.activeTcfTab === 'features'}" data-tcf-tab="features" style="padding:10px 16px;cursor:pointer;font-size:13px;font-weight:600;color:#595959;border-bottom:2px solid transparent;margin-bottom:-2px;white-space:nowrap;transition:all 0.2s;${this.activeTcfTab === 'features' ? 'color:var(--biscotti-primary-color, #9B6B3C);border-bottom-color:var(--biscotti-primary-color, #9B6B3C);' : ''}">${l.features}</div>
+            <div class="biscotti-tcf-tab ${this.activeTcfTab === 'vendors' ? 'active' : ''}" role="tab" aria-selected="${this.activeTcfTab === 'vendors'}" data-tcf-tab="vendors" style="padding:10px 16px;cursor:pointer;font-size:13px;font-weight:600;color:#595959;border-bottom:2px solid transparent;margin-bottom:-2px;white-space:nowrap;transition:all 0.2s;${this.activeTcfTab === 'vendors' ? 'color:var(--biscotti-primary-color, #9B6B3C);border-bottom-color:var(--biscotti-primary-color, #9B6B3C);' : ''}">${l.vendors} (${vendors.length})</div>
+            ${nonIabCount > 0 ? `<div class="biscotti-tcf-tab ${this.activeTcfTab === 'otherPartners' ? 'active' : ''}" role="tab" aria-selected="${this.activeTcfTab === 'otherPartners'}" data-tcf-tab="otherPartners" style="padding:10px 16px;cursor:pointer;font-size:13px;font-weight:600;color:#595959;border-bottom:2px solid transparent;margin-bottom:-2px;white-space:nowrap;transition:all 0.2s;${this.activeTcfTab === 'otherPartners' ? 'color:var(--biscotti-primary-color, #9B6B3C);border-bottom-color:var(--biscotti-primary-color, #9B6B3C);' : ''}">${l.otherPartners} (${nonIabCount})</div>` : ''}
+          </div>
+
+          <!-- Purposes Pane -->
+          <div class="biscotti-tcf-pane" id="tcf-pane-purposes" style="${this.activeTcfTab === 'purposes' ? '' : 'display:none;'}">
+      `;
+      
+      // Standard Purposes (1-11)
+      purposes.forEach(p => {
+        const hasLI = p.id !== 1; // Purpose 1: only consent, no LI
+        const vendorsForPurpose = vendors.filter(v => 
+          (v.purposes || []).includes(p.id) || (v.legIntPurposes || []).includes(p.id)
+        ).length;
+        const vendorCountLabel = this.t('tcf.vendorsPerPurpose').replace('{count}', vendorsForPurpose);
+        html += `
+          <div class="biscotti-category" style="margin-bottom:0;">
+            <div class="biscotti-category-header" style="align-items: center;" data-expand="tcf-p-${p.id}">
+              <div class="biscotti-category-name" style="margin-bottom:0;">
+                <span class="biscotti-expand-icon" data-cat="tcf-p-${p.id}">▼</span>
+                ${p.name}
+              </div>
+              <div class="biscotti-toggle" onclick="event.stopPropagation()">
+                <input type="checkbox" data-tcf-purpose-consent="${p.id}" ${this.tcfPurposeConsents[p.id] ? 'checked' : ''} style="position:absolute;opacity:0;width:0;height:0;" aria-hidden="true">
+                <span class="biscotti-toggle-slider"></span>
+              </div>
+            </div>
+            
+            <div class="biscotti-services-list" id="biscotti-services-tcf-p-${p.id}">
+              <div class="biscotti-category-desc" style="margin-bottom: 12px; padding: 0 12px; font-size: 11px; line-height: 1.4;">
+                ${p.description}
+              </div>
+              ${(() => {
+                // Illustrations from GVL (Policy B(b)) — try tcfData first, then raw GVL fallback
+                const ills = (p.illustrations && p.illustrations.length > 0) ? p.illustrations
+                  : (this.engine?.config?.rawGvlJson?.purposes?.[p.id]?.illustrations || []);
+                if (ills.length > 0) {
+                  return `<div style="padding: 0 12px 8px; font-size: 11px; color: #595959; line-height: 1.4;">
+                    ${ills.map(ill => `<div style="margin-bottom:6px;padding:8px;background:rgba(0,0,0,0.03);border-radius:6px;border-left:3px solid var(--biscotti-primary-color, #9B6B3C);">💡 ${ill}</div>`).join('')}
+                  </div>`;
+                }
+                return '';
+              })()}
+              <div style="font-size:11px;color:#595959;margin-bottom: 12px; padding: 0 12px;"><a href="#" data-action="show-vendors-for-purpose" data-purpose-id="${p.id}" style="color:var(--biscotti-primary-color, #9B6B3C);text-decoration:underline;cursor:pointer;">📊 ${vendorCountLabel}</a></div>
+              ${hasLI ? `
+              <div style="display:flex;align-items:center;gap:8px;padding: 0 12px 12px;">
+                <div class="biscotti-toggle biscotti-toggle-small" onclick="event.stopPropagation()">
+                  <input type="checkbox" data-tcf-li-purpose="${p.id}" ${this.tcfPurposeLIs[p.id] ? 'checked' : ''} style="position:absolute;opacity:0;width:0;height:0;" aria-hidden="true">
+                  <span class="biscotti-toggle-slider"></span>
+                </div>
+                <span style="font-size:11px;color:#595959;">${l.legInt}</span>
+              </div>` : ''}
+            </div>
+          </div>
+        `;
+      });
+      
+      // Special Purposes (info-only, always active)
+      if (specialPurposes.length > 0) {
+        html += `<div style="margin-top:16px;padding-top:12px;border-top:1px solid #e0e0e0;">
+          <div style="font-size:13px;font-weight:600;color:#333;margin:0 0 8px 0;">${l.specialPurposes}</div>
+        </div>`;
+        specialPurposes.forEach(sp => {
+          html += `
+            <div class="biscotti-category" style="margin-bottom:0;">
+              <div class="biscotti-category-header" style="align-items: center;" data-expand="tcf-sp-${sp.id}">
+                <div class="biscotti-category-name" style="margin-bottom:0;">
+                  <span class="biscotti-expand-icon" data-cat="tcf-sp-${sp.id}">▼</span>
+                  ${sp.name}
+                </div>
+                <span style="font-size:11px;color:#6b8e23;font-weight:500;white-space:nowrap;padding:4px 0;">${l.alwaysActive}</span>
+              </div>
+              <div class="biscotti-services-list" id="biscotti-services-tcf-sp-${sp.id}">
+                <div class="biscotti-category-desc" style="padding: 0 12px 12px; font-size: 11px; line-height: 1.4;">${sp.description}</div>
+                ${sp.illustrations && sp.illustrations.length > 0 ? `
+                <div style="padding: 0 12px 8px; font-size: 11px; color: #595959; line-height: 1.4;">
+                  ${sp.illustrations.map(ill => `<div style="margin-bottom:6px;padding:8px;background:rgba(0,0,0,0.03);border-radius:6px;border-left:3px solid var(--biscotti-primary-color, #9B6B3C);">💡 ${ill}</div>`).join('')}
+                </div>
+                ` : ''}
+              </div>
+            </div>
+          `;
+        });
+      }
+      
+      // Features Pane
+      html += `</div>
+        <div class="biscotti-tcf-pane" id="tcf-pane-features" style="${this.activeTcfTab === 'features' ? '' : 'display:none;'}">
+      `;
+      
+      // Feature illustrations (IAB TCF Policy requires illustrations for features too,
+      // but the GVL delivers empty arrays — we provide them per TCF spec, all 39 languages)
+      const featureIllustrations = {
+        1: { de: 'Wenn Sie auf einem Online-Dienst ein Formular ausfüllen, kann der Betreiber diese Informationen mit Daten zusammenführen, die ein Werbepartner zuvor über Sie gesammelt hat, um Ihnen relevantere Inhalte anzuzeigen.', en: 'If you fill out a form on an online service, the operator may combine this information with data previously collected about you by an advertising partner to show you more relevant content.', fr: 'Si vous remplissez un formulaire sur un service en ligne, l\'opérateur peut combiner ces informations avec des données précédemment collectées à votre sujet par un partenaire publicitaire afin de vous montrer un contenu plus pertinent.', es: 'Si rellena un formulario en un servicio en línea, el operador puede combinar esta información con datos recopilados previamente sobre usted por un socio publicitario para mostrarle contenido más relevante.', it: 'Se compilate un modulo su un servizio online, l\'operatore può combinare queste informazioni con dati precedentemente raccolti su di voi da un partner pubblicitario per mostrarvi contenuti più pertinenti.', nl: 'Als u een formulier invult op een online dienst, kan de exploitant deze informatie combineren met gegevens die eerder over u zijn verzameld door een reclamepartner om u relevantere inhoud te tonen.', pl: 'Jeśli wypełnisz formularz w serwisie internetowym, operator może połączyć te informacje z danymi wcześniej zebranymi o Tobie przez partnera reklamowego, aby wyświetlać Ci bardziej trafne treści.', pt: 'Se preencher um formulário num serviço online, o operador pode combinar estas informações com dados previamente recolhidos sobre si por um parceiro publicitário para lhe mostrar conteúdo mais relevante.', da: 'Hvis du udfylder en formular på en onlinetjeneste, kan operatøren kombinere disse oplysninger med data, som en reklamepartner tidligere har indsamlet om dig, for at vise dig mere relevant indhold.', ar: 'إذا قمت بملء نموذج على خدمة عبر الإنترنت، يمكن للمشغل دمج هذه المعلومات مع بيانات تم جمعها مسبقًا عنك بواسطة شريك إعلاني لعرض محتوى أكثر صلة لك.', bg: 'Ако попълните формуляр в онлайн услуга, операторът може да комбинира тази информация с данни, събрани преди това за вас от рекламен партньор, за да ви покаже по-подходящо съдържание.', bs: 'Ako ispunite obrazac na online usluzi, operater može kombinirati ove informacije s podacima koje je ranije prikupio reklamni partner kako bi vam prikazao relevantniji sadržaj.', ca: 'Si empleneu un formulari en un servei en línia, l\'operador pot combinar aquesta informació amb dades recollides prèviament sobre vosaltres per un soci publicitari per mostrar-vos contingut més rellevant.', cs: 'Pokud vyplníte formulář na online službě, provozovatel může tyto informace kombinovat s daty, která o vás dříve shromáždil reklamní partner, aby vám zobrazil relevantnější obsah.', el: 'Εάν συμπληρώσετε μια φόρμα σε μια διαδικτυακή υπηρεσία, ο πάροχος μπορεί να συνδυάσει αυτές τις πληροφορίες με δεδομένα που έχει συλλέξει προηγουμένως ένας διαφημιστικός συνεργάτης για να σας εμφανίσει πιο σχετικό περιεχόμενο.', eu: 'Lineako zerbitzu batean formulario bat betetzen baduzu, operadoreak informazio hori publizitate-bazkide batek aurretik zuri buruz bildutako datuekin konbina dezake eduki garrantzitsuagoa erakusteko.', fi: 'Jos täytät lomakkeen verkkopalvelussa, palveluntarjoaja voi yhdistää nämä tiedot mainosyhteistyökumppanin aiemmin sinusta keräämiin tietoihin näyttääkseen sinulle osuvampaa sisältöä.', gl: 'Se enche un formulario nun servizo en liña, o operador pode combinar esta información con datos recollidos previamente sobre vostede por un socio publicitario para mostrarlle contido máis relevante.', he: 'אם תמלאו טופס בשירות מקוון, המפעיל עשוי לשלב מידע זה עם נתונים שנאספו עליכם בעבר על ידי שותף פרסומי כדי להציג לכם תוכן רלוונטי יותר.', hi: 'यदि आप किसी ऑनलाइन सेवा पर एक फॉर्म भरते हैं, तो ऑपरेटर इस जानकारी को एक विज्ञापन भागीदार द्वारा पहले आपके बारे में एकत्र किए गए डेटा के साथ जोड़ सकता है ताकि आपको अधिक प्रासंगिक सामग्री दिखाई जा सके।', hr: 'Ako ispunite obrazac na mrežnoj usluzi, operater može kombinirati te podatke s podacima koje je ranije prikupio reklamni partner kako bi vam prikazao relevantniji sadržaj.', hu: 'Ha kitölt egy űrlapot egy online szolgáltatáson, az üzemeltető összekapcsolhatja ezeket az információkat egy hirdetési partner által korábban önről gyűjtött adatokkal, hogy relevánsabb tartalmat jelenítsen meg.', id: 'Jika Anda mengisi formulir di layanan online, operator dapat menggabungkan informasi ini dengan data yang sebelumnya dikumpulkan tentang Anda oleh mitra periklanan untuk menampilkan konten yang lebih relevan.', ja: 'オンラインサービスでフォームに記入すると、運営者はこの情報を広告パートナーが以前収集したデータと組み合わせて、より関連性の高いコンテンツを表示することがあります。', lt: 'Jei užpildysite formą internetinėje paslaugoje, operatorius gali sujungti šią informaciją su duomenimis, kuriuos anksčiau apie jus surinko reklamos partneris, kad parodytų jums aktualesnį turinį.', mr: 'जर तुम्ही ऑनलाइन सेवेवर फॉर्म भरलात, तर ऑपरेटर ही माहिती जाहिरात भागीदाराने तुमच्याबद्दल पूर्वी गोळा केलेल्या डेटासह एकत्र करू शकतो जेणेकरून तुम्हाला अधिक संबंधित सामग्री दाखवता येईल.', nb: 'Hvis du fyller ut et skjema på en nettjeneste, kan operatøren kombinere denne informasjonen med data som en reklamepartner tidligere har samlet inn om deg, for å vise deg mer relevant innhold.', ro: 'Dacă completați un formular pe un serviciu online, operatorul poate combina aceste informații cu date colectate anterior despre dvs. de un partener publicitar pentru a vă arăta conținut mai relevant.', ru: 'Если вы заполните форму в онлайн-сервисе, оператор может объединить эту информацию с данными, ранее собранными о вас рекламным партнёром, чтобы показывать вам более релевантный контент.', sk: 'Ak vyplníte formulár v online službe, prevádzkovateľ môže tieto informácie skombinovať s údajmi, ktoré o vás predtým zhromaždil reklamný partner, aby vám zobrazil relevantnejší obsah.', sl: 'Če izpolnite obrazec na spletni storitvi, lahko upravljavec te podatke združi s podatki, ki jih je o vas predhodno zbral oglaševalski partner, da vam prikaže ustreznejšo vsebino.', sr: 'Ако попуните формулар на онлајн сервису, оператер може да комбинује ове информације са подацима које је раније прикупио рекламни партнер како би вам приказао релевантнији садржај.', sv: 'Om du fyller i ett formulär på en onlinetjänst kan operatören kombinera denna information med data som en annonspartner tidigare samlat in om dig för att visa dig mer relevant innehåll.', th: 'หากคุณกรอกแบบฟอร์มบนบริการออนไลน์ ผู้ให้บริการอาจรวมข้อมูลนี้กับข้อมูลที่พันธมิตรโฆษณาเคยรวบรวมเกี่ยวกับคุณก่อนหน้านี้ เพื่อแสดงเนื้อหาที่เกี่ยวข้องมากขึ้น', tr: 'Bir çevrimiçi hizmette bir form doldurursanız, operatör bu bilgileri bir reklam ortağının daha önce hakkınızda topladığı verilerle birleştirerek size daha alakalı içerik gösterebilir.', uk: 'Якщо ви заповните форму в онлайн-сервісі, оператор може поєднати цю інформацію з даними, раніше зібраними про вас рекламним партнером, щоб показувати вам більш релевантний контент.', vi: 'Nếu bạn điền vào biểu mẫu trên dịch vụ trực tuyến, nhà điều hành có thể kết hợp thông tin này với dữ liệu mà đối tác quảng cáo đã thu thập trước đó về bạn để hiển thị nội dung phù hợp hơn.', zh: '如果您在在线服务上填写表单，运营商可能会将此信息与广告合作伙伴之前收集的关于您的数据相结合，以向您展示更相关的内容。', 'zh-TW': '如果您在線上服務上填寫表單，營運商可能會將此資訊與廣告合作夥伴先前收集的關於您的資料相結合，以向您展示更相關的內容。' },
+        2: { de: 'Wenn Sie sich auf Ihrem Telefon und Ihrem Computer mit demselben Konto bei einem Dienst anmelden, kann der Anbieter erkennen, dass beide Geräte wahrscheinlich Ihnen gehören, und Ihnen auf beiden Geräten abgestimmte Inhalte anzeigen.', en: 'If you log in to a service on both your phone and computer with the same account, the provider can recognise that both devices likely belong to you and show you coordinated content on both devices.', fr: 'Si vous vous connectez à un service sur votre téléphone et votre ordinateur avec le même compte, le fournisseur peut reconnaître que les deux appareils vous appartiennent probablement et vous montrer un contenu coordonné sur les deux appareils.', es: 'Si inicia sesión en un servicio tanto en su teléfono como en su ordenador con la misma cuenta, el proveedor puede reconocer que ambos dispositivos probablemente le pertenecen y mostrarle contenido coordinado en ambos dispositivos.', it: 'Se accedete a un servizio sia dal telefono che dal computer con lo stesso account, il fornitore può riconoscere che entrambi i dispositivi probabilmente vi appartengono e mostrarvi contenuti coordinati su entrambi.', nl: 'Als u zich op zowel uw telefoon als uw computer met hetzelfde account bij een dienst aanmeldt, kan de aanbieder herkennen dat beide apparaten waarschijnlijk van u zijn en u op beide apparaten gecoördineerde inhoud tonen.', pl: 'Jeśli logujesz się do usługi zarówno na telefonie, jak i na komputerze tym samym kontem, dostawca może rozpoznać, że oba urządzenia prawdopodobnie należą do Ciebie, i wyświetlać skoordynowane treści na obu urządzeniach.', pt: 'Se iniciar sessão num serviço tanto no telemóvel como no computador com a mesma conta, o fornecedor pode reconhecer que ambos os dispositivos provavelmente lhe pertencem e mostrar-lhe conteúdo coordenado em ambos.', da: 'Hvis du logger ind på en tjeneste på både din telefon og din computer med den samme konto, kan udbyderen genkende, at begge enheder sandsynligvis tilhører dig, og vise dig koordineret indhold på begge enheder.', ar: 'إذا قمت بتسجيل الدخول إلى خدمة على هاتفك وجهاز الكمبيوتر الخاص بك بنفس الحساب، يمكن للمزود التعرف على أن كلا الجهازين ينتميان إليك على الأرجح وعرض محتوى منسق على كلا الجهازين.', bg: 'Ако влезете в услуга както от телефона, така и от компютъра си с един и същ акаунт, доставчикът може да разпознае, че и двете устройства вероятно принадлежат на вас, и да ви показва координирано съдържание на двете.', bs: 'Ako se prijavite na uslugu i na telefonu i na računaru s istim računom, pružatelj može prepoznati da oba uređaja vjerojatno pripadaju vama i prikazati vam koordinirani sadržaj na oba uređaja.', ca: 'Si inicieu sessió en un servei tant al telèfon com a l\'ordinador amb el mateix compte, el proveïdor pot reconèixer que ambdós dispositius probablement us pertanyen i mostrar-vos contingut coordinat en ambdós.', cs: 'Pokud se přihlásíte ke službě na telefonu i počítači se stejným účtem, poskytovatel může rozpoznat, že obě zařízení pravděpodobně patří vám, a zobrazit vám koordinovaný obsah na obou zařízeních.', el: 'Εάν συνδεθείτε σε μια υπηρεσία τόσο στο τηλέφωνό σας όσο και στον υπολογιστή σας με τον ίδιο λογαριασμό, ο πάροχος μπορεί να αναγνωρίσει ότι και οι δύο συσκευές πιθανότατα ανήκουν σε εσάς και να σας εμφανίσει συντονισμένο περιεχόμενο.', eu: 'Zerbitzu batean telefonoan eta ordenagailuan kontu berarekin saioa hasten baduzu, hornitzaileak bi gailuak zureak direla antzeman dezake eta eduki koordinatua erakutsi bi gailuetan.', fi: 'Jos kirjaudut palveluun sekä puhelimellasi että tietokoneellasi samalla tilillä, palveluntarjoaja voi tunnistaa, että molemmat laitteet todennäköisesti kuuluvat sinulle, ja näyttää sinulle koordinoitua sisältöä molemmilla laitteilla.', gl: 'Se inicia sesión nun servizo tanto no teléfono como no ordenador coa mesma conta, o provedor pode recoñecer que ambos dispositivos probablemente lle pertencen e mostrarlle contido coordinado en ambos.', he: 'אם תתחברו לשירות גם בטלפון וגם במחשב עם אותו חשבון, הספק יכול לזהות ששני המכשירים כנראה שייכים לכם ולהציג לכם תוכן מתואם בשני המכשירים.', hi: 'यदि आप एक ही खाते से अपने फोन और कंप्यूटर दोनों पर किसी सेवा में लॉग इन करते हैं, तो प्रदाता पहचान सकता है कि दोनों डिवाइस संभवतः आपके हैं और दोनों डिवाइस पर समन्वित सामग्री दिखा सकता है।', hr: 'Ako se prijavite na uslugu i na telefonu i na računalu s istim računom, pružatelj može prepoznati da oba uređaja vjerojatno pripadaju vama i prikazati vam koordinirani sadržaj na oba uređaja.', hu: 'Ha ugyanazzal a fiókkal jelentkezik be egy szolgáltatásba a telefonján és a számítógépén is, a szolgáltató felismerheti, hogy mindkét eszköz valószínűleg az öné, és koordinált tartalmat jeleníthet meg mindkét eszközön.', id: 'Jika Anda masuk ke layanan di ponsel dan komputer dengan akun yang sama, penyedia dapat mengenali bahwa kedua perangkat kemungkinan milik Anda dan menampilkan konten terkoordinasi di kedua perangkat.', ja: '同じアカウントでスマートフォンとパソコンの両方からサービスにログインすると、プロバイダーは両方のデバイスがあなたのものである可能性が高いと認識し、両方のデバイスで調整されたコンテンツを表示できます。', lt: 'Jei prisijungsite prie paslaugos ir telefone, ir kompiuteryje ta pačia paskyra, teikėjas gali atpažinti, kad abu įrenginiai greičiausiai priklauso jums, ir rodyti koordinuotą turinį abiejuose įrenginiuose.', mr: 'जर तुम्ही एकाच खात्याने तुमच्या फोन आणि संगणक दोन्हीवर सेवेत लॉग इन केले, तर प्रदाता ओळखू शकतो की दोन्ही उपकरणे तुमची आहेत आणि दोन्ही उपकरणांवर समन्वित सामग्री दाखवू शकतो.', nb: 'Hvis du logger inn på en tjeneste på både telefonen og datamaskinen med samme konto, kan leverandøren gjenkjenne at begge enhetene sannsynligvis tilhører deg og vise deg koordinert innhold på begge enheter.', ro: 'Dacă vă conectați la un serviciu atât pe telefon, cât și pe computer cu același cont, furnizorul poate recunoaște că ambele dispozitive vă aparțin probabil și vă poate afișa conținut coordonat pe ambele.', ru: 'Если вы входите в сервис и на телефоне, и на компьютере с одной учётной записью, провайдер может определить, что оба устройства, вероятно, принадлежат вам, и показывать вам согласованный контент на обоих устройствах.', sk: 'Ak sa prihlásite do služby na telefóne aj počítači s rovnakým účtom, poskytovateľ môže rozpoznať, že obe zariadenia pravdepodobne patria vám, a zobrazovať vám koordinovaný obsah na oboch zariadeniach.', sl: 'Če se v storitev prijavite tako na telefonu kot na računalniku z istim računom, lahko ponudnik prepozna, da obe napravi verjetno pripadata vam, in vam na obeh prikazuje usklajeno vsebino.', sr: 'Ако се пријавите на сервис и на телефону и на рачунару са истим налогом, провајдер може да препозна да оба уређаја вероватно припадају вама и да вам приказује координирани садржај на оба уређаја.', sv: 'Om du loggar in på en tjänst på både din telefon och din dator med samma konto kan leverantören känna igen att båda enheterna troligen tillhör dig och visa dig koordinerat innehåll på båda enheterna.', th: 'หากคุณเข้าสู่ระบบบริการทั้งบนโทรศัพท์และคอมพิวเตอร์ด้วยบัญชีเดียวกัน ผู้ให้บริการสามารถรับรู้ได้ว่าอุปกรณ์ทั้งสองน่าจะเป็นของคุณ และแสดงเนื้อหาที่ประสานกันบนอุปกรณ์ทั้งสอง', tr: 'Aynı hesapla hem telefonunuzda hem de bilgisayarınızda bir hizmete giriş yaparsanız, sağlayıcı her iki cihazın da muhtemelen size ait olduğunu anlayabilir ve her iki cihazda da koordineli içerik gösterebilir.', uk: 'Якщо ви входите в сервіс і на телефоні, і на комп\'ютері з одним обліковим записом, провайдер може визначити, що обидва пристрої, ймовірно, належать вам, і показувати вам узгоджений контент на обох пристроях.', vi: 'Nếu bạn đăng nhập vào một dịch vụ trên cả điện thoại và máy tính bằng cùng một tài khoản, nhà cung cấp có thể nhận ra rằng cả hai thiết bị có thể thuộc về bạn và hiển thị nội dung phối hợp trên cả hai thiết bị.', zh: '如果您在手机和电脑上使用同一账户登录某项服务，提供商可以识别出这两台设备可能属于您，并在两台设备上向您展示协调的内容。', 'zh-TW': '如果您在手機和電腦上使用同一帳戶登入某項服務，提供商可以識別出這兩台裝置可能屬於您，並在兩台裝置上向您展示協調的內容。' },
+        3: { de: 'Ihr Gerät kann anhand automatisch übermittelter Informationen wie Ihrer IP-Adresse oder Ihres Browsertyps von anderen Geräten unterschieden werden, um die in dieser Mitteilung erläuterten Zwecke zu unterstützen.', en: 'Your device can be distinguished from other devices based on information it automatically sends, such as your IP address or browser type, in support of the purposes explained in this notice.', fr: 'Votre appareil peut être distingué des autres appareils sur la base d\'informations qu\'il envoie automatiquement, telles que votre adresse IP ou votre type de navigateur, pour soutenir les finalités expliquées dans cet avis.', es: 'Su dispositivo puede distinguirse de otros dispositivos en función de la información que envía automáticamente, como su dirección IP o tipo de navegador, en apoyo de los fines explicados en este aviso.', it: 'Il vostro dispositivo può essere distinto da altri dispositivi in base alle informazioni che invia automaticamente, come il vostro indirizzo IP o il tipo di browser, a supporto delle finalità spiegate in questo avviso.', nl: 'Uw apparaat kan worden onderscheiden van andere apparaten op basis van informatie die het automatisch verzendt, zoals uw IP-adres of browsertype, ter ondersteuning van de doeleinden die in deze mededeling worden uitgelegd.', pl: 'Twoje urządzenie może być odróżnione od innych urządzeń na podstawie automatycznie przesyłanych informacji, takich jak adres IP lub typ przeglądarki, w celu wspierania celów wyjaśnionych w tym powiadomieniu.', pt: 'O seu dispositivo pode ser distinguido de outros dispositivos com base em informações que envia automaticamente, como o seu endereço IP ou tipo de navegador, em apoio aos fins explicados neste aviso.', da: 'Din enhed kan skelnes fra andre enheder baseret på oplysninger, den automatisk sender, såsom din IP-adresse eller browsertype, til støtte for de formål, der er forklaret i denne meddelelse.', ar: 'يمكن تمييز جهازك عن الأجهزة الأخرى بناءً على المعلومات التي يرسلها تلقائيًا، مثل عنوان IP الخاص بك أو نوع المتصفح، لدعم الأغراض الموضحة في هذا الإشعار.', bg: 'Вашето устройство може да бъде разграничено от други устройства въз основа на информация, която изпраща автоматично, като вашия IP адрес или тип браузър, в подкрепа на целите, обяснени в това известие.', bs: 'Vaš uređaj se može razlikovati od drugih uređaja na osnovu informacija koje automatski šalje, kao što su vaša IP adresa ili tip preglednika, u podršci svrha objašnjenih u ovom obavještenju.', ca: 'El vostre dispositiu es pot distingir d\'altres dispositius basant-se en la informació que envia automàticament, com la vostra adreça IP o el tipus de navegador, en suport dels propòsits explicats en aquest avís.', cs: 'Vaše zařízení lze odlišit od jiných zařízení na základě informací, které automaticky odesílá, jako je vaše IP adresa nebo typ prohlížeče, na podporu účelů vysvětlených v tomto oznámení.', el: 'Η συσκευή σας μπορεί να διακριθεί από άλλες συσκευές βάσει πληροφοριών που στέλνει αυτόματα, όπως η διεύθυνση IP ή ο τύπος προγράμματος περιήγησης, προς υποστήριξη των σκοπών που εξηγούνται σε αυτή την ειδοποίηση.', eu: 'Zure gailua beste gailuetatik bereiz daiteke automatikoki bidaltzen duen informazioaren arabera, hala nola zure IP helbidea edo nabigatzaile mota, jakinarazpen honetan azaldutako helburuak laguntzeko.', fi: 'Laitteesi voidaan erottaa muista laitteista sen automaattisesti lähettämien tietojen, kuten IP-osoitteesi tai selaintyyppisi, perusteella tässä ilmoituksessa selitettyjen tarkoitusten tueksi.', gl: 'O seu dispositivo pode distinguirse doutros dispositivos en función da información que envía automaticamente, como o seu enderezo IP ou tipo de navegador, en apoio dos fins explicados neste aviso.', he: 'ניתן להבדיל את המכשיר שלכם ממכשירים אחרים על סמך מידע שהוא שולח אוטומטית, כגון כתובת ה-IP שלכם או סוג הדפדפן, לתמיכה במטרות המוסברות בהודעה זו.', hi: 'आपके डिवाइस को अन्य डिवाइस से उसके द्वारा स्वचालित रूप से भेजी जाने वाली जानकारी, जैसे आपका IP पता या ब्राउज़र प्रकार, के आधार पर अलग किया जा सकता है, इस सूचना में बताए गए उद्देश्यों के समर्थन में।', hr: 'Vaš uređaj se može razlikovati od drugih uređaja na temelju informacija koje automatski šalje, poput vaše IP adrese ili vrste preglednika, u potporu svrha objašnjenih u ovoj obavijesti.', hu: 'Az Ön eszköze megkülönböztethető más eszközöktől az általa automatikusan küldött információk, például az IP-cím vagy a böngésző típusa alapján, az ebben az értesítésben ismertetett célok támogatása érdekében.', id: 'Perangkat Anda dapat dibedakan dari perangkat lain berdasarkan informasi yang dikirimnya secara otomatis, seperti alamat IP atau jenis browser Anda, untuk mendukung tujuan yang dijelaskan dalam pemberitahuan ini.', ja: 'お使いのデバイスは、IPアドレスやブラウザの種類など、自動的に送信される情報に基づいて他のデバイスと区別され、この通知で説明されている目的をサポートします。', lt: 'Jūsų įrenginys gali būti atskirtas nuo kitų įrenginių pagal automatiškai siunčiamą informaciją, pvz., jūsų IP adresą ar naršyklės tipą, siekiant palaikyti šiame pranešime paaiškintas tikslus.', mr: 'तुमचे उपकरण इतर उपकरणांपासून स्वयंचलितपणे पाठवलेल्या माहितीच्या आधारे वेगळे केले जाऊ शकते, जसे की तुमचा IP पत्ता किंवा ब्राउझर प्रकार, या सूचनेत स्पष्ट केलेल्या उद्देशांच्या समर्थनार्थ.', nb: 'Enheten din kan skilles fra andre enheter basert på informasjon den automatisk sender, som din IP-adresse eller nettlesertype, til støtte for formålene forklart i denne meldingen.', ro: 'Dispozitivul dvs. poate fi distins de alte dispozitive pe baza informațiilor pe care le trimite automat, cum ar fi adresa IP sau tipul de browser, în sprijinul scopurilor explicate în această notificare.', ru: 'Ваше устройство может быть отличено от других устройств на основе автоматически отправляемой информации, такой как ваш IP-адрес или тип браузера, в поддержку целей, описанных в этом уведомлении.', sk: 'Vaše zariadenie môže byť odlíšené od iných zariadení na základe informácií, ktoré automaticky odosiela, ako je vaša IP adresa alebo typ prehliadača, na podporu účelov vysvetlených v tomto oznámení.', sl: 'Vašo napravo je mogoče ločiti od drugih naprav na podlagi informacij, ki jih samodejno pošilja, kot sta vaš naslov IP ali vrsta brskalnika, v podporo namenom, pojasnjenim v tem obvestilu.', sr: 'Ваш уређај се може разликовати од других уређаја на основу информација које аутоматски шаље, као што су ваша IP адреса или тип прегледача, у подршку сврхама објашњеним у овом обавештењу.', sv: 'Din enhet kan särskiljas från andra enheter baserat på information den automatiskt skickar, såsom din IP-adress eller webbläsartyp, till stöd för de ändamål som förklaras i detta meddelande.', th: 'อุปกรณ์ของคุณสามารถแยกแยะจากอุปกรณ์อื่นได้โดยอาศัยข้อมูลที่ส่งโดยอัตโนมัติ เช่น ที่อยู่ IP หรือประเภทเบราว์เซอร์ของคุณ เพื่อสนับสนุนวัตถุประสงค์ที่อธิบายไว้ในประกาศนี้', tr: 'Cihazınız, IP adresiniz veya tarayıcı türünüz gibi otomatik olarak gönderdiği bilgilere dayanarak diğer cihazlardan ayırt edilebilir; bu, bu bildirimde açıklanan amaçları desteklemek içindir.', uk: 'Ваш пристрій може бути відрізнений від інших пристроїв на основі інформації, яку він автоматично надсилає, наприклад, вашої IP-адреси або типу браузера, на підтримку цілей, пояснених у цьому повідомленні.', vi: 'Thiết bị của bạn có thể được phân biệt với các thiết bị khác dựa trên thông tin mà nó tự động gửi, chẳng hạn như địa chỉ IP hoặc loại trình duyệt của bạn, để hỗ trợ các mục đích được giải thích trong thông báo này.', zh: '您的设备可以根据其自动发送的信息（如您的IP地址或浏览器类型）与其他设备区分开来，以支持本通知中解释的目的。', 'zh-TW': '您的裝置可以根據其自動傳送的資訊（如您的IP位址或瀏覽器類型）與其他裝置區分開來，以支持本通知中解釋的目的。' }
+      };
+      const specialFeatureIllustrations = {
+        1: { de: 'Wenn Sie einer App erlauben, Ihren genauen Standort zu verwenden, kann ein Werbetreibender Ihnen standortbezogene Angebote in Ihrer unmittelbaren Umgebung anzeigen.', en: 'If you allow an app to use your precise location, an advertiser can show you location-based offers in your immediate vicinity.', fr: 'Si vous autorisez une application à utiliser votre localisation précise, un annonceur peut vous montrer des offres géolocalisées dans votre voisinage immédiat.', es: 'Si permite que una aplicación utilice su ubicación precisa, un anunciante puede mostrarle ofertas basadas en la ubicación en su entorno inmediato.', it: 'Se consentite a un\'app di utilizzare la vostra posizione precisa, un inserzionista può mostrarvi offerte basate sulla posizione nelle vostre immediate vicinanze.', nl: 'Als u een app toestaat uw precieze locatie te gebruiken, kan een adverteerder u locatiegebonden aanbiedingen in uw directe omgeving tonen.', pl: 'Jeśli zezwolisz aplikacji na korzystanie z Twojej dokładnej lokalizacji, reklamodawca może wyświetlać Ci oferty oparte na lokalizacji w Twoim bezpośrednim otoczeniu.', pt: 'Se permitir que uma aplicação utilize a sua localização precisa, um anunciante pode mostrar-lhe ofertas baseadas na localização nas suas imediações.', da: 'Hvis du tillader en app at bruge din præcise placering, kan en annoncør vise dig placeringsbaserede tilbud i din umiddelbare nærhed.', ar: 'إذا سمحت لتطبيق باستخدام موقعك الدقيق، يمكن للمعلن أن يعرض لك عروضًا قائمة على الموقع في محيطك المباشر.', bg: 'Ако разрешите на приложение да използва точното ви местоположение, рекламодател може да ви покаже оферти, базирани на местоположението, в непосредствена близост до вас.', bs: 'Ako dozvolite aplikaciji da koristi vašu preciznu lokaciju, oglašivač vam može prikazati ponude zasnovane na lokaciji u vašoj neposrednoj blizini.', ca: 'Si permeteu que una aplicació utilitzi la vostra ubicació precisa, un anunciant pot mostrar-vos ofertes basades en la ubicació en el vostre entorn immediat.', cs: 'Pokud povolíte aplikaci používat vaši přesnou polohu, inzerent vám může zobrazit nabídky založené na poloze ve vašem bezprostředním okolí.', el: 'Εάν επιτρέψετε σε μια εφαρμογή να χρησιμοποιήσει την ακριβή τοποθεσία σας, ένας διαφημιστής μπορεί να σας εμφανίσει προσφορές βάσει τοποθεσίας στην άμεση γειτονιά σας.', eu: 'Aplikazio bati zure kokapen zehatza erabiltzeko baimena ematen badiozu, iragarle batek kokapenean oinarritutako eskaintzak erakutsi dizkizuke zure ingurune hurbilean.', fi: 'Jos sallit sovelluksen käyttää tarkkaa sijaintiasi, mainostaja voi näyttää sinulle sijaintiin perustuvia tarjouksia välittömässä läheisyydessäsi.', gl: 'Se permite que unha aplicación utilice a súa localización precisa, un anunciante pode mostrarlle ofertas baseadas na localización na súa contorna inmediata.', he: 'אם תאפשרו לאפליקציה להשתמש במיקום המדויק שלכם, מפרסם יכול להציג לכם הצעות מבוססות מיקום בסביבתכם הקרובה.', hi: 'यदि आप किसी ऐप को अपने सटीक स्थान का उपयोग करने की अनुमति देते हैं, तो एक विज्ञापनदाता आपको आपके तत्काल आसपास के क्षेत्र में स्थान-आधारित ऑफ़र दिखा सकता है।', hr: 'Ako dopustite aplikaciji da koristi vašu preciznu lokaciju, oglašivač vam može prikazati ponude temeljene na lokaciji u vašoj neposrednoj blizini.', hu: 'Ha engedélyezi egy alkalmazásnak a pontos tartózkodási helyének használatát, egy hirdető helyfüggő ajánlatokat jeleníthet meg az Ön közvetlen közelében.', id: 'Jika Anda mengizinkan aplikasi menggunakan lokasi tepat Anda, pengiklan dapat menampilkan penawaran berbasis lokasi di sekitar Anda.', ja: 'アプリに正確な位置情報の使用を許可すると、広告主はあなたの近くにある位置情報に基づいたオファーを表示できます。', lt: 'Jei leisite programėlei naudoti jūsų tikslią vietą, reklamuotojas gali rodyti jums vieta pagrįstus pasiūlymus jūsų artimiausioje aplinkoje.', mr: 'जर तुम्ही एखाद्या अॅपला तुमचे अचूक स्थान वापरण्याची परवानगी दिली, तर जाहिरातदार तुम्हाला तुमच्या जवळपासच्या परिसरात स्थान-आधारित ऑफर दाखवू शकतो.', nb: 'Hvis du tillater en app å bruke din nøyaktige posisjon, kan en annonsør vise deg stedsbaserte tilbud i ditt umiddelbare nærområde.', ro: 'Dacă permiteți unei aplicații să vă utilizeze locația precisă, un agent de publicitate vă poate arăta oferte bazate pe locație în vecinătatea dvs. imediată.', ru: 'Если вы разрешите приложению использовать ваше точное местоположение, рекламодатель может показывать вам предложения на основе местоположения в вашей непосредственной близости.', sk: 'Ak povolíte aplikácii používať vašu presnú polohu, inzerent vám môže zobrazovať ponuky založené na polohe vo vašom bezprostrednom okolí.', sl: 'Če aplikaciji dovolite uporabo vaše natančne lokacije, vam lahko oglaševalec prikaže ponudbe na podlagi lokacije v vaši neposredni bližini.', sr: 'Ако дозволите апликацији да користи вашу тачну локацију, оглашивач вам може приказати понуде засноване на локацији у вашој непосредној близини.', sv: 'Om du tillåter en app att använda din exakta plats kan en annonsör visa dig platsbaserade erbjudanden i din omedelbara närhet.', th: 'หากคุณอนุญาตให้แอปใช้ตำแหน่งที่แม่นยำของคุณ ผู้โฆษณาสามารถแสดงข้อเสนอตามตำแหน่งในบริเวณใกล้เคียงของคุณได้', tr: 'Bir uygulamanın kesin konumunuzu kullanmasına izin verirseniz, bir reklamveren size yakın çevrenizdeki konuma dayalı teklifleri gösterebilir.', uk: 'Якщо ви дозволите додатку використовувати ваше точне місцезнаходження, рекламодавець може показувати вам пропозиції на основі місцезнаходження у вашій безпосередній близькості.', vi: 'Nếu bạn cho phép ứng dụng sử dụng vị trí chính xác của bạn, nhà quảng cáo có thể hiển thị cho bạn các ưu đãi dựa trên vị trí trong khu vực lân cận của bạn.', zh: '如果您允许应用使用您的精确位置，广告商可以向您展示您附近的基于位置的优惠。', 'zh-TW': '如果您允許應用程式使用您的精確位置，廣告商可以向您展示您附近的基於位置的優惠。' },
+        2: { de: 'Bestimmte Merkmale Ihres Geräts (z. B. installierte Schriftarten, Bildschirmauflösung) können abgefragt werden, um es von anderen Geräten zu unterscheiden und so die in dieser Mitteilung erläuterten Zwecke zu unterstützen.', en: 'Certain characteristics of your device (e.g. installed fonts, screen resolution) can be queried to distinguish it from other devices in support of the purposes explained in this notice.', fr: 'Certaines caractéristiques de votre appareil (par ex. polices installées, résolution d\'écran) peuvent être interrogées pour le distinguer d\'autres appareils, en soutien des finalités expliquées dans cet avis.', es: 'Ciertas características de su dispositivo (p. ej., fuentes instaladas, resolución de pantalla) pueden consultarse para distinguirlo de otros dispositivos en apoyo de los fines explicados en este aviso.', it: 'Alcune caratteristiche del vostro dispositivo (ad es. font installati, risoluzione dello schermo) possono essere interrogate per distinguerlo da altri dispositivi a supporto delle finalità spiegate in questo avviso.', nl: 'Bepaalde kenmerken van uw apparaat (bijv. geïnstalleerde lettertypen, schermresolutie) kunnen worden opgevraagd om het te onderscheiden van andere apparaten ter ondersteuning van de doeleinden die in deze mededeling worden uitgelegd.', pl: 'Pewne cechy Twojego urządzenia (np. zainstalowane czcionki, rozdzielczość ekranu) mogą być odpytywane w celu odróżnienia go od innych urządzeń, wspierając cele wyjaśnione w tym powiadomieniu.', pt: 'Certas características do seu dispositivo (por ex., fontes instaladas, resolução de ecrã) podem ser consultadas para o distinguir de outros dispositivos em apoio aos fins explicados neste aviso.', da: 'Visse egenskaber ved din enhed (f.eks. installerede skrifttyper, skærmopløsning) kan forespørges for at skelne den fra andre enheder til støtte for de formål, der er forklaret i denne meddelelse.', ar: 'يمكن الاستعلام عن خصائص معينة لجهازك (مثل الخطوط المثبتة، دقة الشاشة) لتمييزه عن الأجهزة الأخرى دعمًا للأغراض الموضحة في هذا الإشعار.', bg: 'Определени характеристики на вашето устройство (напр. инсталирани шрифтове, разделителна способност на екрана) могат да бъдат запитани, за да се разграничи от други устройства в подкрепа на целите, обяснени в това известие.', bs: 'Određene karakteristike vašeg uređaja (npr. instalirani fontovi, rezolucija ekrana) mogu se ispitati kako bi se razlikovao od drugih uređaja u podršci svrha objašnjenih u ovom obavještenju.', ca: 'Certes característiques del vostre dispositiu (p. ex., tipus de lletra instal·lats, resolució de pantalla) es poden consultar per distingir-lo d\'altres dispositius en suport dels propòsits explicats en aquest avís.', cs: 'Určité vlastnosti vašeho zařízení (např. nainstalovaná písma, rozlišení obrazovky) mohou být dotazovány, aby bylo odlišeno od jiných zařízení na podporu účelů vysvětlených v tomto oznámení.', el: 'Ορισμένα χαρακτηριστικά της συσκευής σας (π.χ. εγκατεστημένες γραμματοσειρές, ανάλυση οθόνης) μπορούν να ερωτηθούν για να τη διακρίνουν από άλλες συσκευές προς υποστήριξη των σκοπών που εξηγούνται σε αυτή την ειδοποίηση.', eu: 'Zure gailuaren ezaugarri batzuk (adib., instalatutako letra-tipoak, pantailaren bereizmena) kontsulta daitezke beste gailuetatik bereizteko, jakinarazpen honetan azaldutako helburuak laguntzeko.', fi: 'Tiettyjä laitteesi ominaisuuksia (esim. asennetut fontit, näytön tarkkuus) voidaan tiedustella sen erottamiseksi muista laitteista tässä ilmoituksessa selitettyjen tarkoitusten tueksi.', gl: 'Certas características do seu dispositivo (p. ex., fontes instaladas, resolución de pantalla) poden consultarse para distinguilo doutros dispositivos en apoio dos fins explicados neste aviso.', he: 'ניתן לבדוק מאפיינים מסוימים של המכשיר שלכם (למשל, גופנים מותקנים, רזולוציית מסך) כדי להבדיל אותו ממכשירים אחרים לתמיכה במטרות המוסברות בהודעה זו.', hi: 'आपके डिवाइस की कुछ विशेषताओं (जैसे, इंस्टॉल किए गए फ़ॉन्ट, स्क्रीन रिज़ॉल्यूशन) को इस सूचना में बताए गए उद्देश्यों के समर्थन में अन्य डिवाइस से अलग करने के लिए क्वेरी किया जा सकता है।', hr: 'Određene karakteristike vašeg uređaja (npr. instalirani fontovi, razlučivost zaslona) mogu se ispitati kako bi se razlikovao od drugih uređaja u potporu svrha objašnjenih u ovoj obavijesti.', hu: 'Az Ön eszközének bizonyos jellemzői (pl. telepített betűtípusok, képernyőfelbontás) lekérdezhetők, hogy megkülönböztessék más eszközöktől az ebben az értesítésben ismertetett célok támogatása érdekében.', id: 'Karakteristik tertentu dari perangkat Anda (misalnya font yang diinstal, resolusi layar) dapat ditanyakan untuk membedakannya dari perangkat lain guna mendukung tujuan yang dijelaskan dalam pemberitahuan ini.', ja: 'お使いのデバイスの特定の特性（インストールされたフォント、画面解像度など）を照会して、この通知で説明されている目的をサポートするために他のデバイスと区別することができます。', lt: 'Tam tikros jūsų įrenginio charakteristikos (pvz., įdiegti šriftai, ekrano skiriamoji geba) gali būti užklausiamos, kad jį atskirtų nuo kitų įrenginių, palaikant šiame pranešime paaiškintas tikslus.', mr: 'तुमच्या उपकरणाची काही वैशिष्ट्ये (उदा., स्थापित फॉन्ट, स्क्रीन रिझोल्यूशन) या सूचनेत स्पष्ट केलेल्या उद्देशांच्या समर्थनार्थ इतर उपकरणांपासून वेगळे करण्यासाठी विचारली जाऊ शकतात.', nb: 'Visse egenskaper ved enheten din (f.eks. installerte skrifttyper, skjermoppløsning) kan forespørres for å skille den fra andre enheter til støtte for formålene forklart i denne meldingen.', ro: 'Anumite caracteristici ale dispozitivului dvs. (de ex., fonturi instalate, rezoluția ecranului) pot fi interogate pentru a-l distinge de alte dispozitive în sprijinul scopurilor explicate în această notificare.', ru: 'Определённые характеристики вашего устройства (например, установленные шрифты, разрешение экрана) могут быть запрошены для его отличия от других устройств в поддержку целей, описанных в этом уведомлении.', sk: 'Určité vlastnosti vášho zariadenia (napr. nainštalované písma, rozlíšenie obrazovky) môžu byť dopytované na jeho odlíšenie od iných zariadení na podporu účelov vysvetlených v tomto oznámení.', sl: 'Določene značilnosti vaše naprave (npr. nameščene pisave, ločljivost zaslona) se lahko poizvedujejo, da jo ločijo od drugih naprav v podporo namenom, pojasnjenim v tem obvestilu.', sr: 'Одређене карактеристике вашег уређаја (нпр. инсталирани фонтови, резолуција екрана) могу бити испитане да би се разликовао од других уређаја у подршку сврхама објашњеним у овом обавештењу.', sv: 'Vissa egenskaper hos din enhet (t.ex. installerade teckensnitt, skärmupplösning) kan efterfrågas för att särskilja den från andra enheter till stöd för de ändamål som förklaras i detta meddelande.', th: 'คุณลักษณะบางอย่างของอุปกรณ์ของคุณ (เช่น แบบอักษรที่ติดตั้ง ความละเอียดหน้าจอ) สามารถถูกสอบถามเพื่อแยกแยะจากอุปกรณ์อื่น เพื่อสนับสนุนวัตถุประสงค์ที่อธิบายไว้ในประกาศนี้', tr: 'Cihazınızın belirli özellikleri (ör. yüklü yazı tipleri, ekran çözünürlüğü), bu bildirimde açıklanan amaçları desteklemek için diğer cihazlardan ayırt etmek amacıyla sorgulanabilir.', uk: 'Певні характеристики вашого пристрою (наприклад, встановлені шрифти, роздільна здатність екрана) можуть бути запитані для його відрізнення від інших пристроїв на підтримку цілей, пояснених у цьому повідомленні.', vi: 'Một số đặc điểm của thiết bị của bạn (ví dụ: phông chữ đã cài đặt, độ phân giải màn hình) có thể được truy vấn để phân biệt nó với các thiết bị khác nhằm hỗ trợ các mục đích được giải thích trong thông báo này.', zh: '您设备的某些特征（例如已安装的字体、屏幕分辨率）可以被查询，以将其与其他设备区分开来，以支持本通知中解释的目的。', 'zh-TW': '您裝置的某些特徵（例如已安裝的字型、螢幕解析度）可以被查詢，以將其與其他裝置區分開來，以支持本通知中解釋的目的。' }
+      };
+
+      if (features.length > 0) {
+        html += `<div style="font-size:13px;font-weight:600;color:#333;margin:0 0 12px 0;">${l.featuresHeader}</div>`;
+        features.forEach(f => {
+          const fIll = featureIllustrations[f.id];
+          const fIllText = fIll ? (fIll[lang] || fIll['en'] || '') : '';
+          const vendorsForFeature = vendors.filter(v => 
+            (v.features || []).includes(f.id)
+          ).length;
+          const featureVendorLabel = this.t('tcf.vendorsPerPurpose').replace('{count}', vendorsForFeature);
+          html += `
+            <div class="biscotti-category" style="margin-bottom:0;">
+              <div class="biscotti-category-header" style="align-items: center;" data-expand="tcf-f-${f.id}">
+                <div class="biscotti-category-name" style="margin-bottom:0;">
+                  <span class="biscotti-expand-icon" data-cat="tcf-f-${f.id}">▼</span>
+                  ${f.name}
+                </div>
+                <span style="font-size:11px;color:#6b8e23;font-weight:500;white-space:nowrap;padding:4px 0;">${l.alwaysActive}</span>
+              </div>
+              <div class="biscotti-services-list" id="biscotti-services-tcf-f-${f.id}">
+                <div class="biscotti-category-desc" style="padding: 0 12px 12px; font-size: 11px; line-height: 1.4;">${f.description}</div>
+                ${fIllText ? `<div style="padding: 0 12px 8px; font-size: 11px; color: #595959; line-height: 1.4;">
+                  <div style="margin-bottom:6px;padding:8px;background:rgba(0,0,0,0.03);border-radius:6px;border-left:3px solid var(--biscotti-primary-color, #9B6B3C);">💡 ${fIllText}</div>
+                </div>` : ''}
+                <div style="font-size:11px;color:#595959;margin-bottom: 12px; padding: 0 12px;"><a href="#" data-action="show-vendors-for-purpose" style="color:var(--biscotti-primary-color, #9B6B3C);text-decoration:underline;cursor:pointer;">📊 ${featureVendorLabel}</a></div>
+              </div>
+            </div>
+          `;
+        });
+      }
+      
+      // Special Features (require opt-in consent)
+      if (specialFeatures.length > 0) {
+        html += `<div style="margin-top:16px;padding-top:12px;border-top:1px solid #e0e0e0;">
+          <div style="font-size:13px;font-weight:600;color:#333;margin:0 0 8px 0;">${l.specialFeatures}</div>
+        </div>`;
+        specialFeatures.forEach(sf => {
+          const sfIll = specialFeatureIllustrations[sf.id];
+          const sfIllText = sfIll ? (sfIll[lang] || sfIll['en'] || '') : '';
+          const vendorsForSF = vendors.filter(v => 
+            (v.specialFeatures || []).includes(sf.id)
+          ).length;
+          const sfVendorLabel = this.t('tcf.vendorsPerPurpose').replace('{count}', vendorsForSF);
+          html += `
+            <div class="biscotti-category" style="margin-bottom:0;">
+              <div class="biscotti-category-header" style="align-items: center;" data-expand="tcf-sf-${sf.id}">
+                <div class="biscotti-category-name" style="margin-bottom:0;">
+                  <span class="biscotti-expand-icon" data-cat="tcf-sf-${sf.id}">▼</span>
+                  ${sf.name}
+                </div>
+                <div class="biscotti-toggle" onclick="event.stopPropagation()">
+                  <input type="checkbox" data-tcf-special-feature="${sf.id}" ${this.tcfSpecialFeatures[sf.id] ? 'checked' : ''} style="position:absolute;opacity:0;width:0;height:0;" aria-hidden="true">
+                  <span class="biscotti-toggle-slider"></span>
+                </div>
+              </div>
+              <div class="biscotti-services-list" id="biscotti-services-tcf-sf-${sf.id}">
+                <div class="biscotti-category-desc" style="padding: 0 12px 12px; font-size: 11px; line-height: 1.4;">${sf.description}</div>
+                ${sfIllText ? `<div style="padding: 0 12px 8px; font-size: 11px; color: #595959; line-height: 1.4;">
+                  <div style="margin-bottom:6px;padding:8px;background:rgba(0,0,0,0.03);border-radius:6px;border-left:3px solid var(--biscotti-primary-color, #9B6B3C);">💡 ${sfIllText}</div>
+                </div>` : ''}
+                <div style="font-size:11px;color:#595959;margin-bottom: 12px; padding: 0 12px;"><a href="#" data-action="show-vendors-for-purpose" style="color:var(--biscotti-primary-color, #9B6B3C);text-decoration:underline;cursor:pointer;">📊 ${sfVendorLabel}</a></div>
+              </div>
+            </div>
+          `;
+        });
+      }
+      
+      // Vendors Pane with search
+      html += `</div>
+        <div class="biscotti-tcf-pane" id="tcf-pane-vendors" style="${this.activeTcfTab === 'vendors' ? '' : 'display:none;'}">
+          <input type="text" class="biscotti-tcf-vendor-search" id="tcf-vendor-search" placeholder="${l.search}" style="width:100%;padding:8px 12px;border:1px solid #ddd;border-radius:8px;font-size:13px;margin-bottom:12px;box-sizing:border-box;">
+          <div id="tcf-vendor-list">
+      `;
+      
+      // Render vendors (paginated for performance)
+      const publisherRestrictions = this.engine?.config?.publisherRestrictions || [];
+      const vendorsToShow = vendors.slice(0, 100);
+      vendorsToShow.forEach(v => {
+        const purposeIds = v.purposes || [];
+        const legIntPurposeIds = v.legIntPurposes || [];
+        const featureIds = v.features || [];
+        const specialFeatureIds = v.specialFeatures || [];
+        const specialPurposeIds = v.specialPurposes || [];
+        
+        // Publisher restrictions: filter out restricted purpose/vendor combinations (Req 15.3)
+        const vendorRestrictions = publisherRestrictions.filter(pr => pr.vendorId === v.id);
+        const isFullyRestricted = vendorRestrictions.some(pr => pr.restrictionType === 0 && !pr.purposeId);
+        const restrictedPurposeIds = vendorRestrictions.filter(pr => pr.restrictionType === 0).map(pr => pr.purposeId);
+        
+        // Skip fully restricted vendors
+        if (isFullyRestricted) return;
+        
+        const displayPurposeIds = purposeIds.filter(pid => !restrictedPurposeIds.includes(pid));
+        const displayLegIntPurposeIds = legIntPurposeIds.filter(pid => !restrictedPurposeIds.includes(pid));
+        
+        // Privacy policy URL (language-aware from GVL urls array)
+        const urlEntry = v.urls?.find(u => u.langId === lang)
+          || v.urls?.find(u => u.langId === 'en')
+          || v.urls?.[0];
+        const policyUrl = urlEntry?.privacy || v.policyUrl || '';
+        
+        html += `
+          <div class="biscotti-provider-item" data-vendor-name="${(v.name || '').toLowerCase()}" style="padding:10px 0;border-bottom:1px solid #f0f0f0;">
+            <div style="display:flex;justify-content:space-between;align-items:flex-start;gap:12px;">
+              <div style="flex:1;min-width:0;">
+                <div style="display:flex;align-items:center;gap:8px;flex-wrap:wrap;">
+                  <span style="font-weight:600;font-size:13px;">${v.name}</span>
+                  <span style="font-size:10px;color:#767676;">GVL #${v.id}</span>
+                  <span style="display:inline-block;font-size:9px;font-weight:600;color:#fff;background:#0073b1;padding:1px 5px;border-radius:3px;">IAB TCF</span>
+                </div>
+                ${policyUrl ? `<a href="${policyUrl}" target="_blank" rel="noopener" style="font-size:11px;color:var(--biscotti-primary-color, #9B6B3C);text-decoration:none;">${l.privacyPolicy} ↗</a>` : ''}
+                
+                <div class="biscotti-vendor-details" style="margin-top:6px;font-size:11px;color:#595959;line-height:1.5;">
+                  ${displayPurposeIds.length > 0 ? `<div><strong>${l.consentPurposes}:</strong> ${displayPurposeIds.map(pid => tcfData.purposes?.[pid]?.name || pid).join(', ')}</div>` : ''}
+                  ${displayLegIntPurposeIds.length > 0 ? `<div><strong>${l.legIntPurposes}:</strong> ${displayLegIntPurposeIds.map(pid => tcfData.purposes?.[pid]?.name || pid).join(', ')}</div>` : ''}
+                  ${specialPurposeIds.length > 0 ? `<div><strong>${l.specialPurposes}:</strong> ${specialPurposeIds.map(spid => tcfData.specialPurposes?.[spid]?.name || spid).join(', ')}</div>` : ''}
+                  ${featureIds.length > 0 ? `<div><strong>${l.featuresHeader}:</strong> ${featureIds.map(fid => tcfData.features?.[fid]?.name || fid).join(', ')}</div>` : ''}
+                  ${specialFeatureIds.length > 0 ? `<div><strong>${l.specialFeatures}:</strong> ${specialFeatureIds.map(sfid => tcfData.specialFeatures?.[sfid]?.name || sfid).join(', ')}</div>` : ''}
+                  ${(() => {
+                    // Storage disclosure per vendor (Appendix B, C.c.VII)
+                    const rv = rawVendors[v.id];
+                    if (!rv) return '';
+                    let storageHtml = '';
+                    // Legitimate Interest Claim URL (Policy D(c)(VI))
+                    const liUrlEntry = rv.urls?.find(u => u.langId === lang)
+                      || rv.urls?.find(u => u.langId === 'en')
+                      || rv.urls?.[0];
+                    const legIntClaimUrl = liUrlEntry?.legIntClaim || liUrlEntry?.legIntClaimUrl || '';
+                    if (legIntClaimUrl) {
+                      storageHtml += `<div><a href="${legIntClaimUrl}" target="_blank" rel="noopener" style="font-size:11px;color:var(--biscotti-primary-color, #9B6B3C);text-decoration:none;">⚖️ ${l.legInt} ↗</a></div>`;
+                    }
+                    if (rv.cookieMaxAgeSeconds != null) {
+                      const days = Math.ceil(rv.cookieMaxAgeSeconds / 86400);
+                      const refreshIcon = rv.cookieRefresh ? ' 🔄' : '';
+                      storageHtml += `<div>🕐 ${this.t('tcf.maxStorage')} ${days} ${this.t('tcf.days')}${refreshIcon}</div>`;
+                    }
+                    if (rv.usesNonCookieAccess) {
+                      storageHtml += `<div>💾 ${this.t('tcf.usesNonCookieAccess')}</div>`;
+                    }
+                    if (rv.deviceStorageDisclosureUrl) {
+                      storageHtml += `<div><a href="${rv.deviceStorageDisclosureUrl}" target="_blank" rel="noopener" style="font-size:10px;color:var(--biscotti-primary-color, #9B6B3C);text-decoration:none;">${this.t('tcf.storageInfo')} ↗</a></div>`;
+                    }
+                    // Data categories from GVL dataDeclaration (Policy D(c)(VI))
+                    if (rv.dataDeclaration && rv.dataDeclaration.length > 0) {
+                      // GVL_DATA_CATEGORIES uses ISO 639-1 base codes (e.g. "pt" not "pt-BR")
+                      // Exception: zh-TW has its own key in the data categories
+                      const dcLangRaw = this.language || 'en';
+                      const dcLang = dcLangRaw === 'zh-TW' ? 'zh-TW'
+                        : dcLangRaw.includes('-') ? dcLangRaw.split('-')[0].toLowerCase()
+                        : dcLangRaw.toLowerCase();
+                      const categoryNames = rv.dataDeclaration.map(catId => {
+                        // Try hardcoded translations first, then GVL dataCategories, then fall back to ID
+                        const gvlCat = GVL_DATA_CATEGORIES[catId];
+                        if (gvlCat) return gvlCat[dcLang] || gvlCat['en'] || catId;
+                        const tcfCat = tcfData.dataCategories?.[catId];
+                        if (tcfCat) return tcfCat.name || catId;
+                        return catId;
+                      });
+                      storageHtml += `<div><strong>📋 Data:</strong> ${categoryNames.join(', ')}</div>`;
+                    }
+                    // Retention period from GVL dataRetention
+                    if (rv.dataRetention && rv.dataRetention.stdRetention) {
+                      storageHtml += `<div><strong>Retention:</strong> ${rv.dataRetention.stdRetention} ${this.t('tcf.days')}</div>`;
+                    }
+                    return storageHtml;
+                  })()}
+                </div>
+              </div>
+              <div style="display:flex;flex-direction:column;gap:4px;align-items:flex-end;">
+                <div class="biscotti-toggle biscotti-toggle-small" onclick="event.stopPropagation()">
+                  <input type="checkbox" data-tcf-vendor-consent="${v.id}" ${this.tcfVendorConsents[v.id] ? 'checked' : ''} style="position:absolute;opacity:0;width:0;height:0;" aria-hidden="true">
+                  <span class="biscotti-toggle-slider"></span>
+                </div>
+                ${displayLegIntPurposeIds.length > 0 ? `
+                <div class="biscotti-toggle biscotti-toggle-small" onclick="event.stopPropagation()" title="${l.legInt}">
+                  <input type="checkbox" data-tcf-li-vendor="${v.id}" ${this.tcfVendorLIs[v.id] ? 'checked' : ''} style="position:absolute;opacity:0;width:0;height:0;" aria-hidden="true">
+                  <span class="biscotti-toggle-slider"></span>
+                </div>
+                <span style="font-size:9px;color:#767676;">${l.legInt}</span>
+                ` : ''}
+              </div>
+            </div>
+          </div>
+        `;
+      });
+      
+      if (vendors.length > 100) {
+        html += `<div style="text-align:center;padding:12px;font-size:12px;color:#595959;cursor:pointer;" id="tcf-load-more-vendors">${l.loadMore}</div>`;
+      }
+      
+      html += `</div></div>`;
+      
+      // Other Partners Pane (non-IAB services) — with consent/objection toggles
+      if (nonIabCount > 0) {
+        html += `<div class="biscotti-tcf-pane" id="tcf-pane-otherPartners" style="${this.activeTcfTab === 'otherPartners' ? '' : 'display:none;'}">`;
+        
+        // Initialize non-IAB consent state if not present
+        if (!this.nonIabConsents) this.nonIabConsents = {};
+        if (!this.nonIabLiConsents) this.nonIabLiConsents = {};
+        
+        nonIabServices.forEach((s, idx) => {
+          // Get description in current language, fallback to en, then de
+          const desc = (s.description && typeof s.description === 'object') 
+            ? (s.description[lang] || s.description['en'] || s.description['de'] || '') 
+            : (typeof s.description === 'string' ? s.description : '');
+          
+          const serviceKey = s.id || s.name || `nonIab_${idx}`;
+          const isEssential = (s.category || '').toLowerCase() === 'essential';
+          const isConsented = isEssential ? true : (this.nonIabConsents[serviceKey] === true);
+          
+          html += `
+            <div style="padding:12px 0;border-bottom:1px solid #f0f0f0;">
+              <div style="display:flex;justify-content:space-between;align-items:flex-start;gap:12px;">
+                <div style="flex:1;min-width:0;">
+                  <div style="font-weight:600;font-size:13px;">${s.name || 'Unknown'}</div>
+                  ${s.vendor ? `<div style="font-size:11px;color:#595959;margin-top:2px;">${s.vendor}${s.vendorLocation ? ` · ${s.vendorLocation}` : (s.vendorCountry ? ` · ${s.vendorCountry}` : '')}</div>` : ''}
+                  ${desc ? `<div style="font-size:11px;color:#595959;margin-top:6px;line-height:1.4;">${desc}</div>` : ''}
+                  <div style="margin-top:6px;font-size:11px;color:#595959;line-height:1.5;">
+                    ${s.category ? `<div><strong>${l.purposes || 'Category'}:</strong> <span style="text-transform:capitalize;">${s.category}</span></div>` : ''}
+                    ${s.legalBasis ? `<div><strong>${l.legInt ? l.legInt.split(' ')[0] : 'Legal'} Basis:</strong> ${s.legalBasis}</div>` : ''}
+                    ${s.storageDuration ? `<div>🕐 ${this.t('tcf.maxStorage')} ${s.storageDuration}</div>` : ''}
+                  </div>
+                  ${s.privacyPolicyUrl ? `<a href="${s.privacyPolicyUrl}" target="_blank" rel="noopener" style="display:inline-block;margin-top:4px;font-size:11px;color:var(--biscotti-primary-color, #9B6B3C);text-decoration:none;">${l.privacyPolicy} ↗</a>` : ''}
+                </div>
+                ${isEssential ? `<span style="font-size:11px;color:#6b8e23;font-weight:500;white-space:nowrap;padding:4px 0;flex-shrink:0;">${this.t('categories.alwaysActive')}</span>` : `
+                <div style="display:flex;flex-direction:column;align-items:flex-end;gap:4px;flex-shrink:0;margin-top:2px;">
+                  <div class="biscotti-toggle" onclick="event.stopPropagation()">
+                    <input type="checkbox" data-noniab-consent="${serviceKey}" ${isConsented ? 'checked' : ''} style="position:absolute;opacity:0;width:0;height:0;" aria-hidden="true">
+                    <span class="biscotti-toggle-slider"></span>
+                  </div>
+                  <div class="biscotti-toggle" onclick="event.stopPropagation()">
+                    <input type="checkbox" data-noniab-li="${serviceKey}" ${this.nonIabLiConsents?.[serviceKey] !== false ? 'checked' : ''} style="position:absolute;opacity:0;width:0;height:0;" aria-hidden="true">
+                    <span class="biscotti-toggle-slider"></span>
+                  </div>
+                  <span style="font-size:9px;color:#595959;white-space:nowrap;">${l.legInt || 'Leg. Interest'}</span>
+                </div>`}
+              </div>
+            </div>
+          `;
+        });
+        html += `</div>`;
+      }
+      
+      html += `</div>`;
+      
+      return html;
+    }
+
+    _attachEventListeners() {
+      // Prevent duplicate listeners - only attach once to container
+      if (this._listenersAttached) return;
+      this._listenersAttached = true;
+      
+      this.container.addEventListener('click', (e) => {
+        const actionEl = e.target.closest('[data-action]');
+        const action = actionEl ? actionEl.dataset.action : null;
+        if (!action) return;
+
+        e.preventDefault();
+
+        switch (action) {
+          case 'accept-all':
+            this.engine.acceptAll();
+            this.hide();
+            break;
+          case 'reject-all':
+            this.engine.acceptEssential();
+            this.hide();
+            break;
+          case 'withdraw-all':
+            // TCF Req 17.2/17.3: Withdraw all consent — zero all bits, persist immediately
+            this.engine.revokeConsent();
+            this.hide();
+            break;
+          case 'opt-out-sale':
+            // CCPA: Opt out of data sale
+            if (this.engine.optOutSale) this.engine.optOutSale();
+            this.hide();
+            break;
+          case 'toggle-settings':
+            this._toggleSettings();
+            break;
+          case 'show-vendors':
+            // Open settings and switch to vendors tab (TCF Policy Check 6)
+            this._toggleSettings(true);
+            setTimeout(() => {
+              const vendorsTab = this.container.querySelector('[data-tcf-tab="vendors"]');
+              if (vendorsTab) {
+                vendorsTab.click();
+                // Scroll the settings panel into view so the vendor list is visible
+                setTimeout(() => {
+                  const settingsPanel = this.container.querySelector('.biscotti-settings');
+                  if (settingsPanel) settingsPanel.scrollIntoView({ behavior: 'smooth', block: 'start' });
+                }, 150);
+              }
+            }, 100);
+            break;
+          case 'show-iab-vendors':
+            // Open settings and switch to TCF Vendors tab
+            this._toggleSettings(true);
+            const tryShowVendors = (attempts = 0) => {
+              const vendorsTab = this.container.querySelector('[data-tcf-tab="vendors"]');
+              if (vendorsTab) {
+                vendorsTab.click();
+                setTimeout(() => {
+                  const vendorsPane = this.container.querySelector('#tcf-pane-vendors');
+                  if (vendorsPane) vendorsPane.scrollIntoView({ behavior: 'smooth', block: 'start' });
+                }, 150);
+              } else if (attempts < 10) {
+                setTimeout(() => tryShowVendors(attempts + 1), 200);
+              }
+            };
+            setTimeout(() => tryShowVendors(), 150);
+            break;
+          case 'show-vendors-for-purpose':
+            // Switch to Vendors tab (filtered view would be ideal, but at minimum navigate there)
+            this.activeTcfTab = 'vendors';
+            setTimeout(() => {
+              const vendorsTabP = this.container.querySelector('[data-tcf-tab="vendors"]');
+              if (vendorsTabP) {
+                vendorsTabP.click();
+                setTimeout(() => {
+                  const vendorsPane = this.container.querySelector('#tcf-pane-vendors');
+                  if (vendorsPane) vendorsPane.scrollIntoView({ behavior: 'smooth', block: 'start' });
+                }, 150);
+              }
+            }, 50);
+            break;
+          case 'show-services':
+            // Open settings and switch to Other Partners tab (non-IAB vendors)
+            this._toggleSettings(true);
+            setTimeout(() => {
+              const otherTab = this.container.querySelector('[data-tcf-tab="otherPartners"]');
+              if (otherTab) {
+                otherTab.click();
+              } else {
+                // Fallback: try purposes tab
+                const purposesTab = this.container.querySelector('[data-tcf-tab="purposes"]');
+                if (purposesTab) purposesTab.click();
+              }
+              setTimeout(() => {
+                const tcfSection = this.container.querySelector('.biscotti-tcf-section');
+                if (tcfSection) tcfSection.scrollIntoView({ behavior: 'smooth', block: 'start' });
+              }, 150);
+            }, 100);
+            break;
+          case 'show-li-layer':
+            // Open settings and switch to Vendors tab where LI toggles are shown (Req 14.1)
+            this._toggleSettings(true);
+            setTimeout(() => {
+              // Try dedicated LI tab first (v2 banner), then fall back to vendors tab (v1)
+              const liTab = this.container.querySelector('[data-tcf-tab="legInterests"]');
+              const vendorsTab = this.container.querySelector('[data-tcf-tab="vendors"]');
+              if (liTab) {
+                liTab.click();
+              } else if (vendorsTab) {
+                vendorsTab.click();
+              }
+              setTimeout(() => {
+                const tcfSection = this.container.querySelector('.biscotti-tcf-section');
+                if (tcfSection) tcfSection.scrollIntoView({ behavior: 'smooth', block: 'start' });
+              }, 150);
+            }, 100);
+            break;
+          case 'save':
+            this._saveSelection();
+            this.hide();
+            break;
+        }
+      });
+
+      // Track toggle clicks on category switches
+      this.container.querySelectorAll('.biscotti-toggle[role="switch"][data-category]').forEach(toggle => {
+        toggle.addEventListener('click', (e) => {
+          e.stopPropagation();
+          if (toggle.getAttribute('aria-disabled') === 'true') return;
+          const category = toggle.dataset.category;
+          const newState = toggle.getAttribute('aria-checked') !== 'true';
+          toggle.setAttribute('aria-checked', String(newState));
+          this.categoryStates[category] = newState;
+          // Sync service toggles with category state
+          this.container.querySelectorAll(`[data-service-category="${category}"]`).forEach(serviceToggle => {
+            serviceToggle.setAttribute('aria-checked', String(newState));
+          });
+        });
+      });
+
+      // Expand/collapse category headers
+      this.container.querySelectorAll('[data-expand]').forEach(header => {
+        header.addEventListener('click', (e) => {
+          // Don't collapse if clicking on the toggle
+          if (e.target.closest('.biscotti-toggle')) return;
+          const categoryEl = header.closest('.biscotti-category');
+          categoryEl.classList.toggle('expanded');
+        });
+      });
+
+      // Expand/collapse service details (GDPR info)
+      this.container.querySelectorAll('[data-details]').forEach(link => {
+        link.addEventListener('click', (e) => {
+          e.preventDefault();
+          e.stopPropagation();
+          const serviceKey = e.target.dataset.details;
+          const detailsPanel = document.getElementById(`biscotti-details-${serviceKey}`);
+          if (detailsPanel) {
+            detailsPanel.classList.toggle('open');
+            const detailsLabel = this.bannerUI ? this.bannerUI.t('details.details') : 'Details';
+            e.target.textContent = detailsPanel.classList.contains('open') ? `${detailsLabel} ▲` : `${detailsLabel} ▼`;
+          }
+        });
+      });
+
+      // ============================================================
+      // TCF Tab switching + vendor search + toggle events
+      // Uses event delegation so it works even after re-renders
+      // ============================================================
+      this.container.addEventListener('click', (e) => {
+        const tab = e.target.closest('.biscotti-tcf-tab');
+        if (tab) {
+          const tabName = tab.dataset.tcfTab;
+          if (!tabName) return;
+          this.activeTcfTab = tabName;
+          // Update tab active styles
+          this.container.querySelectorAll('.biscotti-tcf-tab').forEach(t => {
+            const isActive = t.dataset.tcfTab === tabName;
+            t.classList.toggle('active', isActive);
+            t.style.color = isActive ? 'var(--biscotti-primary-color, #9B6B3C)' : '#666';
+            t.style.borderBottomColor = isActive ? 'var(--biscotti-primary-color, #9B6B3C)' : 'transparent';
+          });
+          // Show/hide panes
+          this.container.querySelectorAll('.biscotti-tcf-pane').forEach(p => {
+            p.style.display = 'none';
+          });
+          const pane = this.container.querySelector(`#tcf-pane-${tabName}`);
+          if (pane) pane.style.display = '';
+        }
+      });
+
+      // Vendor search (delegated via MutationObserver to catch dynamically added search inputs)
+      this.container.addEventListener('input', (e) => {
+        if (e.target.id === 'tcf-vendor-search') {
+          const q = e.target.value.toLowerCase();
+          this.container.querySelectorAll('#tcf-vendor-list .biscotti-provider-item').forEach(item => {
+            const name = item.dataset.vendorName || '';
+            item.style.display = name.includes(q) ? '' : 'none';
+          });
+        }
+      });
+
+      // TCF toggle changes (delegated)
+      this.container.addEventListener('change', (e) => {
+        const target = e.target;
+        if (target.dataset.tcfPurposeConsent) {
+          if (!this.tcfPurposeConsents) this.tcfPurposeConsents = {};
+          this.tcfPurposeConsents[target.dataset.tcfPurposeConsent] = target.checked;
+        }
+        if (target.dataset.tcfLiPurpose) {
+          if (!this.tcfPurposeLIs) this.tcfPurposeLIs = {};
+          this.tcfPurposeLIs[target.dataset.tcfLiPurpose] = target.checked;
+        }
+        if (target.dataset.tcfSpecialFeature) {
+          if (!this.tcfSpecialFeatures) this.tcfSpecialFeatures = {};
+          this.tcfSpecialFeatures[target.dataset.tcfSpecialFeature] = target.checked;
+        }
+        if (target.dataset.tcfVendorConsent) {
+          if (!this.tcfVendorConsents) this.tcfVendorConsents = {};
+          this.tcfVendorConsents[target.dataset.tcfVendorConsent] = target.checked;
+        }
+        if (target.dataset.tcfLiVendor) {
+          if (!this.tcfVendorLIs) this.tcfVendorLIs = {};
+          this.tcfVendorLIs[target.dataset.tcfLiVendor] = target.checked;
+        }
+        if (target.dataset.noniabConsent) {
+          if (!this.nonIabConsents) this.nonIabConsents = {};
+          this.nonIabConsents[target.dataset.noniabConsent] = target.checked;
+        }
+        if (target.dataset.noniabLi) {
+          if (!this.nonIabLiConsents) this.nonIabLiConsents = {};
+          this.nonIabLiConsents[target.dataset.noniabLi] = target.checked;
+        }
+      });
+    }
+
+    /**
+     * Build split partner count text with IAB/non-IAB segments.
+     * Each segment is a bold, underlined, clickable link.
+     * IAB link → opens TCF Vendors tab; non-IAB link → opens Services tab.
+     * Returns empty string if both counts are 0.
+     */
+    _buildPartnerCountText(iabCount, nonIabCount) {
+      if (!this.engine?.config?.tcfEnabled) return '';
+      if (iabCount === 0 && nonIabCount === 0) return '';
+
+      const linkStyle = 'color:var(--biscotti-primary-color, #9B6B3C);text-decoration:underline;font-weight:700;cursor:pointer;';
+
+      // Build IAB segment (only the count+label is bold/linked)
+      let iabSegment = '';
+      if (iabCount > 0) {
+        const iabLabel = iabCount === 1
+          ? this.t('tcf.iabPartnerSingular')
+          : this.t('tcf.iabPartnerPlural').replace('{count}', iabCount);
+        iabSegment = `<a href="#" data-action="show-iab-vendors" style="${linkStyle}">${iabLabel}</a>`;
+      }
+
+      // Build non-IAB segment (only the count+label is bold/linked)
+      let nonIabSegment = '';
+      if (nonIabCount > 0) {
+        const nonIabLabel = nonIabCount === 1
+          ? this.t('tcf.nonIabPartnerSingular')
+          : this.t('tcf.nonIabPartnerPlural').replace('{count}', nonIabCount);
+        nonIabSegment = `<a href="#" data-action="show-services" style="${linkStyle}">${nonIabLabel}</a>`;
+      }
+
+      // Compose the full sentence — only the linked parts are bold
+      const prefix = this.t('tcf.partnerCountPrefix');
+      const conjunction = this.t('tcf.partnerCountConjunction');
+      const suffix = this.t('tcf.partnerCountSuffix');
+
+      let partnerPart = '';
+      if (iabSegment && nonIabSegment) {
+        partnerPart = `${iabSegment} ${conjunction} ${nonIabSegment}`;
+      } else if (iabSegment) {
+        partnerPart = iabSegment;
+      } else {
+        partnerPart = nonIabSegment;
+      }
+
+      return `<p class="biscotti-banner-text" style="margin:12px 0 8px 0;">${prefix} ${partnerPart} ${suffix}</p>`;
+    }
+
+    /**
+     * Build the full TCF Initial Layer disclosure per IAB TCF Appendix B.
+     * Includes: device storage, personal data, vendor count with link, purpose names,
+     * special features, consent scope, withdrawal info, LI disclosure with link.
+     * Returns empty string if TCF is not enabled.
+     */
+    _buildTCFInitialLayerDisclosure(iabCount, nonIabCount, tcfData) {
+      if (!this.engine?.config?.tcfEnabled) return '';
+
+      const linkStyle = 'color:var(--biscotti-primary-color, #9B6B3C);text-decoration:underline;font-weight:700;cursor:pointer;';
+      const textStyle = 'font-size:13px;color:var(--biscotti-text-muted, #b0b0b0);line-height:1.5;margin:6px 0;';
+      let html = '<div class="biscotti-tcf-initial-layer" style="margin:8px 0 12px 0;">';
+
+      // 1. Storage disclosure with inline partner count (Req 12.1 + 12.3)
+      const vendorCount = iabCount + nonIabCount;
+      let partnerInline = '';
+      if (vendorCount > 0) {
+        const parts = [];
+        if (iabCount > 0) {
+          const label = iabCount === 1 ? this.t('tcf.iabPartnerSingular') : this.t('tcf.iabPartnerPlural').replace('{count}', iabCount);
+          parts.push(`<a href="#" data-action="show-iab-vendors" style="${linkStyle}">${label}</a>`);
+        }
+        if (nonIabCount > 0) {
+          const label = nonIabCount === 1 ? this.t('tcf.nonIabPartnerSingular') : this.t('tcf.nonIabPartnerPlural').replace('{count}', nonIabCount);
+          parts.push(`<a href="#" data-action="show-services" style="${linkStyle}">${label}</a>`);
+        }
+        partnerInline = ` (${parts.join(', ')})`;
+      }
+      // Inject partner count parenthetical into the storage disclosure text
+      // Strategy: Insert after first sentence-like segment before the verb
+      // Works across all languages because we insert right after the translated "partners" word
+      let storageBase = this.t('tcf.storageDisclosure');
+      if (partnerInline) {
+        // Find the position right after "partners/Partner/partenaires/socios/partner/..." 
+        // by looking for the word that comes before "store/speichern/stockons/almacenamos/..."
+        // Simpler: just insert the parenthetical before the first period or verb-indicator
+        // Most robust: split at first space after "partners" equivalent
+        const insertPatterns = [
+          /Partner(?=\s)/i,           // DE
+          /partners(?=\s)/i,          // EN, NL
+          /partenaires(?=\s)/i,       // FR
+          /socios(?=\s)/i,            // ES
+          /partner(?=\s)/i,           // IT, SV, DA, NB, etc.
+          /partnerzy(?=\s)/i,         // PL
+          /parceiros(?=\s)/i,         // PT
+          /партньори(?=\s)/i,         // BG
+          /партнери(?=\s)/i,          // UK, SR
+          /партнёры(?=\s)/i,          // RU
+          /partneri(?=\s)/i,          // BS, HR, HU
+          /partneři(?=\s)/i,          // CS
+          /συνεργάτες(?=\s)/i,        // EL
+          /bazkideak(?=\s)/i,         // EU
+          /kumppanit(?=\s)/i,         // FI
+          /שותפים(?=\s)/i,            // HE
+          /भागीदार(?=\s)/i,           // HI
+          /partneriai(?=\s)/i,        // LT
+          /भागीदार(?=\s)/i,           // MR
+          /partnerji(?=\s)/i,         // SL
+          /partnere(?=\s)/i,          // DA, NB
+          /ortaklar(?=\s)/i,          // TR
+          /شركاؤنا(?=\s)/i,           // AR
+          /パートナー(?=\s)/,           // JA
+          /合作伙伴(?=\s)/,            // ZH
+          /đối\stác(?=\s)/i,          // VI
+          /mitra(?=\s)/i,             // ID
+          /พันธมิตร/,                  // TH
+        ];
+        let inserted = false;
+        for (const pat of insertPatterns) {
+          if (pat.test(storageBase)) {
+            storageBase = storageBase.replace(pat, (m) => m + partnerInline);
+            inserted = true;
+            break;
+          }
+        }
+        // Fallback: prepend as separate line if no pattern matched
+        if (!inserted) {
+          storageBase = storageBase + partnerInline;
+        }
+      }
+
+      // Build Stacks disclosure per IAB TCF Policy C(b)(IV)
+      // Collect unique stacks used by vendors
+      const usedStackIds = new Set();
+      if (tcfData && tcfData.vendors) {
+        tcfData.vendors.forEach(v => {
+          // Vendors may have a 'useStacks' array or we derive from purposes
+          // GVL vendors typically don't have explicit stacks, so we show purposes instead
+          // But if stacks are available, use them
+        });
+      }
+      
+      // Build Special Features disclosure per IAB TCF Policy C(b)(V)
+      // Policy requires ALL special features to be listed on the first layer
+      const lang = this.language || 'en';
+      const allSpecialFeatures = tcfData && tcfData.specialFeatures ? Object.values(tcfData.specialFeatures) : [];
+      let specialFeaturesHtml = '';
+      if (allSpecialFeatures.length > 0) {
+        const sfNames = allSpecialFeatures
+          .sort((a, b) => a.id - b.id)
+          .map(sf => sf.name)
+          .filter(n => n);
+        if (sfNames.length > 0) {
+          const sfLabel = lang === 'de' ? 'Besondere Funktionen:' : 'Special Features:';
+          specialFeaturesHtml = `</p><div style="margin:8px 0;font-size:13px;color:var(--biscotti-text-muted, #b0b0b0);line-height:1.5;">
+            <div style="font-weight:600;margin-bottom:4px;font-size:13px;">${sfLabel}</div>
+            <ul style="margin:0;padding-left:18px;list-style:disc;font-size:13px;">
+              ${sfNames.map(n => `<li style="margin-bottom:2px;font-size:13px;line-height:1.5;">${n}</li>`).join('')}
+            </ul>
+          </div><p style="${textStyle}">`;
+        }
+      }
+
+      // Build dynamic purpose names list from ALL GVL purposes (Policy C(b)(IV))
+      // IAB TCF Policy requires listing ALL GVL purpose names on the first layer,
+      // not just those used by active vendors.
+      // Rendered as bullet list for readability (IAB allows any format that lists the names).
+      let purposeNamesHtml = '';
+      if (tcfData && tcfData.purposes && Object.keys(tcfData.purposes).length > 0) {
+        const purposes = Object.values(tcfData.purposes)
+          .sort((a, b) => a.id - b.id)
+          .filter(p => p.name);
+        if (purposes.length > 0) {
+          const purposeLabel = this.t('tcf.purposeNames').split('{names}')[0].trim();
+          purposeNamesHtml = `</p><div style="margin:8px 0;font-size:13px;color:var(--biscotti-text-muted, #b0b0b0);line-height:1.5;">
+            <div style="font-weight:600;margin-bottom:4px;font-size:13px;">${purposeLabel}</div>
+            <ul style="margin:0;padding-left:18px;list-style:disc;font-size:13px;">
+              ${purposes.map(p => `<li style="margin-bottom:2px;font-size:13px;line-height:1.5;">${p.name}</li>`).join('')}
+            </ul>
+          </div><p style="${textStyle}">`;
+        }
+      }
+
+      html += `<p style="${textStyle}">${storageBase} ${this.t('tcf.dataExamples')}${purposeNamesHtml}${specialFeaturesHtml} ${this.t('tcf.consentScope')} ${this.t('tcf.withdrawInfo')}`;
+
+      // 5. LI disclosure (Req 12.8)
+      const hasLIVendors = tcfData && tcfData.vendors && tcfData.vendors.some(v => 
+        v.legIntPurposes && v.legIntPurposes.length > 0
+      );
+      if (hasLIVendors) {
+        html += ` ${this.t('tcf.liDisclosure')} <a href="#" data-action="show-li-layer" style="${linkStyle}">${this.t('tcf.liLinkText')}</a>`;
+      }
+
+      html += '</p>';
+
+      html += '</div>';
+      return html;
+    }
+
+    _toggleSettings(forceOpen) {
+      const panel = document.getElementById('biscotti-settings');
+      if (forceOpen) {
+        this.settingsOpen = true;
+      } else {
+        this.settingsOpen = !this.settingsOpen;
+      }
+      panel.classList.toggle('open', this.settingsOpen);
+
+      // Update aria-expanded on settings toggle link
+      const settingsLink = this.container?.querySelector('[data-action="toggle-settings"]');
+      if (settingsLink) {
+        settingsLink.setAttribute('aria-expanded', String(this.settingsOpen));
+      }
+    }
+
+    _saveSelection() {
+      const categories = ['essential']; // Always include essential
+      Object.entries(this.categoryStates).forEach(([cat, enabled]) => {
+        if (enabled && cat !== 'essential') {
+          categories.push(cat);
+        }
+      });
+
+      // Build provider states from non-IAB consent toggles
+      const providerStates = {};
+      if (this.nonIabConsents && Object.keys(this.nonIabConsents).length > 0) {
+        Object.entries(this.nonIabConsents).forEach(([key, granted]) => {
+          providerStates[key] = granted;
+        });
+      }
+
+      if (Object.keys(providerStates).length > 0) {
+        this.engine.acceptCategoriesWithProviders(categories, providerStates);
+      } else {
+        this.engine.acceptCategories(categories);
+      }
+
+      // Pass granular TCF states to the engine for TC String generation
+      if (this.engine?.config?.tcfEnabled) {
+        const tcfPurposes = this.tcfPurposeConsents || {};
+        const tcfPurposeLIs = this.tcfPurposeLIs || {};
+        const tcfVendors = this.tcfVendorConsents || {};
+        const tcfVendorLIs = this.tcfVendorLIs || {};
+        const tcfSF = this.tcfSpecialFeatures || {};
+        this.engine.acceptTCF(tcfPurposes, tcfPurposeLIs, tcfVendors, tcfVendorLIs, tcfSF);
+      }
+    }
+  }
+
+  // ==========================================================================
+  // THUMBNAIL GENERATOR (Local hosting to prevent data leak)
+  // ==========================================================================
+
+  const ThumbnailService = {
+    /**
+     * Get a privacy-safe placeholder image URL
+     * Uses a generic placeholder instead of loading from YouTube
+     */
+    getPlaceholder(embedInfo, originalSrc) {
+      // Return a generic placeholder - DO NOT load from YouTube/Vimeo!
+      // This prevents IP leak before consent
+      return null; // We use CSS background gradient instead
+    },
+
+    /**
+     * Extract video ID for potential later use
+     */
+    extractVideoId(src, service) {
+      if (service === 'YouTube') {
+        const match = src.match(/(?:youtube\.com\/embed\/|youtu\.be\/)([^?&]+)/);
+        return match ? match[1] : null;
+      }
+      if (service === 'Vimeo') {
+        const match = src.match(/player\.vimeo\.com\/video\/(\d+)/);
+        return match ? match[1] : null;
+      }
+      return null;
+    }
+  };
+
+  // ==========================================================================
+  // SCRIPT BLOCKING ENGINE
+  // ==========================================================================
+
+  class BlockingEngine {
+    constructor(patterns) {
+      this.patterns = patterns || DEFAULT_BLOCK_PATTERNS;
+      this.blockedScripts = [];
+      this.observer = null;
+      this.customPatternMap = new Map(); // pattern → { serviceId, serviceName, category }
+    }
+
+    /**
+     * Add custom service blocking patterns from config API.
+     * @param {Array} customServices - Services with isCustom=true from config
+     */
+    addCustomPatterns(customServices) {
+      if (!Array.isArray(customServices)) return;
+      for (const svc of customServices) {
+        if (!svc.blockingPatterns || !Array.isArray(svc.blockingPatterns)) continue;
+        for (const pattern of svc.blockingPatterns) {
+          if (pattern && typeof pattern === 'string') {
+            this.customPatternMap.set(pattern.toLowerCase(), {
+              serviceId: svc.id,
+              serviceName: svc.name,
+              category: (svc.category || 'marketing').toLowerCase(),
+            });
+          }
+        }
+      }
+    }
+
+    shouldBlock(src, content) {
+      if (!src && !content) return false;
+
+      const textToCheck = (src || '') + (content || '');
+      const textLower = textToCheck.toLowerCase();
+
+      // Check default patterns
+      if (this.patterns.some(pattern => textLower.includes(pattern.toLowerCase()))) {
+        return true;
+      }
+
+      // Check custom patterns
+      for (const [pattern] of this.customPatternMap) {
+        if (textLower.includes(pattern)) {
+          return true;
+        }
+      }
+
+      return false;
+    }
+
+    getCategoryForScript(src, content) {
+      const textToCheck = ((src || '') + (content || '')).toLowerCase();
+
+      // Check custom patterns first (more specific)
+      for (const [pattern, info] of this.customPatternMap) {
+        if (textToCheck.includes(pattern)) {
+          return info.category;
+        }
+      }
+
+      for (const [category, patterns] of Object.entries(CATEGORY_PATTERNS)) {
+        if (patterns.some(p => textToCheck.includes(p.toLowerCase()))) {
+          return category;
+        }
+      }
+      return 'marketing'; // Default to marketing (most restrictive)
+    }
+
+    // Get provider info for a script (for granular consent)
+    getProviderForScript(src, content) {
+      const textToCheck = ((src || '') + (content || '')).toLowerCase();
+
+      // Check custom patterns first
+      for (const [pattern, info] of this.customPatternMap) {
+        if (textToCheck.includes(pattern)) {
+          return {
+            providerId: info.serviceId,
+            category: info.category,
+            provider: { name: info.serviceName, patterns: [pattern] },
+          };
+        }
+      }
+
+      for (const [category, providers] of Object.entries(PROVIDER_DATABASE)) {
+        for (const [providerId, provider] of Object.entries(providers)) {
+          if (provider.patterns.some(p => textToCheck.includes(p.toLowerCase()))) {
+            return { providerId, category, provider };
+          }
+        }
+      }
+      return null;
+    }
+
+    blockScript(script) {
+      const src = script.getAttribute('src') || '';
+      const content = script.textContent || '';
+
+      if (!this.shouldBlock(src, content)) return false;
+
+      const category = this.getCategoryForScript(src, content);
+      const providerInfo = this.getProviderForScript(src, content);
+
+      // Store original type
+      const originalType = script.getAttribute('type') || 'text/javascript';
+      script.setAttribute('data-biscotti-original-type', originalType);
+      script.setAttribute('data-biscotti-category', category);
+      script.setAttribute('data-biscotti-blocked', 'true');
+
+      // Also store provider ID if found
+      if (providerInfo) {
+        script.setAttribute('data-biscotti-provider', providerInfo.providerId);
+      }
+
+      // Change type to prevent execution
+      script.setAttribute('type', 'text/plain');
+
+      this.blockedScripts.push({
+        element: script,
+        src: src,
+        category: category,
+        providerId: providerInfo?.providerId || null,
+        originalType: originalType
+      });
+
+      return true;
+    }
+
+    unblockScripts(categories) {
+      const toUnblock = this.blockedScripts.filter(item =>
+        categories.includes(item.category)
+      );
+
+      toUnblock.forEach(item => {
+        this.reloadScript(item.element, item.originalType);
+      });
+
+      // Remove unblocked from list
+      this.blockedScripts = this.blockedScripts.filter(item =>
+        !categories.includes(item.category)
+      );
+    }
+
+    // Unblock scripts based on full consent state (with provider-level granularity)
+    unblockForConsentState(consentState) {
+      const toUnblock = this.blockedScripts.filter(item => {
+        // If we have a provider ID, check provider-level consent
+        if (item.providerId) {
+          return consentState.isProviderGranted(item.providerId);
+        }
+        // Otherwise fall back to category-level consent
+        return consentState.isGranted(item.category);
+      });
+
+      toUnblock.forEach(item => {
+        this.reloadScript(item.element, item.originalType);
+      });
+
+      // Remove unblocked from list
+      this.blockedScripts = this.blockedScripts.filter(item => {
+        if (item.providerId) {
+          return !consentState.isProviderGranted(item.providerId);
+        }
+        return !consentState.isGranted(item.category);
+      });
+    }
+
+    reloadScript(script, originalType) {
+      // Guard: Skip Next.js internal bootstrap/RSC scripts to avoid hydration errors.
+      // These scripts use `self.__next_f.push()` or `nextServerDataCallback` and break
+      // when re-injected after consent because Next.js expects them during initial hydration only.
+      const src = script.src || '';
+      const content = script.textContent || '';
+      if (
+        src.includes('_next/') ||
+        content.includes('__next_f') ||
+        content.includes('nextServerDataCallback') ||
+        content.includes('__NEXT_DATA__')
+      ) {
+        return; // Skip — Next.js manages these scripts itself
+      }
+
+      const newScript = document.createElement('script');
+
+      // Copy attributes
+      Array.from(script.attributes).forEach(attr => {
+        if (attr.name !== 'type' && !attr.name.startsWith('data-biscotti')) {
+          newScript.setAttribute(attr.name, attr.value);
+        }
+      });
+
+      newScript.setAttribute('type', originalType);
+
+      // Copy inline content if no src
+      if (!script.src && script.textContent) {
+        newScript.textContent = script.textContent;
+      }
+
+      // Replace old script with new
+      script.parentNode.replaceChild(newScript, script);
+    }
+
+    startObserving() {
+      if (this.observer) return;
+
+      this.observer = new MutationObserver((mutations) => {
+        mutations.forEach(mutation => {
+          mutation.addedNodes.forEach(node => {
+            if (node.nodeName === 'SCRIPT') {
+              this.blockScript(node);
+            }
+          });
+        });
+      });
+
+      this.observer.observe(document.documentElement, {
+        childList: true,
+        subtree: true
+      });
+    }
+
+    stopObserving() {
+      if (this.observer) {
+        this.observer.disconnect();
+        this.observer = null;
+      }
+    }
+
+    // Block existing scripts in DOM
+    blockExistingScripts() {
+      const scripts = document.querySelectorAll('script:not([data-biscotti-blocked])');
+      scripts.forEach(script => this.blockScript(script));
+    }
+  }
+
+  // ==========================================================================
+  // MAIN BISCOTTI ENGINE
+  // ==========================================================================
+
+  export class BiscottiEngine {
+    constructor(config = {}) {
+      this.config = {
+        ...config,
+        apiEndpoint: config.apiEndpoint || null,
+        accountId: config.accountId || null,
+        blockPatterns: config.blockPatterns || DEFAULT_BLOCK_PATTERNS,
+        cookieDays: config.cookieDays || COOKIE_DAYS,
+        debug: config.debug || false,
+        autoBlock: config.autoBlock !== false,
+        googleConsentMode: config.googleConsentMode !== false,
+        tcfEnabled: false, // NEVER trust client-side config — always wait for server API response
+        gppEnabled: config.gppEnabled !== undefined ? config.gppEnabled : null, // null means auto-detect based on GEO
+        // Advanced Mode: If true, Google tags load but are cookieless until consent
+        // WARNING: May transfer IP to Google before consent (DSGVO-kritisch!)
+        // If false (default): Tags are blocked until consent (Basic Mode - safer)
+        consentModeAdvanced: config.consentModeAdvanced === true,
+      };
+
+      this.consentState = new ConsentState();
+      
+      this.tcfApi = null;
+      this.tcModel = null;
+      
+      this.blockingEngine = new BlockingEngine(this.config.blockPatterns);
+      this.iframeBlockingEngine = new IframeBlockingEngine();
+      this.floatingButton = new FloatingSettingsButton(() => this.showBanner(), this.config);
+      this.bannerUI = new BannerUI(this);
+      this.eventListeners = {};
+      this.initialized = false;
+      this.gpcApplied = false;
+
+      // Store jurisdiction config from server for region-aware rendering
+      this.jurisdiction = config.jurisdiction || null;
+
+      this._init();
+    }
+
+    _log(...args) {
+      if (this.config.debug) {
+        console.log('[Biscotti]', ...args);
+      }
+    }
+
+    // ==========================================================================
+    // DEBUG MODE - Visual Debugging Panel
+    // ==========================================================================
+
+    /**
+     * Show debug panel overlay with comprehensive info
+     */
+    showDebugPanel() {
+      // Enable debug mode
+      this.config.debug = true;
+      
+      // Remove existing panel
+      const existing = document.getElementById('biscotti-debug-panel');
+      if (existing) existing.remove();
+
+      // Create debug panel
+      const panel = document.createElement('div');
+      panel.id = 'biscotti-debug-panel';
+      panel.innerHTML = this._renderDebugPanel();
+      document.body.appendChild(panel);
+
+      // Add styles
+      this._addDebugStyles();
+
+      // Update panel every 2 seconds
+      this._debugInterval = setInterval(() => {
+        const content = document.getElementById('biscotti-debug-content');
+        if (content) {
+          content.innerHTML = this._getDebugContent();
+        }
+      }, 2000);
+
+      // Event listeners
+      panel.querySelector('[data-action="close"]')?.addEventListener('click', () => this.hideDebugPanel());
+      panel.querySelector('[data-action="copy"]')?.addEventListener('click', () => this._copyDebugInfo());
+      panel.querySelector('[data-action="reset"]')?.addEventListener('click', () => {
+        this.reset();
+        this.showBanner();
+      });
+    }
+
+    /**
+     * Hide debug panel
+     */
+    hideDebugPanel() {
+      const panel = document.getElementById('biscotti-debug-panel');
+      if (panel) panel.remove();
+      if (this._debugInterval) {
+        clearInterval(this._debugInterval);
+        this._debugInterval = null;
+      }
+    }
+
+    /**
+     * Render debug panel HTML
+     */
+    _renderDebugPanel() {
+      return `
+        <div class="biscotti-debug-header">
+          <span>🍪 Biscotti Debug Panel</span>
+          <div class="biscotti-debug-actions">
+            <button data-action="copy" title="Copy debug info">📋</button>
+            <button data-action="reset" title="Reset consent">🔄</button>
+            <button data-action="close" title="Close panel">✕</button>
+          </div>
+        </div>
+        <div id="biscotti-debug-content" class="biscotti-debug-content">
+          ${this._getDebugContent()}
+        </div>
+      `;
+    }
+
+    /**
+     * Get debug content
+     */
+    _getDebugContent() {
+      const consent = this.consentState;
+      const blocked = this.blockingEngine?.blockedScripts || [];
+      const released = this.blockingEngine?.releasedScripts || [];
+      
+      return `
+        <div class="biscotti-debug-section">
+          <h4>📊 Status</h4>
+          <table>
+            <tr><td>Version</td><td><code>${VERSION}</code></td></tr>
+            <tr><td>Initialisiert</td><td>${this.initialized ? '✅' : '❌'}</td></tr>
+            <tr><td>TCF Enabled</td><td>${this.config.tcfEnabled ? '✅' : '❌'}</td></tr>
+            <tr><td>GPC Signal</td><td>${navigator.globalPrivacyControl ? '🛑 Aktiv' : '—'}</td></tr>
+            <tr><td>GPC Applied</td><td>${this.gpcApplied ? '✅' : '—'}</td></tr>
+            <tr><td>Bot Detected</td><td>${botDetector.detect() ? '🤖 Ja' : '👤 Nein'}</td></tr>
+          </table>
+        </div>
+
+        <div class="biscotti-debug-section">
+          <h4>✅ Consent State</h4>
+          <table>
+            <tr><td>Essential</td><td>${consent.categories.essential ? '✅' : '❌'}</td></tr>
+            <tr><td>Functional</td><td>${consent.categories.functional ? '✅' : '❌'}</td></tr>
+            <tr><td>Analytics</td><td>${consent.categories.analytics ? '✅' : '❌'}</td></tr>
+            <tr><td>Marketing</td><td>${consent.categories.marketing ? '✅' : '❌'}</td></tr>
+          </table>
+          <p style="font-size: 10px; color: #595959; margin: 4px 0 0;">
+            Consent: ${consent.timestamp ? new Date(consent.timestamp).toLocaleString() : 'Nicht erteilt'}
+          </p>
+        </div>
+
+        <div class="biscotti-debug-section">
+          <h4>🚫 Blocked (${blocked.length})</h4>
+          <div class="biscotti-debug-scripts">
+            ${blocked.length > 0 
+              ? blocked.slice(0, 5).map(s => `<code>${this._truncate(s.src || s.innerHTML?.substring(0, 40), 40)}</code>`).join('') 
+              : '<span style="color:#595959">Keine blockierten Scripts</span>'
+            }
+            ${blocked.length > 5 ? `<span style="color:#595959">... +${blocked.length - 5} weitere</span>` : ''}
+          </div>
+        </div>
+
+        <div class="biscotti-debug-section">
+          <h4>✅ Released (${released.length})</h4>
+          <div class="biscotti-debug-scripts">
+            ${released.length > 0 
+              ? released.slice(0, 5).map(s => `<code>${this._truncate(s, 40)}</code>`).join('') 
+              : '<span style="color:#595959">Keine freigegebenen Scripts</span>'
+            }
+          </div>
+        </div>
+
+        <div class="biscotti-debug-section">
+          <h4>🔐 TCF String</h4>
+          <div style="word-break: break-all; font-size: 10px; font-family: monospace; background: #1a1a2e; padding: 8px; border-radius: 4px; max-height: 60px; overflow: auto;">
+            ${consent.tcfString || '<span style="color:#595959">Kein TCF String</span>'}
+          </div>
+        </div>
+
+        <div class="biscotti-debug-section">
+          <h4>⚙️ Config</h4>
+          <table>
+            <tr><td>API Endpoint</td><td><code>${this.config.apiEndpoint || 'default'}</code></td></tr>
+            <tr><td>Account ID</td><td><code>${this.config.accountId || '—'}</code></td></tr>
+            <tr><td>Auto Block</td><td>${this.config.autoBlock ? '✅' : '❌'}</td></tr>
+            <tr><td>Google Consent Mode</td><td>${this.config.googleConsentMode ? '✅' : '❌'}</td></tr>
+            <tr><td>Consent Mode Advanced</td><td>${this.config.consentModeAdvanced ? '⚠️ Ja' : '✅ Basic'}</td></tr>
+          </table>
+        </div>
+
+        <div class="biscotti-debug-section">
+          <h4>🌐 Google Consent Mode</h4>
+          <table>
+            ${window.dataLayer ? 
+              `<tr><td>dataLayer</td><td>✅ Vorhanden (${window.dataLayer.length} Einträge)</td></tr>` :
+              `<tr><td>dataLayer</td><td>❌ Nicht gefunden</td></tr>`
+            }
+            <tr><td>ad_storage</td><td>${consent.categories.marketing ? '✅ granted' : '❌ denied'}</td></tr>
+            <tr><td>analytics_storage</td><td>${consent.categories.analytics ? '✅ granted' : '❌ denied'}</td></tr>
+            <tr><td>ad_user_data</td><td>${consent.categories.marketing ? '✅ granted' : '❌ denied'}</td></tr>
+            <tr><td>ad_personalization</td><td>${consent.categories.marketing ? '✅ granted' : '❌ denied'}</td></tr>
+          </table>
+        </div>
+      `;
+    }
+
+    /**
+     * Add debug panel styles
+     */
+    _addDebugStyles() {
+      const styleId = 'biscotti-debug-styles';
+      if (document.getElementById(styleId)) return;
+
+      const style = document.createElement('style');
+      style.id = styleId;
+      style.textContent = `
+        #biscotti-debug-panel {
+          position: fixed;
+          bottom: 20px;
+          right: 20px;
+          width: 360px;
+          max-height: 80vh;
+          background: linear-gradient(135deg, #0f0f1a 0%, #1a1a2e 100%);
+          color: #fff;
+          font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+          font-size: 12px;
+          border-radius: 12px;
+          box-shadow: 0 20px 60px rgba(0,0,0,0.4);
+          z-index: 999999;
+          overflow: hidden;
+          border: 1px solid rgba(212, 165, 116, 0.3);
+        }
+        .biscotti-debug-header {
+          display: flex;
+          justify-content: space-between;
+          align-items: center;
+          padding: 12px 16px;
+          background: linear-gradient(135deg, #9B6B3C 0%, #8B5A2B 100%);
+          color: #fff;
+          font-weight: 600;
+          font-size: 14px;
+        }
+        .biscotti-debug-actions {
+          display: flex;
+          gap: 8px;
+        }
+        .biscotti-debug-actions button {
+          background: rgba(255,255,255,0.2);
+          border: none;
+          padding: 4px 8px;
+          border-radius: 4px;
+          cursor: pointer;
+          font-size: 14px;
+        }
+        .biscotti-debug-actions button:hover {
+          background: rgba(255,255,255,0.3);
+        }
+        .biscotti-debug-content {
+          padding: 12px;
+          max-height: 60vh;
+          overflow-y: auto;
+        }
+        .biscotti-debug-section {
+          background: rgba(255,255,255,0.05);
+          border-radius: 8px;
+          padding: 12px;
+          margin-bottom: 8px;
+        }
+        .biscotti-debug-section h4 {
+          margin: 0 0 8px;
+          font-size: 12px;
+          color: #9B6B3C;
+          font-weight: 600;
+        }
+        .biscotti-debug-section table {
+          width: 100%;
+          border-collapse: collapse;
+        }
+        .biscotti-debug-section td {
+          padding: 4px 0;
+          border-bottom: 1px solid rgba(255,255,255,0.1);
+          font-size: 11px;
+        }
+        .biscotti-debug-section td:first-child {
+          color: #595959;
+        }
+        .biscotti-debug-section td:last-child {
+          text-align: right;
+        }
+        .biscotti-debug-section code {
+          background: rgba(212, 165, 116, 0.2);
+          padding: 2px 6px;
+          border-radius: 4px;
+          font-size: 10px;
+        }
+        .biscotti-debug-scripts {
+          display: flex;
+          flex-direction: column;
+          gap: 4px;
+        }
+        .biscotti-debug-scripts code {
+          display: block;
+          font-size: 10px;
+          padding: 4px 6px;
+          background: #1a1a2e;
+          border-radius: 4px;
+          overflow: hidden;
+          text-overflow: ellipsis;
+          white-space: nowrap;
+        }
+      `;
+      document.head.appendChild(style);
+    }
+
+    /**
+     * Helper: Truncate string
+     */
+    _truncate(str, len) {
+      if (!str) return '—';
+      return str.length > len ? str.substring(0, len) + '...' : str;
+    }
+
+    /**
+     * Copy debug info to clipboard
+     */
+    _copyDebugInfo() {
+      const info = {
+        version: VERSION,
+        consent: this.consentState.toJSON(),
+        config: {
+          debug: this.config.debug,
+          autoBlock: this.config.autoBlock,
+          tcfEnabled: this.config.tcfEnabled,
+          googleConsentMode: this.config.googleConsentMode,
+          consentModeAdvanced: this.config.consentModeAdvanced
+        },
+        blocked: this.blockingEngine?.blockedScripts?.length || 0,
+        released: this.blockingEngine?.releasedScripts?.length || 0,
+        gpc: navigator.globalPrivacyControl,
+        isBot: botDetector.detect(),
+        userAgent: navigator.userAgent
+      };
+      
+      navigator.clipboard?.writeText(JSON.stringify(info, null, 2))
+        .then(() => alert('Debug info copied!'))
+        .catch(() => console.log('Debug info:', info));
+    }
+
+    // Load configuration from API (services, banner settings, etc.)
+    async _loadConfigFromAPI() {
+      // Prefer websiteId (UUID) from BiscottiConfig, fall back to hostname
+      const domain = this.config.websiteId || window.location.hostname;
+      const apiBase = this.config.apiEndpoint || 'https://api.biscotti-cmp.com/api/v1';
+      
+      // Generate or retrieve persistent visitor ID for A/B testing
+      let visitorId = '';
+      try {
+        visitorId = localStorage.getItem('biscotti_visitor_id') || '';
+        if (!visitorId) {
+          visitorId = 'v_' + Math.random().toString(36).substring(2) + Date.now().toString(36);
+          localStorage.setItem('biscotti_visitor_id', visitorId);
+        }
+      } catch (e) { /* localStorage unavailable */ }
+      
+      try {
+        const configUrl = visitorId
+          ? `${apiBase}/config/${domain}?visitorId=${encodeURIComponent(visitorId)}`
+          : `${apiBase}/config/${domain}`;
+        const response = await fetch(configUrl, {
+          method: 'GET',
+          credentials: 'omit'
+        });
+        
+        if (!response.ok) {
+          this._log('Config API error:', response.status);
+          return;
+        }
+        
+        const data = await response.json();
+        
+        if (data.success !== false) {
+          // ─── BANNER DISABLED CHECK ───────────────────────────────────────
+          // If the server explicitly says bannerEnabled=false (no active banner
+          // in the admin), the client must NOT render anything — no banner,
+          // no floating button, no UI at all. This respects the admin toggle.
+          if (data.bannerEnabled === false) {
+            this._log('Banner is disabled by admin (bannerEnabled=false). Exiting.');
+            this._disabled = true;
+            return;
+          }
+
+          // Server-side tcfEnabled ALWAYS takes precedence over WP plugin config
+          if (data.tcfEnabled !== undefined) {
+            this.config.tcfEnabled = data.tcfEnabled;
+            this._log('TCF enabled override from server:', data.tcfEnabled);
+          }
+          
+          // If TCF is enabled, also fetch the official GVL in parallel
+          // NO HARDCODING: We load the exact IAB translations/definitions from the backend
+          // TCF only activates when tcfEnabled=true AND jurisdiction requires it (EU/EEA/UK)
+          const jurisdictionRequiresTcf = this.jurisdiction?.requiredFeatures?.includes?.('tcf_support') || 
+              (Array.isArray(this.jurisdiction?.requiredFeatures) ? false : this.jurisdiction?.requiredFeatures?.tcf);
+           if (this.config.tcfEnabled && (jurisdictionRequiresTcf || !this.jurisdiction)) {
+            try {
+              this._log('TCF enabled: Fetching official Global Vendor List (GVL) data...');
+              const gvlRes = await fetch(`${apiBase}/tcf/gvl/vendor-list.json`, { credentials: 'omit' });
+
+              if (gvlRes.ok) {
+                const gvl = await gvlRes.json();
+                
+                // Store raw GVL JSON for TCModel encoding (GVL class requires vendors as object)
+                this.config.rawGvlJson = gvl;
+                
+                // ── IAB TCF Compliance: Scope vendors to this website only ──
+                // The full GVL contains 1100+ vendors. We MUST only disclose/consent
+                // vendors that are actually used on THIS website. Showing/consenting
+                // all vendors is a Critical Fail for IAB certification.
+                const allGvlVendors = Object.values(gvl.vendors || {});
+                const websiteServices = this.config.services || data.services || [];
+                
+                // Build set of active GVL vendor IDs from website services
+                this.config.activeVendorIds = new Set();
+                const gvlVendorMap = gvl.vendors || {};
+                
+                for (const svc of websiteServices) {
+                  // Method A: Explicit gvlVendorId mapping (most reliable)
+                  if (svc.gvlVendorId) {
+                    this.config.activeVendorIds.add(parseInt(svc.gvlVendorId));
+                    continue;
+                  }
+                  // Method B: Name-based matching against GVL vendor names
+                  const svcName = (svc.name || '').toLowerCase().trim();
+                  if (!svcName || svcName.length < 3) continue;
+                  
+                  for (const [vid, v] of Object.entries(gvlVendorMap)) {
+                    if (!v.name) continue;
+                    const gvlName = v.name.toLowerCase();
+                    // Match if service name contains vendor name or vice versa
+                    // e.g. "Google Analytics" matches GVL vendor "Google Advertising Products"
+                    if (gvlName.includes(svcName) || svcName.includes(gvlName) ||
+                        // Also match on first significant word (e.g. "Hotjar" → "Hotjar Ltd")
+                        (svcName.split(/\s+/)[0].length >= 4 && gvlName.startsWith(svcName.split(/\s+/)[0]))) {
+                      this.config.activeVendorIds.add(parseInt(vid));
+                      break;
+                    }
+                  }
+                }
+                
+                // Filter vendors to only active ones for UI display
+                const activeVendors = allGvlVendors.filter(v => this.config.activeVendorIds.has(v.id));
+                
+                this._log('TCF Vendor Scoping:', activeVendors.length, 'active vendors out of', allGvlVendors.length, 'total GVL vendors');
+                this._log('TCF Active Vendor IDs:', [...this.config.activeVendorIds]);
+                
+                this.config.tcfData = {
+                  purposes: gvl.purposes || {},
+                  specialPurposes: gvl.specialPurposes || {},
+                  features: gvl.features || {},
+                  specialFeatures: gvl.specialFeatures || {},
+                  dataCategories: this.config.rawGvlJson?.dataCategories || gvl.dataCategories || {},
+                  vendors: activeVendors,
+                  allVendorCount: allGvlVendors.length,
+                  vendorListVersion: gvl.vendorListVersion
+                };
+                this._log('TCF GVL data loaded:', 
+                  Object.keys(this.config.tcfData.purposes).length, 'purposes,',
+                  Object.keys(this.config.tcfData.specialPurposes).length, 'specialPurposes,',
+                  Object.keys(this.config.tcfData.features).length, 'features,',
+                  Object.keys(this.config.tcfData.specialFeatures).length, 'specialFeatures,',
+                  this.config.tcfData.vendors.length, 'vendors (scoped to website)'
+                );
+                
+                // TCF 2.3: Update CmpApi with GVL data so that:
+                // - getVendorList command works (returns the GVL)
+                // - ping returns correct tcfPolicyVersion (5, not default 2)
+                // - Initial TC string includes mandatory disclosedVendors segment
+                if (this.tcfApi && this.tcfApi.updateWithGVL) {
+                  this._log('TCF: updateWithGVL from config API');
+                  this.tcfApi.updateWithGVL(gvl, this.config.activeVendorIds);
+                } else {
+                  this._log('TCF: skipped updateWithGVL — tcfApi:', !!this.tcfApi);
+                }
+
+                // NOTE: TCF translations are loaded AFTER the language cascade below
+                // so we use the correct resolved language, not a premature fallback
+              } else {
+                this._log('TCF GVL fetch failed:', gvlRes.status);
+              }
+            } catch (tcfErr) {
+              this._log('Error fetching TCF GVL:', tcfErr);
+            }
+          }
+
+          // Merge API config into local config
+          // Sync showFloatingButton from API top-level (source of truth)
+          if (data.showFloatingButton !== undefined) {
+            this.config.showFloatingButton = data.showFloatingButton;
+          }
+          if (data.services && Array.isArray(data.services)) {
+            this.config.services = data.services;
+            this._log('Loaded services from API:', data.services.length);
+
+            // Custom Service Blocking: Extract custom services and register patterns
+            const customServices = data.services.filter(
+              svc => svc.isCustom === true && svc.blockingPatterns && svc.blockingPatterns.length > 0
+            );
+            if (customServices.length > 0) {
+              this.blockingEngine.addCustomPatterns(customServices);
+              this.iframeBlockingEngine.addCustomPatterns(customServices);
+              this._log('Custom service patterns registered:', customServices.length, 'services');
+            }
+
+            // Store all custom services (including those without blocking patterns) for embed-code handler
+            this._customServices = data.services.filter(svc => svc.isCustom === true);
+
+            // Handle data-biscotti-service elements for embed-code blocking
+            this._initCustomEmbedHandler();
+          }
+          
+          // Store vendor counts for IAB/non-IAB split partner count
+          if (data.vendorCounts) {
+            this.config.vendorCounts = data.vendorCounts;
+          }
+
+          // Store publisher restrictions from Config API for TC String encoding
+          if (data.publisherRestrictions) {
+            this.config.publisherRestrictions = data.publisherRestrictions;
+          }
+
+          // Store ATP vendors from Config API for AC String generation
+          if (data.atpVendors) {
+            this.config.atpVendors = data.atpVendors;
+          }
+          
+          // Store plan info for branding logic
+          if (data.plan) {
+            this.config.plan = data.plan;
+          }
+
+          // Store test domain flag from API response
+          if (data.isTestDomain === true) {
+            this.config.isTestDomain = true;
+          }
+
+          // Store legal page URLs (Datenschutzerklärung, Impressum)
+          if (data.privacyUrl) {
+            this.config.privacyUrl = data.privacyUrl;
+          }
+          if (data.imprintUrl) {
+            this.config.imprintUrl = data.imprintUrl;
+          }
+          
+          // Store branding config (controls attribution display)
+          if (data.branding) {
+            this.config.branding = data.branding;
+          }
+          
+          // Store white-label config
+          if (data.whiteLabel) {
+            this.config.whiteLabel = data.whiteLabel;
+          }
+          
+          // Merge banner settings
+          if (data.banner) {
+            this.config.banner = { ...this.config.banner, ...data.banner };
+            // Apply ethical UI mode from banner theme
+            if (data.banner.theme?.ethicalUiMode) {
+              this.config.ethicalUiMode = true;
+            }
+          }
+          
+          // Merge categories
+          if (data.categories) {
+            this.config.categories = data.categories;
+          }
+          
+          // Store compliance information
+          if (data.compliance) {
+            this.config.compliance = data.compliance;
+            this.config.consentMode = data.compliance.consentModel === 'opt_out' ? 'opt-out' : 'opt-in';
+            this.config.legalBasis = data.legalBasis || 'consent';
+            
+            // Align frontend UI with regional backend compliance
+            if (data.compliance.ui) {
+              if (!this.config.banner) this.config.banner = {};
+              if (data.compliance.ui.bannerType) {
+                this.config.banner.type = data.compliance.ui.bannerType;
+              }
+              if (data.compliance.ui.buttons && data.compliance.ui.buttons.equalProminence) {
+                this.config.ethicalUiMode = true; // Enforces equal prominence for buttons
+              }
+            }
+            
+            // Determine if GPP is needed based on US frameworks or backend features
+            const usFrameworks = ['ccpa', 'vcdpa', 'cpa', 'ctdpa', 'ucpa', 'tdpsa', 'ocpa', 'mcdpa', 'fdbr', 'tipa', 'dpdpa', 'icdpa', 'njdpa', 'nhdpl', 'kcdpa', 'ndpa', 'modpa', 'mcdpa_mn'];
+            const isUSState = (data.compliance.frameworks && data.compliance.frameworks.some(f => usFrameworks.includes(f))) || (data.compliance.features && data.compliance.features.includes('gpp_support'));
+            
+            // Auto-resolve gppEnabled if not explicitly configured
+            if (this.config.gppEnabled === null) {
+              this.config.gppEnabled = isUSState;
+              
+              // Only push an update to clear GPP if we're not in a US state
+              if (!isUSState && this.gppApi) {
+                this.gppApi.update('DBABMA~', 'hidden', []);
+              }
+            }
+            
+            this._log('Compliance model loaded:', this.config.compliance.consentModel, 'Legal Basis:', this.config.legalBasis, 'GPP Enabled:', this.config.gppEnabled);
+
+            // OPT-OUT LOGIC: If we are in opt-out mode and user hasn't made a choice,
+            // we should pre-grant all categories and apply them immediately.
+            if (this.config.consentMode === 'opt-out' && !this.consentState.hasUserChoice()) {
+              this._log('Opt-out model detected: auto-granting consent until user opts out');
+              this.consentState.categories.functional = true;
+              this.consentState.categories.analytics = true;
+              this.consentState.categories.marketing = true;
+              // Do NOT set timestamp so it remains !hasUserChoice()
+              // Unblock immediately based on the granted state
+              this._applyConsent();
+            }
+          }
+          if (data.tcfPurposes) {
+            this.config.tcfPurposes = data.tcfPurposes;
+            this._log('Loaded TCF purposes from API:', data.tcfPurposes.length);
+          }
+          
+          // ================================================================
+          // SMART LANGUAGE DETECTION CASCADE
+          // Priority: 1. Explicit config → 2. Page lang → 3. GeoIP → 4. Browser
+          // ================================================================
+          const SUPPORTED_LANGS = ['de', 'en', 'fr', 'es', 'it', 'nl', 'pl', 'pt-BR', 'pt-PT', 'da', 'ar', 'bg', 'bs', 'ca', 'cs', 'el', 'eu', 'fi', 'gl', 'he', 'hi', 'hr', 'hu', 'id', 'ja', 'lt', 'mr', 'nb', 'ro', 'ru', 'sk', 'sl', 'sr', 'sv', 'th', 'tr', 'uk', 'vi', 'zh', 'zh-TW'];
+          
+          const _normalizeLang = (raw) => {
+            if (!raw) return null;
+            const lower = raw.toLowerCase();
+            // Direct match (handles "pt-br", "pt-pt", "zh-tw")
+            const direct = SUPPORTED_LANGS.find(l => l.toLowerCase() === lower);
+            if (direct) return direct;
+            // Base language fallback
+            const base = lower.split('-')[0];
+            // "pt" without region → pt-BR (Brazilian default)
+            if (base === 'pt') return 'pt-BR';
+            return SUPPORTED_LANGS.find(l => l.toLowerCase() === base) || null;
+          };
+
+          const _detectPageLanguage = () => {
+            // Check <html lang="..."> attribute
+            const htmlLang = document.documentElement.lang;
+            const normalized = _normalizeLang(htmlLang);
+            if (normalized) return normalized;
+            
+            // Check URL path prefix (e.g., /de/, /en/page)
+            const pathMatch = window.location.pathname.match(/^\/([a-z]{2})(\/|$)/);
+            if (pathMatch) return _normalizeLang(pathMatch[1]);
+            
+            return null;
+          };
+          
+          const _detectBrowserLanguage = () => {
+            const navLang = navigator.language || navigator.userLanguage || '';
+            return _normalizeLang(navLang);
+          };
+          
+          // Backward compat: bare "pt" in config resolves to "pt-BR"
+          if (this.config.language === 'pt') {
+            this.config.language = 'pt-BR';
+          }
+
+          // Priority cascade
+          const resolvedLanguage = 
+            this.config.language                    // 1. Explicit BiscottiConfig.language
+            || _detectPageLanguage()                // 2. <html lang> or URL prefix
+            || data.effectiveLanguage               // 3. GeoIP from API
+            || _detectBrowserLanguage()             // 4. Browser navigator.language
+            || 'en';                                // 5. Final fallback
+          
+          // Store the API's language so t() can compare with resolved language
+          this.config._apiEffectiveLanguage = data.effectiveLanguage || null;
+          
+          this.config.effectiveLanguage = resolvedLanguage;
+          if (this.bannerUI) this.bannerUI.language = resolvedLanguage;
+          this._log('Language resolved:', resolvedLanguage, 
+            '(config:', this.config.language, 
+            '| page:', _detectPageLanguage(), 
+            '| geoip:', data.effectiveLanguage, 
+            '| browser:', _detectBrowserLanguage(), ')');
+          
+          // Store multi-language originals for SPA language re-resolution
+          if (this.config.categories && !Array.isArray(this.config.categories)) {
+            this.config._allCategories = this.config.categories;
+            this.config.categories = this.config._allCategories[resolvedLanguage] 
+              || this.config._allCategories['en'] 
+              || this.config._allCategories['de'] 
+              || [];
+            this._log('Categories resolved to', resolvedLanguage, ':', this.config.categories.length, 'items');
+          }
+          
+          if (this.config.tcfPurposes && !Array.isArray(this.config.tcfPurposes)) {
+            this.config._allTcfPurposes = this.config.tcfPurposes;
+            this.config.tcfPurposes = this.config._allTcfPurposes[resolvedLanguage] 
+              || this.config._allTcfPurposes['en'] 
+              || this.config._allTcfPurposes['de'] 
+              || [];
+            this._log('TCF purposes resolved to', resolvedLanguage, ':', this.config.tcfPurposes.length, 'items');
+          }
+          
+          // NOW load TCF translations in the correct resolved language
+          // (must happen AFTER language cascade so effectiveLanguage is set)
+          if (this.config.tcfData) {
+            await this._loadTCFTranslations();
+          }
+          
+          // Resolve legal links (privacyUrl, imprintUrl) for the resolved language
+          // The API returns URLs based on its effectiveLanguage (usually 'de'),
+          // but the client may resolve to a different language (e.g. 'en' from page URL)
+          const allTexts = this.config.banner?.allLocalizedTexts;
+          if (allTexts && resolvedLanguage !== data.effectiveLanguage) {
+            const langTexts = allTexts[resolvedLanguage] || {};
+            if (langTexts.privacyUrl) this.config.privacyUrl = langTexts.privacyUrl;
+            if (langTexts.imprintUrl) this.config.imprintUrl = langTexts.imprintUrl;
+          }
+          
+          // Apply theme from API — always merge, API theme takes precedence
+          if (data.banner?.theme) {
+            this.config.theme = { ...(this.config.theme || {}), ...data.banner.theme };
+            // Sync theme-level settings to top-level config (API is source of truth)
+            if (data.banner.theme.showFloatingButton !== undefined) {
+              this.config.showFloatingButton = data.banner.theme.showFloatingButton;
+            }
+            this._applyTheme();
+          }
+          
+          this._log('Config loaded from API:', data);
+          
+          // Re-render banner if it's currently visible so services appear
+          // Support both v1 BannerUI (container, _renderBanner, _attachEventListeners)
+          // and v2 BiscottiBanner (element, _createBanner, _bindEvents)
+          if (this.bannerUI) {
+            // Force re-detect services with new API config
+            this.bannerUI.detectedServices = null;
+            
+            // v1 BannerUI: has .container and ._renderBanner()
+            if (this.bannerUI.container && typeof this.bannerUI._renderBanner === 'function') {
+              this.bannerUI.container.innerHTML = this.bannerUI._renderBanner();
+              this.bannerUI._attachEventListeners();
+              this._log('Banner re-rendered with API services (v1)');
+            }
+            // v2 BiscottiBanner: has .element and ._createBanner()
+            else if (this.bannerUI.element && typeof this.bannerUI._renderCategories === 'function') {
+              // Sync TCF flag before re-rendering (tcfData may have loaded after banner construction)
+              this.bannerUI.isTCF = !!this.config.tcfEnabled;
+              
+              // Update the preferences panel with new services
+              const prefsPanel = this.bannerUI.element.querySelector('#biscotti-preferences, .biscotti-preferences');
+              if (prefsPanel) {
+                prefsPanel.innerHTML = this.bannerUI._renderCategories();
+                // Re-bind category/provider toggle events
+                this.bannerUI.element.querySelectorAll('.biscotti-toggle[role="switch"][data-category]').forEach(toggle => {
+                  toggle.addEventListener('click', (e) => {
+                    e.stopPropagation();
+                    if (toggle.getAttribute('aria-disabled') === 'true') return;
+                    const category = toggle.dataset.category;
+                    const newState = toggle.getAttribute('aria-checked') !== 'true';
+                    toggle.setAttribute('aria-checked', String(newState));
+                    this.bannerUI.categoryStates[category] = newState;
+                    this.bannerUI.element.querySelectorAll(`.biscotti-provider-item [data-category="${category}"]`).forEach(pt => {
+                      const providerId = pt.dataset.provider;
+                      pt.setAttribute('aria-checked', String(newState));
+                      this.bannerUI.providerStates[providerId] = newState;
+                    });
+                  });
+                });
+                this.bannerUI.element.querySelectorAll('.biscotti-toggle [data-provider]').forEach(toggle => {
+                  toggle.addEventListener('change', (e) => {
+                    const providerId = e.target.dataset.provider;
+                    this.bannerUI.providerStates[providerId] = e.target.checked;
+                  });
+                });
+                this.bannerUI.element.querySelectorAll('.biscotti-category-header').forEach(header => {
+                  header.addEventListener('click', (e) => {
+                    const cat = e.currentTarget.dataset.toggleCategory;
+                    const catEl = this.bannerUI.element.querySelector(`.biscotti-category[data-category="${cat}"]`);
+                    if (catEl) catEl.classList.toggle('expanded');
+                  });
+                });
+                // TCF tab switching (Purposes, Features, Vendors)
+                this.bannerUI.element.querySelectorAll('.biscotti-tcf-tab').forEach(tab => {
+                  tab.addEventListener('click', (e) => {
+                    const tabName = e.currentTarget.dataset.tcfTab;
+                    if (!tabName) return;
+                    this.bannerUI.activeTcfTab = tabName;
+                    // Update tab styles
+                    this.bannerUI.element.querySelectorAll('.biscotti-tcf-tab').forEach(t => {
+                      const isActive = t.dataset.tcfTab === tabName;
+                      t.classList.toggle('active', isActive);
+                      t.style.color = isActive ? 'var(--biscotti-primary-color, #9B6B3C)' : '#666';
+                      t.style.borderBottomColor = isActive ? 'var(--biscotti-primary-color, #9B6B3C)' : 'transparent';
+                    });
+                    // Show/hide panes via display style (panes use inline display:none)
+                    this.bannerUI.element.querySelectorAll('.biscotti-tcf-pane').forEach(p => {
+                      p.style.display = 'none';
+                    });
+                    const pane = this.bannerUI.element.querySelector(`#tcf-pane-${tabName}`);
+                    if (pane) pane.style.display = '';
+                  });
+                });
+                // TCF vendor search
+                const vendorSearch = this.bannerUI.element.querySelector('#tcf-vendor-search');
+                if (vendorSearch) {
+                  vendorSearch.addEventListener('input', (e) => {
+                    const q = e.target.value.toLowerCase();
+                    this.bannerUI.element.querySelectorAll('#tcf-vendor-list .biscotti-provider-item').forEach(item => {
+                      const name = item.dataset.vendorName || '';
+                      item.style.display = name.includes(q) ? '' : 'none';
+                    });
+                  });
+                }
+                // TCF special feature toggles
+                this.bannerUI.element.querySelectorAll('.biscotti-toggle input[data-tcf-special-feature]').forEach(toggle => {
+                  toggle.addEventListener('change', (e) => {
+                    const sfId = e.target.dataset.tcfSpecialFeature;
+                    if (this.bannerUI.tcfSpecialFeatures) {
+                      this.bannerUI.tcfSpecialFeatures[sfId] = e.target.checked;
+                    }
+                  });
+                });
+                // TCF purpose/vendor toggle events
+                this.bannerUI.element.querySelectorAll('.biscotti-toggle input[data-tcf-purpose-consent]').forEach(toggle => {
+                  toggle.addEventListener('change', (e) => {
+                    const pid = e.target.dataset.tcfPurposeConsent;
+                    if (this.bannerUI.tcfPurposes) {
+                      this.bannerUI.tcfPurposes[pid] = e.target.checked;
+                    }
+                  });
+                });
+                this.bannerUI.element.querySelectorAll('.biscotti-toggle input[data-tcf-li-purpose]').forEach(toggle => {
+                  toggle.addEventListener('change', (e) => {
+                    const pid = e.target.dataset.tcfLiPurpose;
+                    if (this.bannerUI.tcfPurposeLIs) {
+                      this.bannerUI.tcfPurposeLIs[pid] = e.target.checked;
+                    }
+                  });
+                });
+                this.bannerUI.element.querySelectorAll('.biscotti-toggle input[data-tcf-vendor-consent]').forEach(toggle => {
+                  toggle.addEventListener('change', (e) => {
+                    const vid = e.target.dataset.tcfVendorConsent;
+                    if (this.bannerUI.tcfVendors) {
+                      this.bannerUI.tcfVendors[vid] = e.target.checked;
+                    }
+                  });
+                });
+                this.bannerUI.element.querySelectorAll('.biscotti-toggle input[data-tcf-li-vendor]').forEach(toggle => {
+                  toggle.addEventListener('change', (e) => {
+                    const vid = e.target.dataset.tcfLiVendor;
+                    if (this.bannerUI.tcfVendorLIs) {
+                      this.bannerUI.tcfVendorLIs[vid] = e.target.checked;
+                    }
+                  });
+                });
+                this._log('Banner re-rendered with API services (v2)');
+              }
+            }
+          }
+        }
+      } catch (error) {
+        this._log('Failed to load config from API:', error.message);
+      }
+    }
+
+    _init() {
+      // Flag to defer banner showing until API config loads
+      this._deferredShowBanner = false;
+
+      // === Backward Compatibility: Config Normalization (Req 8.1-8.5) ===
+      // Old WP plugin versions (≤ v2.9.5) may pass stale config values.
+      // Normalize all new fields with safe defaults so no code path fails.
+      this.config.atpVendors = this.config.atpVendors || [];
+      this.config.publisherRestrictions = this.config.publisherRestrictions || [];
+      this.config.vendorCounts = {
+        iabVendorCount: 0,
+        nonIabVendorCount: 0,
+        atpVendorCount: 0,
+        ...(this.config.vendorCounts || {})
+      };
+
+      // TCF MUST always be initialized — old plugins may pass tcfEnabled: false
+      // but the server-side config (loaded async) will override this.
+      // We initialize TCF unconditionally to ensure __tcfapi is available
+      // for ad-tech vendors from the start. (Req 8.1)
+      this._initTCF();
+      
+      // Initialize IAB GPP Support early too
+      if (this.config.gppEnabled !== false) {
+        this._initGPP();
+      }
+      
+      // Load configuration from API (services, banner settings, etc.)
+      // This runs asynchronously - banner will be shown AFTER config loads
+      this._loadConfigFromAPI().then(() => {
+        // If banner was disabled by admin, tear down everything and stop
+        if (this._disabled) {
+          this._log('Banner disabled — removing all UI elements');
+          if (this.floatingButton?.button) {
+            this.floatingButton.button.remove();
+          }
+          if (this.bannerUI?.container) {
+            this.bannerUI.container.remove();
+          }
+          return;
+        }
+
+        // If floating button was disabled via API config but already rendered, remove it
+        if (this.config.showFloatingButton === false && this.floatingButton?.button) {
+          this.floatingButton.button.remove();
+          document.getElementById('biscotti-settings-btn-tooltip')?.remove();
+        }
+        // Create floating button only if API says it should be shown
+        if (this.config.showFloatingButton !== false && this.floatingButton && !this.floatingButton.button) {
+          if (document.readyState === 'loading') {
+            document.addEventListener('DOMContentLoaded', () => {
+              this.floatingButton.create();
+              if (this._gpcActive) this.floatingButton.setGpcIndicator(true);
+            });
+          } else {
+            this.floatingButton.create();
+            if (this._gpcActive) this.floatingButton.setGpcIndicator(true);
+          }
+        }
+
+        this.configLoaded = true;
+        this._emit('configReady', this.config);
+        
+        // Update floating button icon now that API config (with theme) is available
+        // The button was created before the API fetch completed, so the icon defaulted to cookie
+        const loadedTheme = this.config?.banner?.theme || this.config?.theme || {};
+        if (loadedTheme.floatingButtonIcon && this.floatingButton) {
+          this.floatingButton.setIcon(loadedTheme.floatingButtonIcon);
+        }
+
+        // TCF 2.3: Ensure CmpApi is updated with GVL data after config loads.
+        // This handles the race condition where _loadConfigFromAPI resolves before
+        // _initTCF runs (e.g. cached responses). If _initTCF already ran and
+        // updateWithGVL was called inside _loadConfigFromAPI, this is a safe no-op
+        // (CmpApiModel.tcfPolicyVersion will already be 5).
+        if (this.tcfApi && this.tcfApi.updateWithGVL && this.config.rawGvlJson) {
+          this.tcfApi.updateWithGVL(this.config.rawGvlJson, this.config.activeVendorIds);
+        }
+        
+        // After API loads, show banner if it was deferred
+        if (this._deferredShowBanner && !this.consentState.hasUserChoice()) {
+          this.showBanner();
+        }
+      }).catch(() => {
+        this.configLoaded = true;
+        this._emit('configReady', this.config);
+        
+        // Even on error, show banner if needed (graceful degradation)
+        if (this._deferredShowBanner && !this.consentState.hasUserChoice()) {
+          this.showBanner();
+        }
+      });
+      
+      // Apply theme colors from config
+      this._applyTheme();
+
+      // Initialize Google Consent Mode first (before any tags load)
+      if (this.config.googleConsentMode) {
+        GoogleConsentMode.init();
+      }
+
+      // Initialize cross-frame consent tunneling
+      CrossFrameConsent.init();
+
+      // Check for Global Privacy Control (GPC) / Do Not Track
+      if (GlobalPrivacyControl.isEnabled()) {
+        this._log('GPC/DNT detected - auto-rejecting non-essential cookies');
+        this.gpcApplied = true;
+        this.consentState = GlobalPrivacyControl.getDefaultState();
+        this._saveConsent();
+        this._applyConsent(); // Apply the GPC-based consent immediately
+        this._log('GPC active - NO BANNER will be shown (valid consent choice)');
+        // GPC = valid consent, skip banner entirely but still create floating button
+        this.initialized = true;
+        
+        // Floating button creation is deferred to _loadConfigFromAPI().then()
+        // to respect the API's showFloatingButton setting.
+        // Store GPC state so the .then() block can apply the indicator.
+        this._gpcActive = true;
+        return; // Exit _init - no banner needed
+      } else {
+        // Load existing consent
+        this._loadConsent();
+      }
+
+      // CRITICAL: If user already consented, send Google Consent Mode update
+      // IMMEDIATELY — before blocking engine setup or any other init work.
+      // The page's consent default starts a 500ms wait_for_update timer.
+      // If we don't call gtag('consent','update') within that window,
+      // GA permanently stays in denied mode for this page load.
+      if (this.config.googleConsentMode && this.consentState.hasUserChoice()) {
+        GoogleConsentMode.update(this.consentState);
+      }
+
+      // Start blocking if no consent yet (GPC users never reach here)
+      // In Advanced Mode: Skip blocking - Google tags run but are cookieless via gtag consent
+      // In Basic Mode (default): Block all tracking scripts until consent
+      if (this.config.autoBlock && !this.config.consentModeAdvanced) {
+        this.blockingEngine.startObserving();
+        this.iframeBlockingEngine.startObserving(this.consentState);
+
+        // _initTCF and _initGPP already called at the top of _init()
+
+        // Block any scripts/iframes already in DOM
+        if (document.readyState === 'loading') {
+          document.addEventListener('DOMContentLoaded', () => {
+            if (!this.consentState.hasUserChoice()) {
+              this.blockingEngine.blockExistingScripts();
+              this.iframeBlockingEngine.blockExistingIframes(this.consentState);
+              // Defer banner showing until API config loads
+              this._deferredShowBanner = true;
+            }
+          });
+        } else {
+          // DOM already loaded
+          if (!this.consentState.hasUserChoice()) {
+            this.blockingEngine.blockExistingScripts();
+            this.iframeBlockingEngine.blockExistingIframes(this.consentState);
+            // Defer banner showing until API config loads
+            this._deferredShowBanner = true;
+          }
+        }
+      } else if (this.config.consentModeAdvanced) {
+        // Advanced Mode: No script blocking, but still show banner for legal compliance
+        // Google tags will run in cookieless mode via gtag('consent', 'default', {...})
+        this._log('Advanced Consent Mode: Scripts NOT blocked (cookieless until consent)');
+        if (!this.consentState.hasUserChoice()) {
+          this._deferredShowBanner = true;
+        }
+      }
+
+      // Floating Button: Do NOT create here. Wait for API config to load.
+      // The API response is the source of truth for showFloatingButton.
+      // Creation happens in the _loadConfigFromAPI().then() block below.
+
+      // If user has already consented, unblock appropriate scripts/iframes
+      if (this.consentState.hasUserChoice()) {
+        this._applyConsent();
+      }
+
+      // Track session for billing/usage metrics
+      this._trackSession();
+
+      // Implement Retry Logic for any offline/failed syncs
+      // Execute asynchronously to unblock initialization
+      setTimeout(() => {
+        this._retryFailedSyncs();
+      }, 2000);
+
+      this.initialized = true;
+      this._log('Initialized', this.config);
+      this._log('GPC applied:', this.gpcApplied);
+    }
+
+    /**
+     * Initialize custom embed-code handler for [data-biscotti-service] elements.
+     * Blocks elements until consent is granted for the associated service category.
+     */
+    _initCustomEmbedHandler() {
+      if (!this._customServices || this._customServices.length === 0) return;
+
+      // Build service lookup by name (slug-like, case-insensitive)
+      this._customServiceMap = new Map();
+      for (const svc of this._customServices) {
+        if (svc.name) {
+          // Store by lowercase name and by slug (name with spaces replaced by hyphens)
+          const slug = svc.name.toLowerCase().replace(/\s+/g, '-');
+          this._customServiceMap.set(slug, svc);
+          this._customServiceMap.set(svc.name.toLowerCase(), svc);
+        }
+      }
+
+      // Process existing elements
+      const processElement = (el) => {
+        const serviceRef = el.getAttribute('data-biscotti-service');
+        if (!serviceRef || el.hasAttribute('data-biscotti-embed-blocked')) return;
+
+        const svc = this._customServiceMap.get(serviceRef.toLowerCase());
+        if (!svc) return;
+
+        const category = (svc.category || 'marketing').toLowerCase();
+
+        if (this.consentState.isGranted(category)) {
+          // Consent already granted — inject embed code if available
+          if (svc.embedCode) {
+            this._injectEmbedCode(el, svc);
+          }
+          return;
+        }
+
+        // Block the element
+        el.setAttribute('data-biscotti-embed-blocked', 'true');
+        el.setAttribute('data-biscotti-category', category);
+        el.style.display = 'none';
+      };
+
+      // Process all existing elements
+      if (document.readyState === 'loading') {
+        document.addEventListener('DOMContentLoaded', () => {
+          document.querySelectorAll('[data-biscotti-service]').forEach(processElement);
+        });
+      } else {
+        document.querySelectorAll('[data-biscotti-service]').forEach(processElement);
+      }
+
+      // Observe for dynamically added elements
+      const embedObserver = new MutationObserver((mutations) => {
+        for (const mutation of mutations) {
+          for (const node of mutation.addedNodes) {
+            if (node.nodeType !== 1) continue;
+            if (node.hasAttribute && node.hasAttribute('data-biscotti-service')) {
+              processElement(node);
+            }
+            // Also check children
+            if (node.querySelectorAll) {
+              node.querySelectorAll('[data-biscotti-service]').forEach(processElement);
+            }
+          }
+        }
+      });
+
+      embedObserver.observe(document.documentElement, { childList: true, subtree: true });
+      this._embedObserver = embedObserver;
+    }
+
+    /**
+     * Inject embed code into a [data-biscotti-service] element after consent.
+     */
+    _injectEmbedCode(el, svc) {
+      if (!svc.embedCode) return;
+      el.style.display = '';
+      el.innerHTML = svc.embedCode;
+
+      // Execute any script tags in the embed code
+      const scripts = el.querySelectorAll('script');
+      scripts.forEach(oldScript => {
+        const newScript = document.createElement('script');
+        Array.from(oldScript.attributes).forEach(attr => {
+          newScript.setAttribute(attr.name, attr.value);
+        });
+        if (oldScript.textContent) {
+          newScript.textContent = oldScript.textContent;
+        }
+        oldScript.parentNode.replaceChild(newScript, oldScript);
+      });
+    }
+
+    /**
+     * Unblock custom embed elements when consent is granted for a category.
+     */
+    _unblockCustomEmbeds(categories) {
+      if (!this._customServiceMap) return;
+
+      const blocked = document.querySelectorAll('[data-biscotti-embed-blocked="true"]');
+      blocked.forEach(el => {
+        const category = el.getAttribute('data-biscotti-category');
+        if (categories.includes(category)) {
+          el.removeAttribute('data-biscotti-embed-blocked');
+          el.style.display = '';
+
+          const serviceRef = el.getAttribute('data-biscotti-service');
+          const svc = this._customServiceMap.get(serviceRef?.toLowerCase());
+          if (svc && svc.embedCode) {
+            this._injectEmbedCode(el, svc);
+          }
+        }
+      });
+    }
+
+    /**
+     * Match a cookie name against a pattern (exact or wildcard).
+     * Wildcard (*) at end means prefix match.
+     */
+    static _matchesCookiePattern(cookieName, pattern) {
+      if (pattern.endsWith('*')) {
+        return cookieName.startsWith(pattern.slice(0, -1));
+      }
+      return cookieName === pattern;
+    }
+
+    /**
+     * Delete cookies matching custom service cookie patterns for revoked categories.
+     */
+    _clearCustomServiceCookies(revokedCategories) {
+      if (!this._customServices || this._customServices.length === 0) return;
+
+      const allCookies = document.cookie.split(';').map(c => c.trim().split('=')[0]).filter(Boolean);
+
+      for (const svc of this._customServices) {
+        const category = (svc.category || 'marketing').toLowerCase();
+        if (!revokedCategories.includes(category)) continue;
+        if (!svc.cookiePatterns || svc.cookiePatterns.length === 0) continue;
+
+        for (const cookieName of allCookies) {
+          for (const pattern of svc.cookiePatterns) {
+            if (BiscottiEngine._matchesCookiePattern(cookieName, pattern)) {
+              Storage.deleteCookie(cookieName);
+              document.cookie = `${cookieName}=;expires=Thu, 01 Jan 1970 00:00:00 GMT;path=/;domain=${window.location.hostname}`;
+              document.cookie = `${cookieName}=;expires=Thu, 01 Jan 1970 00:00:00 GMT;path=/;domain=.${window.location.hostname}`;
+            }
+          }
+        }
+      }
+    }
+
+    _applyTheme() {
+      // Apply theme colors from config (local or from API)
+      const theme = this.config.theme || {};
+      const primaryColor = theme.primaryColor || this.config.primaryColor;
+      const backgroundColor = theme.backgroundColor;
+
+      if (primaryColor) {
+        // Set all primary color CSS variables for consistency
+        // --biscotti-primary and --biscotti-primary-hover are used by biscotti-banner.js
+        // --biscotti-primary-color and --biscotti-primary-dark are used by the built-in banner UI
+        document.documentElement.style.setProperty('--biscotti-primary', primaryColor);
+        document.documentElement.style.setProperty('--biscotti-primary-color', primaryColor);
+        
+        // Calculate darker shade for hover state and gradients
+        const darkerColor = this._darkenColor(primaryColor, 10);
+        const darkColor = this._darkenColor(primaryColor, 30);
+        document.documentElement.style.setProperty('--biscotti-primary-hover', darkerColor);
+        document.documentElement.style.setProperty('--biscotti-primary-dark', darkColor);
+        
+        this._log('Theme applied:', primaryColor);
+      }
+
+      if (backgroundColor) {
+        document.documentElement.style.setProperty('--biscotti-bg-color', backgroundColor);
+        // Also set bg-dark to a slightly darker shade for gradient
+        const bgDark = this._darkenColor(backgroundColor, 5);
+        document.documentElement.style.setProperty('--biscotti-bg-dark', bgDark);
+      }
+      
+      // Apply text color from theme
+      const textColor = theme.textColor;
+      if (textColor) {
+        document.documentElement.style.setProperty('--biscotti-text-color', textColor);
+        // Also set lighter variant for secondary text
+        document.documentElement.style.setProperty('--biscotti-text-muted', this._adjustOpacity(textColor, 0.7));
+      }
+
+      // Apply font configuration from theme (fontConfig takes precedence over legacy fontFamily)
+      const fontConfig = theme.fontConfig || (this.config.banner?.theme?.fontConfig) || { mode: 'system' };
+      const systemStack = "-apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif";
+
+      if (fontConfig.mode === 'inherit') {
+        document.documentElement.style.setProperty('--biscotti-font-family', 'inherit');
+      } else if (fontConfig.mode === 'custom' && fontConfig.fontFamily && fontConfig.fontUrl) {
+        // Inject @font-face rule for custom font (self-hosted, GDPR-compliant)
+        if (!document.getElementById('biscotti-custom-font-face')) {
+          const fontStyle = document.createElement('style');
+          fontStyle.id = 'biscotti-custom-font-face';
+          fontStyle.textContent = `@font-face { font-family: '${fontConfig.fontFamily}'; src: url('${fontConfig.fontUrl}') format('woff2'); font-display: swap; }`;
+          document.head.appendChild(fontStyle);
+        }
+        document.documentElement.style.setProperty('--biscotti-font-family', `'${fontConfig.fontFamily}', ${systemStack}`);
+      } else {
+        // mode=system or fallback — use system font stack
+        document.documentElement.style.setProperty('--biscotti-font-family', systemStack);
+      }
+
+      // Legacy fontFamily support (only if fontConfig is not set to custom/inherit)
+      if (fontConfig.mode === 'system') {
+        const fontFamily = theme.fontFamily;
+        if (fontFamily) {
+          const webSafe = ['Arial', 'Georgia', 'Verdana', 'Tahoma', 'Trebuchet MS', 'Times New Roman'];
+          const isWebSafe = webSafe.some(f => fontFamily.includes(f));
+          if (!isWebSafe && !document.getElementById('biscotti-google-font')) {
+            const link = document.createElement('link');
+            link.id = 'biscotti-google-font';
+            link.rel = 'stylesheet';
+            link.href = `https://fonts.googleapis.com/css2?family=${encodeURIComponent(fontFamily)}:wght@400;500;600;700&display=swap`;
+            document.head.appendChild(link);
+          }
+          document.documentElement.style.setProperty('--biscotti-font-family', fontFamily + ', -apple-system, BlinkMacSystemFont, sans-serif');
+        }
+      }
+
+      // Apply font size from theme
+      const fontSize = theme.fontSize;
+      if (fontSize) {
+        document.documentElement.style.setProperty('--biscotti-font-size', fontSize + 'px');
+      }
+
+      // White-label branding color overrides (take precedence over theme colors)
+      const branding = this.config.banner?.branding;
+      if (branding) {
+        if (branding.primaryColor) {
+          document.documentElement.style.setProperty('--biscotti-primary', branding.primaryColor);
+          document.documentElement.style.setProperty('--biscotti-primary-color', branding.primaryColor);
+          document.documentElement.style.setProperty('--biscotti-primary-hover', this._darkenColor(branding.primaryColor, 10));
+          document.documentElement.style.setProperty('--biscotti-primary-dark', this._darkenColor(branding.primaryColor, 30));
+        }
+        if (branding.accentColor) {
+          document.documentElement.style.setProperty('--biscotti-accent', branding.accentColor);
+        }
+        // Inject white-label customCss (includes hideFooter, hidePoweredBy CSS)
+        if (branding.customCss && !document.getElementById('biscotti-whitelabel-css')) {
+          const wlStyle = document.createElement('style');
+          wlStyle.id = 'biscotti-whitelabel-css';
+          wlStyle.textContent = branding.customCss;
+          document.head.appendChild(wlStyle);
+        }
+      }
+    }
+    
+    _adjustOpacity(hexColor, opacity) {
+      // Convert hex to RGBA with opacity
+      const hex = hexColor.replace('#', '');
+      const r = parseInt(hex.substring(0, 2), 16);
+      const g = parseInt(hex.substring(2, 4), 16);
+      const b = parseInt(hex.substring(4, 6), 16);
+      return `rgba(${r}, ${g}, ${b}, ${opacity})`;
+    }
+
+
+    _darkenColor(hex, percent) {
+      // Convert hex to RGB, darken, and convert back
+      const num = parseInt(hex.replace('#', ''), 16);
+      const r = Math.max(0, Math.min(255, (num >> 16) - Math.round(2.55 * percent)));
+      const g = Math.max(0, Math.min(255, ((num >> 8) & 0x00FF) - Math.round(2.55 * percent)));
+      const b = Math.max(0, Math.min(255, (num & 0x0000FF) - Math.round(2.55 * percent)));
+      return `#${(1 << 24 | r << 16 | g << 8 | b).toString(16).slice(1)}`;
+    }
+
+    /**
+     * Track session for billing/usage metrics
+     * Sends a ping to the backend to count unique visitor sessions
+     */
+    _trackSession() {
+      // Skip if no websiteId or apiEndpoint configured
+      const websiteId = this.config.websiteId;
+      const apiEndpoint = this.config.apiEndpoint;
+      
+      if (!websiteId || !apiEndpoint) {
+        this._log('Session tracking skipped: missing websiteId or apiEndpoint');
+        return;
+      }
+
+      // Skip bots
+      if (botDetector.detect()) {
+        this._log('Session tracking skipped: bot detected');
+        return;
+      }
+
+      // Generate or get session ID (unique per browser session)
+      const sessionKey = 'biscotti_session_id';
+      let sessionId;
+      
+      try {
+        sessionId = sessionStorage.getItem(sessionKey);
+        if (!sessionId) {
+          // Generate new session ID
+          sessionId = 'sess_' + Date.now().toString(36) + '_' + Math.random().toString(36).substring(2, 10);
+          sessionStorage.setItem(sessionKey, sessionId);
+        } else {
+          // Already tracked this session
+          this._log('Session already tracked this browser session');
+          return;
+        }
+      } catch (e) {
+        // sessionStorage not available, generate ephemeral ID
+        sessionId = 'sess_' + Date.now().toString(36) + '_' + Math.random().toString(36).substring(2, 10);
+      }
+
+      // Get or create visitor hash for deduplication
+      const visitorToken = CrossDomainAPI.visitorToken || CrossDomainAPI._getOrCreateVisitorToken();
+
+      // Send ping to backend
+      const pingUrl = `${apiEndpoint}/ping`;
+      
+      fetch(pingUrl, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'Accept': 'application/json'
+        },
+        body: JSON.stringify({
+          websiteId: websiteId,
+          sessionId: sessionId,
+          visitorHash: visitorToken,
+          referrer: document.referrer || null
+        })
+      }).then(response => {
+        if (response.ok) {
+          this._log('Session tracked successfully');
+        } else {
+          this._log('Session tracking failed:', response.status);
+        }
+      }).catch(error => {
+        this._log('Session tracking error:', error.message);
+      });
+    }
+
+    _loadConsent() {
+      // Try localStorage first, then cookie
+      let data = Storage.getLocal(STORAGE_KEY);
+      if (!data) {
+        const cookieData = Storage.getCookie(COOKIE_NAME);
+        if (cookieData) {
+          try {
+            data = JSON.parse(cookieData);
+          } catch (e) {
+            this._log('Failed to parse cookie consent');
+          }
+        }
+      }
+
+      if (data) {
+        this.consentState = ConsentState.fromJSON(data);
+        this._log('Loaded consent:', this.consentState.toJSON());
+      }
+    }
+
+    _saveConsent() {
+      const data = this.consentState.toJSON();
+
+      // Add bot detection flag
+      data.isBot = botDetector.detect();
+
+      // Save to localStorage
+      Storage.setLocal(STORAGE_KEY, data);
+
+      // Save to cookie (for server-side access)
+      Storage.setCookie(COOKIE_NAME, JSON.stringify(data), this.config.cookieDays);
+
+      // Sync to backend for GDPR-compliant proof storage
+      if (this.config.apiEndpoint && !data.isBot) {
+        this._syncConsentToBackend(data);
+      }
+
+      this._log('Saved consent:', data, 'isBot:', data.isBot);
+    }
+
+    _syncConsentToBackend(consentData) {
+      const payload = {
+        websiteId: this.config.websiteId || null,
+        domain: window.location.hostname,
+        consent: consentData.categories,
+        tcfString: consentData.tcfString || null,
+        acString: consentData.acString || null,
+        visitorToken: this._getVisitorToken()
+      };
+
+      // Flag test domain consent for backend analytics filtering
+      if (this.config.isTestDomain) {
+        payload.testDomain = true;
+      }
+
+      fetch(`${this.config.apiEndpoint}/consent`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(payload),
+        credentials: 'omit' // Don't send cookies
+      }).then(res => {
+        if (!res.ok) throw new Error(`HTTP ${res.status}`);
+        return res.json();
+      }).then(result => {
+        this._log('Consent synced to backend:', result.consentId);
+      }).catch(err => {
+        console.error('[Biscotti] Backend sync failed:', err.message);
+        // Queue for retry on next page load
+        this._queueFailedSync(payload);
+      });
+    }
+
+    _getVisitorToken() {
+      // Generate or retrieve a stable visitor token
+      let token = Storage.getLocal('biscotti_visitor_token');
+      if (!token) {
+        token = 'v_' + Math.random().toString(36).substring(2, 15) + Date.now().toString(36);
+        Storage.setLocal('biscotti_visitor_token', token);
+      }
+      return token;
+    }
+
+    _queueFailedSync(payload, retries = 0, timestamp = null) {
+      // Store failed sync for retry
+      const queue = Storage.getLocal('biscotti_sync_queue') || [];
+      queue.push({
+        payload,
+        timestamp: timestamp || Date.now(),
+        retries: retries
+      });
+      // Keep only last 5 failed syncs
+      Storage.setLocal('biscotti_sync_queue', queue.slice(-5));
+    }
+
+    _retryFailedSyncs() {
+      const queue = Storage.getLocal('biscotti_sync_queue') || [];
+      if (!queue || queue.length === 0) return;
+
+      this._log(`Retrying ${queue.length} failed sync(s)`);
+      
+      // Clear queue instantly to prevent race conditions with new incoming syncs
+      Storage.setLocal('biscotti_sync_queue', []);
+
+      queue.forEach(item => {
+        // Drop items that have failed more than 3 times
+        if (item.retries >= 3) {
+          this._log('Dropping failed sync - max retries (3) reached');
+          return;
+        }
+
+        fetch(`${this.config.apiEndpoint}/consent`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify(item.payload),
+          credentials: 'omit'
+        }).then(res => {
+          if (!res.ok) throw new Error(`HTTP ${res.status}`);
+          return res.json();
+        }).then(result => {
+          this._log('Queued consent synced successfully:', result.consentId);
+        }).catch(err => {
+          console.error('[Biscotti] Queued backend sync failed again:', err.message);
+          // Re-queue with incremented retries
+          this._queueFailedSync(item.payload, item.retries + 1, item.timestamp);
+        });
+      });
+    }
+
+    /**
+     * Initialize IAB TCF v2.3
+     * Creates window.__tcfapi via @iabtcf/cmpapi's CmpApi class.
+     * TCF 2.3 change: disclosedVendors segment is now mandatory in all TC strings
+     */
+    _initTCF() {
+      try {
+        // Official IAB TCF CMP ID assigned to Biscotti CMP
+        const cmpId = 497;
+        const cmpVersion = 1;
+        this._cmpId = cmpId;
+        this._cmpVersion = cmpVersion;
+
+        // Reference to `this` (engine instance) for the custom getVendorList command
+        const engine = this;
+
+        // TCF 2.3: isServiceSpecific MUST be true — pass as 3rd arg so CmpApi.update()
+        // correctly sets it on the decoded TCModel (CmpApi overwrites tcModel.isServiceSpecific
+        // with whatever was passed to the constructor).
+        // 4th arg: Custom commands — we override getVendorList because esbuild bundles
+        // CmpApiModel as a separate instance, so the built-in GetVendorListCommand can't
+        // access the GVL we set. Our custom handler returns the GVL directly.
+        const cmpApi = new CmpApi(cmpId, cmpVersion, true, {
+          'getVendorList': (callback) => {
+            const rawGvl = engine.config?.rawGvlJson;
+            if (rawGvl) {
+              callback(rawGvl, true);
+            } else {
+              callback(null, false);
+            }
+          }
+        });
+        this._cmpApi = cmpApi;
+
+        // CmpApi constructor registers window.__tcfapi automatically.
+        // Set the CMP status to 'loaded' (CMP is ready to receive commands)
+        // Pass empty string = GDPR applies, no consent yet
+        cmpApi.update('', false);
+
+        // NOTE: The library defaults tcfPolicyVersion to 2 when update('') creates
+        // an empty TCModel. The correct policy version (5) will be set when
+        // updateWithGVL encodes a proper TCModel with policyVersion=5.
+
+        // === IAB TCF Spec: __tcfapiLocator iframe ===
+        // The TCF spec requires a hidden iframe named '__tcfapiLocator' in the
+        // top frame so that other frames (and validators like the IAB CMP Validator)
+        // can discover the CMP via window.frames lookup.
+        // @iabtcf/cmpapi@1.5.6 does NOT create this — we add it manually.
+        if (!window.frames['__tcfapiLocator']) {
+          const locatorFrame = document.createElement('iframe');
+          locatorFrame.style.cssText = 'display:none;position:absolute;width:0;height:0;';
+          locatorFrame.name = '__tcfapiLocator';
+          // Must be in DOM before validator checks
+          if (document.body) {
+            document.body.appendChild(locatorFrame);
+          } else {
+            document.addEventListener('DOMContentLoaded', () => {
+              document.body.appendChild(locatorFrame);
+            });
+          }
+        }
+
+        // === IAB TCF Spec: Cross-frame postMessage handler ===
+        // Other frames discover the CMP by walking up parent frames looking for
+        // __tcfapiLocator, then use postMessage with __tcfapiCall to invoke commands.
+        window.addEventListener('message', (event) => {
+          try {
+            let data = event.data;
+            if (typeof data === 'string') {
+              try { data = JSON.parse(data); } catch (e) { return; }
+            }
+            const call = data && data.__tcfapiCall;
+            if (!call) return;
+
+            window.__tcfapi(call.command, call.version, (returnValue, success) => {
+              const response = {
+                __tcfapiReturn: {
+                  returnValue: returnValue,
+                  success: success,
+                  callId: call.callId
+                }
+              };
+              if (event.source) {
+                event.source.postMessage(response, '*');
+              }
+            }, call.parameter);
+          } catch (e) {
+            // Silently ignore malformed messages
+          }
+        });
+
+        // Create a wrapper for the engine to update TC strings
+        this.tcfApi = {
+          update: (tcString, showUI) => {
+            try {
+              cmpApi.update(tcString || '', showUI);
+            } catch (e) {
+              this._log('TCF update error:', e);
+            }
+          },
+          /**
+           * Update the CmpApiModel's tcModel with GVL data so that:
+           * 1. getVendorList command returns the GVL (instead of failing)
+           * 2. ping returns correct tcfPolicyVersion from the GVL
+           * 3. disclosedVendors segment is present in the initial TC string
+           * Called after GVL is fetched in _loadConfigFromAPI.
+           */
+          updateWithGVL: (rawGvlJson, activeVendorIds) => {
+            try {
+              const model = new TCModel();
+              // TCModel.gvl needs a GVL instance, not raw JSON
+              const gvlInstance = new GVL(rawGvlJson);
+              model.gvl = gvlInstance;
+              model.cmpId = cmpId;
+              model.cmpVersion = cmpVersion;
+              model.isServiceSpecific = true;
+              // TCF 2.3: Policy version MUST be 5
+              model.policyVersion = 5;
+              // Portuguese variants (pt-BR, pt-PT) both map to "PT" for TCF
+              const _rl = this.config?.effectiveLanguage || this.config?.language || 'EN';
+              model.consentLanguage = _rl.toLowerCase().startsWith('pt') ? 'PT' : _rl.substring(0, 2).toUpperCase();
+              model.publisherCountryCode = 'DE';
+
+              // TCF 2.3: Set disclosedVendors for all active vendors (even before consent)
+              if (activeVendorIds && activeVendorIds.size > 0) {
+                for (const vid of activeVendorIds) {
+                  model.vendorsDisclosed.set(vid);
+                }
+              }
+
+              // === Special Purpose 3 — "Save and communicate privacy choices" (Req 18.1, 18.2, 18.3) ===
+              // SP3 is transparency-only: set vendor LI bit unconditionally for vendors declaring SP3.
+              const rawVendors = rawGvlJson?.vendors || {};
+              if (activeVendorIds && activeVendorIds.size > 0) {
+                for (const vid of activeVendorIds) {
+                  const rv = rawVendors[vid];
+                  if (rv && Array.isArray(rv.specialPurposes) && rv.specialPurposes.includes(3)) {
+                    model.vendorLegitimateInterests.set(vid);
+                  }
+                }
+              }
+
+              // Encode with explicit segments including vendorsDisclosed (TCF 2.3 mandatory)
+              const tcString = TCString.encode(model, {
+                segments: ['core', 'vendorsDisclosed', 'publisherTC']
+              });
+              cmpApi.update(tcString, false);
+
+              // Store the initial TC string so showBanner can use it
+              // (instead of resetting to '' which loses policyVersion=5)
+              this._initialTcString = tcString;
+
+              this._log('TCF: CmpApi updated with GVL — policyVersion=5, disclosedVendors in TC string');
+            } catch (e) {
+              console.error('[Biscotti] updateWithGVL error:', e.message);
+              this._log('TCF: Failed to update CmpApi with GVL:', e);
+            }
+          }
+        };
+
+        // Replay CMP Stub queue (if stub was loaded before full CMP)
+        if (window.__tcfapiBuffer && Array.isArray(window.__tcfapiBuffer)) {
+          const buffer = window.__tcfapiBuffer;
+          this._log('TCF: Replaying', buffer.length, 'queued stub calls');
+          for (const args of buffer) {
+            try {
+              window.__tcfapi.apply(null, args);
+            } catch (e) {
+              this._log('TCF: Error replaying stub call:', e);
+            }
+          }
+          // Clear the buffer so calls aren't replayed again
+          window.__tcfapiBuffer = [];
+        }
+
+        // Monkey-patch __tcfapi to inject addtlConsent (AC String) into TCData responses
+        // The @iabtcf/cmpapi library doesn't support Google's Additional Consent natively
+        const originalTcfApi = window.__tcfapi;
+        const engineRef = this;
+        window.__tcfapi = function(command, version, callback, parameter) {
+          if (command === 'addEventListener' || command === 'getTCData') {
+            originalTcfApi(command, version, function(tcData, success) {
+              if (success && tcData && engineRef.consentState?.acString) {
+                tcData.addtlConsent = engineRef.consentState.acString;
+              }
+              callback(tcData, success);
+            }, parameter);
+          } else {
+            originalTcfApi(command, version, callback, parameter);
+          }
+        };
+
+        this._log('TCF v2.3 initialized — CMP ID:', cmpId, '— window.__tcfapi + __tcfapiLocator registered');
+      } catch (e) {
+        console.error('[Biscotti] Failed to init TCF:', e);
+      }
+    }
+
+    /**
+     * Initialize IAB GPP (Global Privacy Platform) API stub
+     * Registers window.__gpp and cross-frame __gppLocator
+     */
+    _initGPP() {
+      try {
+        if (typeof window.__gpp === 'undefined') {
+          window.__gpp = function(command, callback, parameter, version) {
+            window.__gpp.queue = window.__gpp.queue || [];
+            window.__gpp.queue.push([command, callback, parameter, version]);
+          };
+          window.__gpp.events = window.__gpp.events || [];
+          window.__gpp.cmpStatus = 'stub';
+          window.__gpp.isLoaded = false;
+        }
+
+        if (!window.frames['__gppLocator']) {
+          const locatorFrame = document.createElement('iframe');
+          locatorFrame.style.cssText = 'display:none;position:absolute;width:0;height:0;';
+          locatorFrame.name = '__gppLocator';
+          if (document.body) {
+            document.body.appendChild(locatorFrame);
+          } else {
+            document.addEventListener('DOMContentLoaded', () => {
+              document.body.appendChild(locatorFrame);
+            });
+          }
+        }
+        
+        // Handle postMessage for cross-frame
+        window.addEventListener('message', (event) => {
+          let data = event.data;
+          if (typeof data === 'string') {
+            try { data = JSON.parse(data); } catch (e) { return; }
+          }
+          const call = data && data.__gppCall;
+          if (!call) return;
+          
+          window.__gpp(call.command, (result, success) => {
+            if (event.source) {
+              event.source.postMessage({
+                __gppReturn: {
+                  returnValue: result,
+                  success: success,
+                  callId: call.callId
+                }
+              }, '*');
+            }
+          }, call.parameter, call.version);
+        });
+
+        // Setup real implementation
+        const self = this;
+        const gppData = {
+          gppString: 'DBABMA~', // Empty USNat
+          applicableSections: [7], // USNat
+          supportedAPIs: ['7'],
+          cmpStatus: 'loaded',
+          cmpDisplayStatus: 'hidden',
+          signalStatus: 'ready'
+        };
+
+        const executeCommand = (command, callback, parameter) => {
+          if (!callback || typeof callback !== 'function') return;
+          
+          switch (command) {
+            case 'ping':
+              callback({
+                gppVersion: '1.1',
+                cmpStatus: gppData.cmpStatus,
+                cmpDisplayStatus: gppData.cmpDisplayStatus,
+                signalStatus: gppData.signalStatus,
+                supportedAPIs: gppData.supportedAPIs,
+                cmpId: 497,
+                sectionList: gppData.applicableSections,
+                applicableSections: gppData.applicableSections,
+                gppString: gppData.gppString
+              }, true);
+              break;
+            case 'getGPPData':
+              callback(gppData, true);
+              break;
+            case 'hasSection':
+              callback(gppData.applicableSections.includes(parameter), true);
+              break;
+            case 'getSection':
+              callback(parameter === 7 || parameter === '7' ? gppData.gppString.split('~')[1] || '' : null, true);
+              break;
+            case 'addEventListener':
+              const listenerId = Math.floor(Math.random() * 1000000);
+              window.__gpp.events.push({ id: listenerId, callback });
+              callback({ eventName: 'listenerRegistered', listenerId, data: gppData, pingData: gppData }, true);
+              break;
+            case 'removeEventListener':
+              const index = window.__gpp.events.findIndex(e => e.id === parameter);
+              if (index > -1) {
+                window.__gpp.events.splice(index, 1);
+                callback(true, true);
+              } else {
+                callback(false, true);
+              }
+              break;
+            default:
+              callback(null, false);
+          }
+        };
+
+        const oldGpp = window.__gpp;
+        window.__gpp = function(command, callback, parameter, version) {
+          executeCommand(command, callback, parameter);
+        };
+        window.__gpp.events = oldGpp.events || [];
+        window.__gpp.isLoaded = true;
+
+        this.gppApi = {
+          update: (gppString, displayStatus, applicableSections = [7]) => {
+            gppData.gppString = gppString;
+            gppData.cmpDisplayStatus = displayStatus || 'hidden';
+            gppData.signalStatus = 'ready';
+            
+            // If GPP is disabled or has no applicable sections, send empty Array
+            gppData.applicableSections = applicableSections;
+            gppData.supportedAPIs = applicableSections.map(String);
+            
+            // Trigger events
+            window.__gpp.events.forEach(req => {
+              if (req.callback) req.callback({
+                eventName: 'cmpDisplayStatus',
+                data: gppData,
+                pingData: gppData
+              }, true);
+            });
+          }
+        };
+
+        // Process queue
+        if (oldGpp && oldGpp.queue && oldGpp.queue.length > 0) {
+          oldGpp.queue.forEach(args => {
+            executeCommand(args[0], args[1], args[2]);
+          });
+        }
+        
+        this._log('GPP initialized — window.__gpp + __gppLocator registered');
+      } catch (e) {
+        console.error('[Biscotti] Failed to init GPP:', e);
+      }
+    }
+
+    /**
+     * Update GPP String based on user consent choices
+     */
+    _updateGPP() {
+      if (!this.gppApi) return;
+      try {
+        if (this.config.gppEnabled === false) {
+           this.gppApi.update('DBABMA~', 'hidden', []);
+           return;
+        }
+
+        const consentModel = this.config.compliance?.consentModel || this.config.consentMode;
+        
+        let usNatString = 'BAAAAAA'; // Default Empty string (base64url)
+        
+        // Very basic mock USNat base64 encoding (in production, use standard bitfield encoding)
+        // MSPA National Opt-Out 
+        if (consentModel === 'opt-out' && Object.keys(this.consentState.categories).length > 0) {
+          const granted = Object.values(this.consentState.categories).some(v => v);
+          usNatString = granted ? 'BqAAAAA' : 'B1AAAAA'; // Opt-out mock
+        } else if (consentModel === 'opt-in') {
+          const granted = Object.values(this.consentState.categories).some(v => v);
+          usNatString = granted ? 'BgAAAAA' : 'BAAAAAA'; // Opt-in mock 
+        }
+
+        const gppStr = `DBABMA~${usNatString}`;
+        
+        this.consentState.gppString = gppStr;
+        this.gppApi.update(gppStr, 'hidden');
+        
+        this._log('GPP String updated', gppStr);
+      } catch (e) {
+        console.error('[Biscotti] Error generating GPP string:', e);
+      }
+    }
+
+    /**
+     * Load official IAB translations for the active language.
+     * Fetches purposes-{lang}.json via our server proxy (/gvl/lang/:code).
+     * Merges localized purpose/feature names into tcfData.
+     * NO HARDCODING: All translations come from IAB's official GVL language files.
+     */
+    async _loadTCFTranslations() {
+      if (!this.config.tcfData) return;
+      
+      const rawLang = this.config.effectiveLanguage || this.config.language || 'en';
+      // GVL uses ISO 639-1 base codes — "pt" not "pt-BR" or "pt-PT"
+      const lang = rawLang.toLowerCase().startsWith('pt') ? 'pt' : rawLang.split('-')[0].toLowerCase();
+      
+      this._log('Loading TCF translations for language:', lang);
+      
+      try {
+        const apiBase = this.config.apiEndpoint || 'https://api.biscotti-cmp.com/api/v1';
+        const res = await fetch(`${apiBase}/tcf/gvl/lang/${lang}`, { credentials: 'omit' });
+        
+        if (!res.ok) {
+          this._log('TCF translation fetch failed:', res.status, '- keeping English');
+          return;
+        }
+        
+        const langData = await res.json();
+        
+        // Merge translated purpose/feature names into tcfData
+        // IAB language files contain: purposes, specialPurposes, features, specialFeatures
+        if (langData.purposes) {
+          Object.entries(langData.purposes).forEach(([id, trans]) => {
+            if (this.config.tcfData.purposes[id]) {
+              this.config.tcfData.purposes[id].name = trans.name;
+              this.config.tcfData.purposes[id].description = trans.description;
+              if (trans.illustrations) this.config.tcfData.purposes[id].illustrations = trans.illustrations;
+            }
+          });
+        }
+        if (langData.specialPurposes) {
+          Object.entries(langData.specialPurposes).forEach(([id, trans]) => {
+            if (this.config.tcfData.specialPurposes[id]) {
+              this.config.tcfData.specialPurposes[id].name = trans.name;
+              this.config.tcfData.specialPurposes[id].description = trans.description;
+              if (trans.illustrations) this.config.tcfData.specialPurposes[id].illustrations = trans.illustrations;
+            }
+          });
+        }
+        if (langData.features) {
+          Object.entries(langData.features).forEach(([id, trans]) => {
+            if (this.config.tcfData.features[id]) {
+              this.config.tcfData.features[id].name = trans.name;
+              this.config.tcfData.features[id].description = trans.description;
+              if (trans.illustrations) this.config.tcfData.features[id].illustrations = trans.illustrations;
+            }
+          });
+        }
+        if (langData.specialFeatures) {
+          Object.entries(langData.specialFeatures).forEach(([id, trans]) => {
+            if (this.config.tcfData.specialFeatures[id]) {
+              this.config.tcfData.specialFeatures[id].name = trans.name;
+              this.config.tcfData.specialFeatures[id].description = trans.description;
+              if (trans.illustrations) this.config.tcfData.specialFeatures[id].illustrations = trans.illustrations;
+            }
+          });
+        }
+        
+        // Merge data category translations
+        if (langData.dataCategories) {
+          Object.entries(langData.dataCategories).forEach(([id, trans]) => {
+            if (this.config.tcfData.dataCategories[id]) {
+              this.config.tcfData.dataCategories[id].name = trans.name;
+              this.config.tcfData.dataCategories[id].description = trans.description;
+            }
+          });
+        }
+        
+        this._log('TCF translations loaded for:', lang, 
+          '- Purpose 1:', this.config.tcfData.purposes?.['1']?.name || 'N/A'
+        );
+      } catch (e) {
+        this._log('Failed to load TCF translations, using English fallback:', e.message);
+      }
+      
+      // Always apply GVL_DATA_CATEGORIES for the active language as fallback.
+      // This covers: (a) languages IAB doesn't provide (bs, eu, gl, hi, id, mr, th, vi, zh-TW)
+      // and (b) cases where the IAB fetch failed. All 40 languages are hardcoded.
+      // Use base language for lookup (e.g. "pt-BR" → "pt") since GVL_DATA_CATEGORIES uses ISO 639-1
+      // Exception: zh-TW has its own key in GVL_DATA_CATEGORIES
+      if (this.config.tcfData.dataCategories) {
+        const dcLang = lang === 'zh-TW' ? 'zh-TW' : gvlLang;
+        Object.entries(this.config.tcfData.dataCategories).forEach(([id, cat]) => {
+          const localName = GVL_DATA_CATEGORIES[id]?.[dcLang] || GVL_DATA_CATEGORIES[id]?.['en'];
+          if (localName) {
+            cat.name = localName;
+          }
+        });
+      }
+    }
+
+    /**
+     * Update TCF Consent String based on user consent choices.
+     * Builds a TCModel from the current consent state and encodes it to a TC String.
+     * TCF 2.3: disclosedVendors segment is mandatory in all TC strings.
+     *
+     * Handles 3 scenarios:
+     * 1. Accept All: all categories granted + no specific TCF toggles → grant all purposes/vendors
+     * 2. Reject All: no categories granted + no specific TCF toggles → deny all purposes/vendors
+     * 3. Granular: specific TCF toggles set via acceptTCF() → use those exact choices
+     */
+    _updateTCF() {
+      if (!this.tcfApi) return;
+
+      try {
+        const tcfData = this.config.tcfData;
+        if (!tcfData || !tcfData.purposes) {
+          this._log('TCF: No GVL data available yet, skipping TC String encoding');
+          return;
+        }
+
+        // Guard: TCString.encode() requires GVL attached to TCModel
+        if (!this.config.rawGvlJson) {
+          this._log('TCF: Raw GVL JSON not loaded yet, skipping TC String encoding');
+          return;
+        }
+
+        // Determine consent scenario
+        const consentState = this.consentState;
+        const hasTcfChoices = Object.keys(consentState.tcfPurposes || {}).length > 0;
+        const allCategoriesGranted = Object.entries(consentState.categories)
+          .filter(([k]) => k !== 'essential')
+          .every(([_, v]) => v === true);
+
+        // Accept All: all Biscotti categories granted, no granular TCF choices
+        const isAcceptAll = allCategoriesGranted && !hasTcfChoices;
+        // Reject All: not all categories granted and no granular TCF choices
+        const isRejectAll = !allCategoriesGranted && !hasTcfChoices;
+
+        // Build TCModel
+        const tcModel = new TCModel();
+        
+        // Assign GVL to TCModel — required by TCString.encode()
+        // Must be a GVL instance, not raw JSON
+        tcModel.gvl = new GVL(this.config.rawGvlJson);
+        
+        tcModel.cmpId = this._cmpId || 2;
+        tcModel.cmpVersion = this._cmpVersion || 1;
+        tcModel.consentScreen = 1;
+        // TCF 2.3: Policy version MUST be 5
+        tcModel.policyVersion = 5;
+        // TCF 2.3: isServiceSpecific MUST be 1 (true) for valid vendor TC strings.
+        // The @iabtcf/core library's SegmentSequence omits vendorsDisclosed when isServiceSpecific=true
+        // (pre-TCF 2.3 behavior). We override this below by passing explicit segments to TCString.encode.
+        tcModel.isServiceSpecific = true;
+        tcModel.useNonStandardTexts = false;
+
+        // Consent language (ISO 639-1, 2 chars uppercase)
+        // Portuguese variants (pt-BR, pt-PT) both map to "PT" for TCF
+        const resolvedLang = this.config.effectiveLanguage || this.config.language || 'EN';
+        const tcfLang = resolvedLang.toLowerCase().startsWith('pt') ? 'PT' : resolvedLang.substring(0, 2).toUpperCase();
+        tcModel.consentLanguage = tcfLang;
+        tcModel.publisherCountryCode = 'DE'; // Biscotti GmbH is based in Germany
+
+        // === Map Purpose Consents ===
+        const purposes = tcfData.purposes || {};
+        Object.keys(purposes).forEach(pid => {
+          const id = parseInt(pid);
+          if (isAcceptAll) {
+            tcModel.purposeConsents.set(id);
+          } else if (!isRejectAll && (consentState.tcfPurposes?.[pid] || consentState.tcfPurposes?.[id])) {
+            tcModel.purposeConsents.set(id);
+          }
+        });
+
+        // === Map Purpose Legitimate Interests ===
+        // TCF Policy v5: Purposes 1, 3, 4, 5, 6 are consent-only (no legitimate interest allowed)
+        const consentOnlyPurposes = new Set([1, 3, 4, 5, 6]);
+        Object.keys(purposes).forEach(pid => {
+          const id = parseInt(pid);
+          if (consentOnlyPurposes.has(id)) return; // Skip consent-only purposes
+          if (isAcceptAll) {
+            tcModel.purposeLegitimateInterests.set(id);
+          } else if (!isRejectAll && (consentState.tcfPurposeLIs?.[pid] || consentState.tcfPurposeLIs?.[id])) {
+            tcModel.purposeLegitimateInterests.set(id);
+          }
+        });
+
+        // === Map Special Feature Opt-ins ===
+        const specialFeatures = tcfData.specialFeatures || {};
+        Object.keys(specialFeatures).forEach(sfid => {
+          const id = parseInt(sfid);
+          if (isAcceptAll) {
+            tcModel.specialFeatureOptins.set(id);
+          } else if (!isRejectAll && (consentState.tcfSpecialFeatures?.[sfid] || consentState.tcfSpecialFeatures?.[id])) {
+            tcModel.specialFeatureOptins.set(id);
+          }
+        });
+
+        // === Map Vendor Consents + Legitimate Interests + Disclosed ===
+        // CRITICAL: Only set consent/disclosure for vendors actually used by this website.
+        // Using the full GVL vendor list here would grant consent for 1100+ vendors
+        // while the user only saw a handful — an IAB certification Critical Fail.
+        const rawGvlVendors = this.config.rawGvlJson?.vendors || {};
+        const activeIds = this.config.activeVendorIds || new Set();
+        const vendors = tcfData.vendors || [];
+        
+        // Use activeVendorIds if available, otherwise fall back to tcfData.vendors
+        // (tcfData.vendors is already filtered at load time, but activeIds is the canonical set)
+        const vendorIdsToProcess = activeIds.size > 0 
+          ? [...activeIds] 
+          : vendors.map(v => v.id);
+        
+        vendorIdsToProcess.forEach(vid => {
+          const vidStr = String(vid);
+
+          // GVL v3: Skip vendors that have been deleted from the Global Vendor List
+          const rawV = rawGvlVendors[vid];
+          if (rawV?.deletedDate && new Date(rawV.deletedDate) <= new Date()) {
+            return;
+          }
+
+          // Vendor Consent
+          if (isAcceptAll) {
+            tcModel.vendorConsents.set(vid);
+          } else if (!isRejectAll && (consentState.tcfVendors?.[vid] || consentState.tcfVendors?.[vidStr])) {
+            tcModel.vendorConsents.set(vid);
+          }
+
+          // Vendor Legitimate Interest
+          if (isAcceptAll) {
+            tcModel.vendorLegitimateInterests.set(vid);
+          } else if (!isRejectAll && (consentState.tcfVendorLIs?.[vid] || consentState.tcfVendorLIs?.[vidStr])) {
+            tcModel.vendorLegitimateInterests.set(vid);
+          }
+
+          // TCF 2.3 Mandatory: vendorsDisclosed — list vendors the CMP has disclosed to the user
+          // Only disclose vendors we actually showed to the user (not the entire GVL)
+          tcModel.vendorsDisclosed.set(vid);
+        });
+
+        // === Special Purpose 3 — "Save and communicate privacy choices" (Req 18.1, 18.2, 18.3) ===
+        // SP3 is transparency-only: NOT a user choice, no toggle, no right to object.
+        // For every active vendor that declares SP3 in the GVL, set the vendor LI bit
+        // unconditionally (regardless of user consent state).
+        const SP3_ID = 3;
+        vendorIdsToProcess.forEach(vid => {
+          const rawV = rawGvlVendors[vid];
+          if (rawV?.deletedDate && new Date(rawV.deletedDate) <= new Date()) return;
+          if (rawV && Array.isArray(rawV.specialPurposes) && rawV.specialPurposes.includes(SP3_ID)) {
+            tcModel.vendorLegitimateInterests.set(vid);
+          }
+        });
+
+        // === Publisher Restrictions (Req 15.2, 15.4) ===
+        const publisherRestrictions = this.config.publisherRestrictions || [];
+        for (const pr of publisherRestrictions) {
+          try {
+            tcModel.publisherRestrictions.add(pr.purposeId, {
+              restrictionType: pr.restrictionType,
+              vendorIds: [pr.vendorId]
+            });
+            // If restriction is "Not Allowed" (type 0), ensure consent and LI bits are 0
+            if (pr.restrictionType === 0) {
+              tcModel.vendorConsents.unset(pr.vendorId);
+              tcModel.vendorLegitimateInterests.unset(pr.vendorId);
+            }
+          } catch (e) {
+            // Skip invalid restrictions silently
+          }
+        }
+
+        // Encode TC String using @iabtcf/core
+        // TCF 2.3 (since 01.03.2026): vendorsDisclosed segment is MANDATORY in all TC strings.
+        // The library's default SegmentSequence only adds it when isServiceSpecific=false,
+        // but the spec requires isServiceSpecific=true. We override by passing explicit segments.
+        const tcString = TCString.encode(tcModel, {
+          segments: ['core', 'vendorsDisclosed', 'publisherTC']
+        });
+
+        // Store in consent state and update CmpApi
+        consentState.tcfString = tcString;
+        this.tcfApi.update(tcString, false);
+
+        // Re-save consent so the tcfString is persisted to localStorage/cookie
+        // (acceptAll/acceptEssential call _saveConsent before _applyConsent,
+        //  so the tcfString is only available after _updateTCF runs)
+        this._saveConsent();
+
+        // Generate AC String for non-GVL ATP vendors (Google Additional Consent)
+        const acString = this._generateACString();
+        if (acString) {
+          consentState.acString = acString;
+          this._saveConsent();
+          this._log('AC String generated:', acString);
+        }
+
+        this._log('TCF 2.3 TC String generated (' + tcString.length + ' chars):',
+          tcString.substring(0, 50) + '...',
+          '| purposes:', Object.keys(purposes).length,
+          '| active vendors:', vendorIdsToProcess.length
+        );
+      } catch (e) {
+        console.error('[Biscotti] Error generating TCF TC String:', e);
+        // Fallback: update with empty string so CmpApi doesn't stall
+        this.tcfApi.update('', true);
+      }
+    }
+
+    /**
+     * Generate Google Additional Consent (AC) String for non-GVL ATP vendors.
+     * Format: 2~{consented_atp_ids}~dv.{disclosed_atp_ids}
+     * See: https://support.google.com/authorizedbuyers/answer/9681920
+     */
+    _generateACString() {
+      const atpVendors = this.config.atpVendors || [];
+      if (atpVendors.length === 0) return null;
+
+      const disclosedIds = atpVendors
+        .map(v => v.atpProviderId)
+        .sort((a, b) => a - b);
+
+      const consentState = this.consentState;
+      const allCategoriesGranted = Object.entries(consentState.categories || {})
+        .filter(([k]) => k !== 'essential')
+        .every(([_, v]) => v === true);
+
+      let consentedIds;
+      if (allCategoriesGranted) {
+        // Accept All: consent for all ATP vendors
+        consentedIds = [...disclosedIds];
+      } else {
+        // Granular: check per-ATP consent state
+        consentedIds = atpVendors
+          .filter(v => consentState.atpConsents?.[v.atpProviderId])
+          .map(v => v.atpProviderId)
+          .sort((a, b) => a - b);
+      }
+
+      const consentedPart = consentedIds.join('.');
+      const disclosedPart = disclosedIds
+        .filter(id => !consentedIds.includes(id))
+        .join('.');
+
+      return `2~${consentedPart}~dv.${disclosedPart}`;
+    }
+
+    _applyConsent() {
+      // Update Google Consent Mode
+      if (this.config.googleConsentMode) {
+        GoogleConsentMode.update(this.consentState);
+      }
+      
+      // Update TCF v2.3
+      if (this.config.tcfEnabled) {
+        this._updateTCF();
+      }
+
+      // Update IAB GPP (US States)
+      this._updateGPP();
+
+      // Unblock scripts for granted categories
+      const grantedCategories = Object.entries(this.consentState.categories)
+        .filter(([_, granted]) => granted)
+        .map(([category]) => category);
+
+      this.blockingEngine.unblockScripts(grantedCategories);
+
+      // Unblock iframes for granted categories
+      grantedCategories.forEach(category => {
+        this.iframeBlockingEngine.unblockCategory(category);
+      });
+
+      // Unblock custom embed elements (data-biscotti-service)
+      this._unblockCustomEmbeds(grantedCategories);
+
+      // Clear custom service cookies for revoked categories
+      const revokedCategories = Object.entries(this.consentState.categories)
+        .filter(([cat, granted]) => !granted && cat !== 'essential')
+        .map(([category]) => category);
+      if (revokedCategories.length > 0) {
+        this._clearCustomServiceCookies(revokedCategories);
+      }
+
+      // Notify pre-boot Shield to unblock (if present)
+      if (window.__biscotti_shield) {
+        window.__biscotti_shield._unblockGranted();
+      }
+
+      // Broadcast consent update to all iframes (cross-frame solution)
+      CrossFrameConsent.broadcast(this.consentState);
+
+      this._log('Applied consent for categories:', grantedCategories);
+    }
+
+    // Apply consent with provider-level granularity
+    _applyConsentWithProviders() {
+      // Update Google Consent Mode
+      if (this.config.googleConsentMode) {
+        GoogleConsentMode.update(this.consentState);
+      }
+
+      // Update TCF v2.3
+      if (this.config.tcfEnabled) {
+        this._updateTCF();
+      }
+
+      // Update IAB GPP (US States)
+      this._updateGPP();
+
+      // Use provider-aware unblocking
+      this.blockingEngine.unblockForConsentState(this.consentState);
+
+      // Unblock iframes for granted categories (still category-level for iframes)
+      const grantedCategories = Object.entries(this.consentState.categories)
+        .filter(([_, granted]) => granted)
+        .map(([category]) => category);
+
+      grantedCategories.forEach(category => {
+        this.iframeBlockingEngine.unblockCategory(category);
+      });
+
+      // Unblock custom embed elements (data-biscotti-service)
+      this._unblockCustomEmbeds(grantedCategories);
+
+      // Clear custom service cookies for revoked categories
+      const revokedCategories = Object.entries(this.consentState.categories)
+        .filter(([cat, granted]) => !granted && cat !== 'essential')
+        .map(([category]) => category);
+      if (revokedCategories.length > 0) {
+        this._clearCustomServiceCookies(revokedCategories);
+      }
+
+      // Notify pre-boot Shield to unblock (if present)
+      if (window.__biscotti_shield) {
+        window.__biscotti_shield._unblockGranted();
+      }
+
+      // Broadcast consent update to all iframes
+      CrossFrameConsent.broadcast(this.consentState);
+
+      this._log('Applied consent with providers:', this.consentState.getProviderStates());
+    }
+
+    _emit(event, data) {
+      // Internal callbacks
+      if (this.eventListeners[event]) {
+        this.eventListeners[event].forEach(callback => callback(data));
+      }
+      
+      // Also dispatch as DOM CustomEvent for external scripts
+      // Dispatch on BOTH window and document for maximum compatibility
+      // (allows window.addEventListener('biscotti:consent', ...) and document.addEventListener)
+      try {
+        const customEvent = new CustomEvent(`biscotti:${event}`, {
+          detail: data,
+          bubbles: true
+        });
+        document.dispatchEvent(customEvent);
+        window.dispatchEvent(customEvent);  // Also dispatch on window for Analytics.jsx
+      } catch (e) {
+        // IE11 fallback
+        this._log('CustomEvent dispatch failed:', e);
+      }
+    }
+
+    // ==========================================================================
+    // PUBLIC API
+    // ==========================================================================
+
+    /**
+     * Accept all cookies
+     */
+    acceptAll() {
+      this.consentState.grant('all');
+      this._saveConsent();
+      this._applyConsent();
+      this._emit('consent', { type: 'acceptAll', state: this.consentState.toJSON() });
+      this._log('Accepted all');
+      // Announce consent saved via live region
+      if (this.bannerUI) {
+        this.bannerUI.announceStatus(this.bannerUI.t('banner.consentSaved') || 'Consent preferences saved');
+      }
+    }
+
+    /**
+     * Accept only essential cookies
+     */
+    acceptEssential() {
+      this.consentState.revoke('all');
+      this.consentState.categories.essential = true;
+      this._saveConsent();
+      this._applyConsent();
+      this._emit('consent', { type: 'acceptEssential', state: this.consentState.toJSON() });
+      this._log('Accepted essential only');
+      // Announce consent saved via live region
+      if (this.bannerUI) {
+        this.bannerUI.announceStatus(this.bannerUI.t('banner.consentSaved') || 'Consent preferences saved');
+      }
+    }
+
+    /**
+     * Accept specific categories
+     * @param {string[]} categories - Array of category names
+     */
+    acceptCategories(categories) {
+      this.consentState.revoke('all');
+      this.consentState.grant(categories);
+      this._saveConsent();
+      this._applyConsent();
+      this._emit('consent', { type: 'acceptCategories', categories, state: this.consentState.toJSON() });
+      this._log('Accepted categories:', categories);
+      // Announce consent saved via live region
+      if (this.bannerUI) {
+        this.bannerUI.announceStatus(this.bannerUI.t('banner.consentSaved') || 'Consent preferences saved');
+      }
+    }
+
+    /**
+     * Accept categories with provider-level overrides
+     * @param {string[]} categories - Array of category names to enable
+     * @param {Object} providerStates - Object with { providerId: boolean } for individual providers
+     */
+    acceptCategoriesWithProviders(categories, providerStates = {}) {
+      this.consentState.revoke('all');
+      this.consentState.grant(categories);
+
+      // Apply provider-level overrides
+      for (const [providerId, granted] of Object.entries(providerStates)) {
+        this.consentState.setProvider(providerId, granted);
+      }
+
+      this._saveConsent();
+      this._applyConsentWithProviders();
+      this._emit('consent', {
+        type: 'acceptCategoriesWithProviders',
+        categories,
+        providers: providerStates,
+        state: this.consentState.toJSON()
+      });
+      this._log('Accepted categories:', categories, 'with providers:', providerStates);
+      // Announce consent saved via live region
+      if (this.bannerUI) {
+        this.bannerUI.announceStatus(this.bannerUI.t('banner.consentSaved') || 'Consent preferences saved');
+      }
+    }
+
+    /**
+     * Accept TCF specific granular choices
+     */
+    acceptTCF(purposes, purposeLIs, vendors, vendorLIs, specialFeatures = {}) {
+      this.consentState.tcfPurposes = purposes;
+      this.consentState.tcfPurposeLIs = purposeLIs;
+      this.consentState.tcfVendors = vendors;
+      this.consentState.tcfVendorLIs = vendorLIs;
+      this.consentState.tcfSpecialFeatures = specialFeatures;
+      
+      this.consentState.timestamp = new Date().toISOString();
+      this._saveConsent();
+      this._applyConsent();
+      this._emit('consent', {
+        type: 'acceptTCF',
+        state: this.consentState.toJSON()
+      });
+      this._log('Accepted TCF choices', purposes);
+    }
+
+    /**
+     * Revoke consent (clear all non-essential)
+     * TCF Req 17.3: On withdrawal, generate new TC String with all consent bits = 0 and persist immediately
+     */
+    revokeConsent() {
+      this.consentState.revoke('all');
+
+      // Clear granular TCF choices so _updateTCF sees a reject-all scenario
+      this.consentState.tcfPurposes = {};
+      this.consentState.tcfPurposeLIs = {};
+      this.consentState.tcfVendors = {};
+      this.consentState.tcfVendorLIs = {};
+      this.consentState.tcfSpecialFeatures = {};
+
+      // Clear ATP consents for AC String
+      this.consentState.atpConsents = {};
+
+      this._saveConsent();
+
+      // TCF: Generate new TC String with all consent bits = 0 and persist immediately
+      if (this.config.tcfEnabled) {
+        this._updateTCF();
+      }
+
+      // Clear tracking cookies
+      this._clearTrackingCookies();
+
+      this._emit('consent', { type: 'revoke', state: this.consentState.toJSON() });
+      this._log('Revoked consent (all consent bits zeroed)');
+    }
+
+    /**
+     * Get current consent state
+     */
+    getConsent() {
+      return this.consentState.toJSON();
+    }
+
+    /**
+     * Check if category is granted
+     */
+    isGranted(category) {
+      return this.consentState.isGranted(category);
+    }
+
+    /**
+     * Check if user has made a choice
+     */
+    hasConsent() {
+      return this.consentState.hasUserChoice();
+    }
+
+    /**
+     * Register event listener
+     */
+    on(event, callback) {
+      if (!this.eventListeners[event]) {
+        this.eventListeners[event] = [];
+      }
+      this.eventListeners[event].push(callback);
+    }
+
+    /**
+     * Remove event listener
+     */
+    off(event, callback) {
+      if (this.eventListeners[event]) {
+        this.eventListeners[event] = this.eventListeners[event]
+          .filter(cb => cb !== callback);
+      }
+    }
+
+    /**
+     * Show consent banner (triggers UI)
+     */
+    showBanner() {
+      // Re-detect page language on every show (SPA may have changed <html lang> or URL)
+      const SUPPORTED_LANGS = ['de', 'en', 'fr', 'es', 'it', 'nl', 'pl', 'pt-BR', 'pt-PT', 'da', 'ar', 'bg', 'bs', 'ca', 'cs', 'el', 'eu', 'fi', 'gl', 'he', 'hi', 'hr', 'hu', 'id', 'ja', 'lt', 'mr', 'nb', 'ro', 'ru', 'sk', 'sl', 'sr', 'sv', 'th', 'tr', 'uk', 'vi', 'zh', 'zh-TW'];
+      
+      const _normalizeLang = (raw) => {
+        if (!raw) return null;
+        const lower = raw.toLowerCase();
+        const direct = SUPPORTED_LANGS.find(l => l.toLowerCase() === lower);
+        if (direct) return direct;
+        const base = lower.split('-')[0];
+        if (base === 'pt') return 'pt-BR';
+        return SUPPORTED_LANGS.find(l => l.toLowerCase() === base) || null;
+      };
+
+      const htmlLang = document.documentElement.lang;
+      const pathMatch = window.location.pathname.match(/^\/([a-z]{2})(\/|$)/);
+      const pageLang = _normalizeLang(htmlLang)
+        || (pathMatch ? _normalizeLang(pathMatch[1]) : null);
+      
+      if (pageLang && pageLang !== this.bannerUI.language) {
+        this._log('Language changed (SPA):', this.bannerUI.language, '→', pageLang);
+        this.bannerUI.language = pageLang;
+        this.config.effectiveLanguage = pageLang;
+        // Force banner AND detected services to re-render with new language
+        if (this.bannerUI.container) {
+          this.bannerUI.container.remove();
+          this.bannerUI.container = null;
+          this.bannerUI._listenersAttached = false;
+        }
+        // Re-resolve categories and TCF purposes for new language
+        if (this.config._allCategories) {
+          this.config.categories = this.config._allCategories[pageLang] 
+            || this.config._allCategories['en'] || [];
+        }
+        if (this.config._allTcfPurposes) {
+          this.config.tcfPurposes = this.config._allTcfPurposes[pageLang] 
+            || this.config._allTcfPurposes['en'] || [];
+        }
+        // Clear detected services cache so multilingual objects resolve correctly
+        this.bannerUI.detectedServices = null;
+        // Re-resolve legal links (privacyUrl, imprintUrl) from allLocalizedTexts
+        // Only override if the user has set a custom URL for this language
+        const allTexts = this.engine?.config?.banner?.allLocalizedTexts;
+        if (allTexts) {
+          const langTexts = allTexts[pageLang] || allTexts['en'] || allTexts['de'] || {};
+          // Only update if a custom URL exists (TCF defaults are stripped server-side)
+          if (langTexts.privacyUrl) this.engine.config.privacyUrl = langTexts.privacyUrl;
+          if (langTexts.imprintUrl) this.engine.config.imprintUrl = langTexts.imprintUrl;
+        }
+        // Re-load TCF GVL translations for the new language (purposes, specialPurposes, features)
+        // This is async but we fire-and-forget — the banner will re-render after show()
+        // and the TCF texts will update on next interaction or re-show
+        if (this.config.tcfData) {
+          this._loadTCFTranslations().then(() => {
+            // After TCF translations loaded, force re-render if banner is visible
+            if (this.bannerUI && this.bannerUI.container) {
+              this.bannerUI.container.remove();
+              this.bannerUI.container = null;
+              this.bannerUI._listenersAttached = false;
+              this.bannerUI.detectedServices = null;
+              this.bannerUI.show();
+              this._log('Banner re-rendered after TCF language switch to:', pageLang);
+            }
+          }).catch(() => {});
+        }
+      }
+      
+      this.bannerUI.show();
+      this._emit('showBanner', {});
+
+      // TCF: Notify CmpApi that the UI is now visible
+      // This sets displayStatus='visible' and eventStatus='cmpuishown'
+      if (this.tcfApi && this.consentState?.tcfString) {
+        this.tcfApi.update(this.consentState.tcfString, true);
+      } else if (this.tcfApi && this._initialTcString) {
+        // Use the initial TC string from updateWithGVL (has policyVersion=5)
+        this.tcfApi.update(this._initialTcString, true);
+      } else if (this.tcfApi) {
+        this.tcfApi.update('', true);
+      }
+    }
+
+    /**
+     * Hide consent banner
+     */
+    hideBanner() {
+      this.bannerUI.hide();
+      this._emit('hideBanner', {});
+    }
+
+    /**
+     * Show settings panel directly (used by floating button)
+     * Opens the banner with the granular settings panel already expanded
+     */
+    showSettings() {
+      this.bannerUI ? this.bannerUI.showSettings() : console.warn('[Biscotti] Not yet initialized');
+      this._emit('showSettings', {});
+    }
+
+    /**
+     * Export user data (GDPR Art. 15)
+     * Shows user their stored consent data
+     */
+    exportUserData() {
+      const data = {
+        consent: this.consentState.toJSON(),
+        storedCookies: this._getStoredCookies(),
+        localStorage: this._getLocalStorageData(),
+        exportedAt: new Date().toISOString()
+      };
+
+      // Show in UI if container exists
+      const container = document.getElementById('biscotti-export-result');
+      const dataEl = document.getElementById('biscotti-export-data');
+
+      if (container && dataEl) {
+        dataEl.textContent = JSON.stringify(data, null, 2);
+        container.style.display = 'block';
+      }
+
+      // Also trigger download
+      this._downloadJSON(data, 'biscotti-user-data.json');
+
+      this._emit('dataExport', data);
+      this._log('Exported user data');
+
+      return data;
+    }
+
+    /**
+     * Get all stored cookies
+     */
+    _getStoredCookies() {
+      const cookies = {};
+      document.cookie.split(';').forEach(cookie => {
+        const [name, value] = cookie.trim().split('=');
+        if (name) {
+          cookies[name] = value ? decodeURIComponent(value) : '';
+        }
+      });
+      return cookies;
+    }
+
+    /**
+     * Get relevant localStorage data
+     */
+    _getLocalStorageData() {
+      const data = {};
+      try {
+        for (let i = 0; i < localStorage.length; i++) {
+          const key = localStorage.key(i);
+          if (key && (key.startsWith('biscotti') || key.includes('consent'))) {
+            data[key] = localStorage.getItem(key);
+          }
+        }
+      } catch (e) {
+        // localStorage not available
+      }
+      return data;
+    }
+
+    /**
+     * Download JSON data as file
+     */
+    _downloadJSON(data, filename) {
+      const blob = new Blob([JSON.stringify(data, null, 2)], { type: 'application/json' });
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement('a');
+      a.href = url;
+      a.download = filename;
+      a.click();
+      URL.revokeObjectURL(url);
+    }
+
+    /**
+     * Opt out of data sale (CCPA)
+     * Revokes marketing consent and sets "do not sell" flag
+     */
+    optOutSale() {
+      // Revoke marketing consent
+      this.consentState.categories.marketing = false;
+
+      // Set "do not sell" flag
+      this.consentState.doNotSell = true;
+
+      this._saveConsent();
+
+      // Also set GPC signal if supported
+      if ('globalPrivacyControl' in navigator) {
+        this._log('GPC already set by browser');
+      }
+
+      // Clear marketing cookies
+      this._clearMarketingCookies();
+
+      this._emit('optOutSale', { state: this.consentState.toJSON() });
+      this._log('Opted out of data sale (CCPA)');
+
+      // Show confirmation
+      
+      const ccpaTranslations = {
+  "en": "You have opted out of the sale of your data. Marketing cookies have been removed.",
+  "de": "Sie haben dem Verkauf Ihrer Daten widersprochen. Marketing-Cookies wurden entfernt.",
+  "fr": "Vous avez refusé la vente de vos données. Les cookies marketing ont été supprimés.",
+  "es": "Se ha opuesto a la venta de sus datos. Las cookies de marketing han sido eliminadas.",
+  "it": "Ti sei opposto alla vendita dei tuoi dati. I cookie di marketing sono stati rimossi.",
+  "nl": "U heeft zich afgemeld voor de verkoop van uw gegevens. Marketingcookies zijn verwijderd.",
+  "pl": "Zrezygnowałeś ze sprzedaży swoich danych. Ciasteczka marketingowe zostały usunięte.",
+  "pt": "Você se opôs à venda de seus dados. Os cookies de marketing foram removidos.",
+  "da": "Du har fravalgt salget af dine data. Marketing-cookies er blevet fjernet.",
+  "ar": "لقد اخترت عدم بيع بياناتك. تمت إزالة ملفات تعريف الارتباط التسويقية.",
+  "bg": "Вие се отказахте от продажбата на вашите данни. Маркетинговите бисквитки са премахнати.",
+  "bs": "Odbili ste prodaju svojih podataka. Marketinški kolačići su uklonjeni.",
+  "ca": "Us heu oposat a la venda de les vostres dades. Les galetes de màrqueting s'han eliminat.",
+  "cs": "Odhlásili jste se z prodeje vašich údajů. Marketingové soubory cookie byly odstraněny.",
+  "el": "Έχετε εξαιρεθεί από την πώληση των δεδομένων σας. Τα cookies μάρκετινγκ έχουν αφαιρεθεί.",
+  "eu": "Zure datuen salmentari uko egin diozu. Marketin-cookieak kendu dira.",
+  "fi": "Olet estänyt tietojesi myynnin. Markkinointievästeet on poistettu.",
+  "gl": "Opúxose á venda dos seus datos. As cookies de márketing foron eliminadas.",
+  "he": "ביטלת את ההסכמה למכירת הנתונים שלך. קובצי ה-Cookie לשיווק הוסרו.",
+  "hi": "आपने अपने डेटा की बिक्री से ऑप्ट आउट किया है। मार्केटिंग कुकीज़ हटा दी गई हैं।",
+  "hr": "Odustali ste od prodaje svojih podataka. Marketinški kolačići su uklonjeni.",
+  "hu": "Ön leiratkozott adatai értékesítéséről. A marketing sütik eltávolításra kerültek.",
+  "id": "Anda telah menyisih dari penjualan data Anda. Cookie pemasaran telah dihapus.",
+  "ja": "データの販売をオプトアウトしました。マーケティングCookieは削除されました。",
+  "lt": "Jūs atsisakėte savo duomenų pardavimo. Rinkodaros slapukai buvo pašalinti.",
+  "mr": "तुम्ही तुमच्या डेटाच्या विक्रीतून बाहेर पडला आहात. मार्केटिंग कुकीज काढल्या गेल्या आहेत.",
+  "nb": "Du har valgt bort salg av dataene dine. Markedsføringsinformasjonskapsler er fjernet.",
+  "ro": "Ați renunțat la vânzarea datelor dvs. Cookie-urile de marketing au fost eliminate.",
+  "ru": "Вы отказались от продажи ваших данных. Маркетинговые файлы cookie удалены.",
+  "sk": "Odhlásili ste sa z predaja vašich údajov. Marketingové súbory cookie boli odstránené.",
+  "sl": "Odjavili ste se od prodaje vaših podatkov. Trženjski piškotki so bili odstranjeni.",
+  "sr": "Одустали сте од продаје својих података. Маркетиншки колачићи су уклоњени.",
+  "sv": "Du har valt bort försäljningen av dina uppgifter. Marknadsföringscookies har tagits bort.",
+  "th": "คุณได้เลือกไม่ขายข้อมูลของคุณแล้ว คุกกี้การตลาดถูกลบออกแล้ว",
+  "tr": "Verilerinizin satışından vazgeçtiniz. Pazarlama çerezleri kaldırıldı.",
+  "uk": "Ви відмовилися від продажу ваших даних. Маркетингові файли cookie видалено.",
+  "vi": "Bạn đã chọn không bán dữ liệu của mình. Cookie tiếp thị đã bị xóa.",
+  "zh": "您已选择退出出售您的数据。营销Cookie已被删除。",
+  "zh-TW": "您已選擇退出出售您的資料。行銷Cookie已被刪除。"
+};
+      const lang = document.documentElement.lang || navigator.language.split('-')[0] || 'en';
+      alert(ccpaTranslations[lang] || ccpaTranslations['en']);
+    
+    }
+
+    /**
+     * Clear marketing-specific cookies
+     */
+    _clearMarketingCookies() {
+      const marketingCookies = [
+        '_fbp', 'fr', '_fbc', // Facebook
+        '_gcl_au', 'IDE', 'NID', // Google Ads
+        'li_sugr', 'bcookie', 'lidc', // LinkedIn
+        'guest_id', 'personalization_id', // Twitter
+        '_ttp', 'tt_webid' // TikTok
+      ];
+
+      marketingCookies.forEach(name => {
+        Storage.deleteCookie(name);
+        document.cookie = `${name}=;expires=Thu, 01 Jan 1970 00:00:00 GMT;path=/;domain=${window.location.hostname}`;
+        document.cookie = `${name}=;expires=Thu, 01 Jan 1970 00:00:00 GMT;path=/;domain=.${window.location.hostname}`;
+      });
+    }
+
+    /**
+     * Clear tracking cookies (best effort)
+     */
+    _clearTrackingCookies() {
+      const trackingCookies = [
+        '_ga', '_gid', '_gat', '__utma', '__utmb', '__utmc', '__utmz',
+        '_gcl_au', '_fbp', 'fr', '_fbc', '_hjid', '_hjSession'
+      ];
+
+      trackingCookies.forEach(name => {
+        Storage.deleteCookie(name);
+        // Also try with domain variations
+        document.cookie = `${name}=;expires=Thu, 01 Jan 1970 00:00:00 GMT;path=/;domain=${window.location.hostname}`;
+        document.cookie = `${name}=;expires=Thu, 01 Jan 1970 00:00:00 GMT;path=/;domain=.${window.location.hostname}`;
+      });
+    }
+  }
+
+  // ==========================================================================
+  // INITIALIZATION
+  // ==========================================================================
+
+  // Create global instance
+  window.Biscotti = window.Biscotti || {};
+
+  // Factory function
+  window.Biscotti.init = function (config) {
+    if (window.Biscotti._instance) {
+      console.warn('[Biscotti] Already initialized');
+      return window.Biscotti._instance;
+    }
+    window.Biscotti._instance = new BiscottiEngine(config);
+    return window.Biscotti._instance;
+  };
+
+  // Expose classes for advanced usage
+  window.Biscotti.Engine = BiscottiEngine;
+  window.Biscotti.ConsentState = ConsentState;
+  window.Biscotti.VERSION = VERSION;
+  window.Biscotti.PROVIDER_DATABASE = PROVIDER_DATABASE;
+
+  // Global convenience wrappers (no need to access _instance)
+  window.Biscotti.showBanner = function () {
+    if (window.Biscotti._instance) {
+      window.Biscotti._instance.showBanner();
+    } else {
+      console.warn('[Biscotti] Not yet initialized');
+    }
+  };
+
+  window.Biscotti.showSettings = function () {
+    if (window.Biscotti._instance) {
+      window.Biscotti._instance.showSettings();
+    } else {
+      console.warn('[Biscotti] Not yet initialized');
+    }
+  };
+
+  window.Biscotti.hideBanner = function () {
+    if (window.Biscotti._instance) {
+      window.Biscotti._instance.hideBanner();
+    } else {
+      console.warn('[Biscotti] Not yet initialized');
+    }
+  };
+
+  window.Biscotti.acceptAll = function () {
+    if (window.Biscotti._instance) {
+      window.Biscotti._instance.acceptAll();
+    }
+  };
+
+  window.Biscotti.acceptEssential = function () {
+    if (window.Biscotti._instance) {
+      window.Biscotti._instance.acceptEssential();
+    }
+  };
+
+  // Auto-init if config is provided via data attribute OR window.BiscottiConfig
+  const scriptTag = document.currentScript || document.querySelector('script[data-biscotti-account]');
+
+  // Method 1: Data attribute on script tag
+  if (scriptTag) {
+    const accountId = scriptTag.getAttribute('data-biscotti-account');
+    const debug = scriptTag.hasAttribute('data-biscotti-debug');
+
+    if (accountId) {
+      window.Biscotti.init({
+        accountId: accountId,
+        debug: debug
+      });
+    }
+  }
+
+  // Method 2: window.BiscottiConfig (WordPress plugin integration)
+  // This runs after the script tag check, so explicit config takes priority
+  if (!window.Biscotti._instance && window.BiscottiConfig) {
+    const config = window.BiscottiConfig;
+    window.Biscotti.init({
+      websiteId: config.websiteId,
+      apiEndpoint: config.apiUrl && !config.apiUrl.endsWith('/api/v1') ? config.apiUrl.replace(/\/+$/, '') + '/api/v1' : config.apiUrl,
+      showFloatingButton: config.showFloatingButton === true,
+      geoIpEnabled: config.geoIpEnabled || false,
+      region: config.region || 'eu',
+      consentMode: config.consentMode || 'opt-in',
+      language: config.language || null,  // null = let smart cascade detect (page lang > GeoIP > browser)
+      debug: config.debug || false,
+      primaryColor: config.primaryColor || null,
+      backgroundColor: config.backgroundColor || null,
+      // White-label branding from WP plugin (C15 fix)
+      banner: config.whiteLabel ? {
+        branding: {
+          logoUrl: config.whiteLabel.logoUrl || null,
+          brandColor: config.whiteLabel.brandColor || null,
+          primaryColor: config.whiteLabel.brandColor || null,
+          customCss: config.whiteLabel.customCss || null,
+          hidePoweredBy: config.whiteLabel.hidePoweredBy || false
+        }
+      } : undefined,
+      // A/B test variant config (C16 fix) — override banner design
+      ...(config.abTest && config.abTest.config ? {
+        primaryColor: config.abTest.config.color || config.primaryColor || null,
+        position: config.abTest.config.position || config.position || null,
+        bannerType: config.abTest.config.type || null,
+        borderRadius: config.abTest.config.borderRadius || null
+      } : {}),
+      // TCF: Default to undefined (= wait for server config).
+      // The server config endpoint is the source of truth for tcfEnabled.
+      // After the API response arrives, this.config.tcfEnabled is set from server data.
+      // Legacy WP plugins (< 3.2.1) may send tcfEnabled: false — we ignore client-side
+      // config and always defer to the server response.
+      tcfEnabled: undefined
+    });
+  }
