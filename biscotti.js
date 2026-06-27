@@ -31,11 +31,279 @@ import { TCModel, TCString, GVL } from '@iabtcf/core';
 import { FocusTrapManager, AriaManager, LiveRegionAnnouncer, ReducedMotionHandler } from './accessibility/index.js';
 
 // ==========================================================================
+// === EARLY BLOCKING IIFE ===
+// Runs at parse/eval time BEFORE any class definitions and BEFORE the full
+// BiscottiEngine initializes. Fixes the iframe/script blocking race condition:
+// when biscotti.js is loaded async/deferred, the browser would otherwise start
+// fetching embed iframes and executing tracker scripts before the engine's
+// MutationObservers are attached — a DSGVO violation.
+//
+// Strategy:
+//   1. Read localStorage('biscotti_consent') synchronously.
+//   2. If full consent is granted → do nothing (no-op).
+//   3. Otherwise attach a MutationObserver on document.documentElement that
+//      strips the `src` of matching iframes (stored in data-biscotti-original-src)
+//      and neutralizes matching tracker scripts (type="text/plain",
+//      data-biscotti-blocked="true") for any category that is NOT granted.
+//   4. Also sweep nodes already present at IIFE run time.
+//   5. Expose window.__biscottiEarlyBlock so BiscottiEngine can take over.
+// ==========================================================================
+(function () {
+  if (typeof window === 'undefined' || typeof document === 'undefined') return;
+
+  // 1. Read consent from localStorage synchronously
+  var consent = null;
+  try {
+    var raw = localStorage.getItem('biscotti_consent');
+    consent = raw ? JSON.parse(raw) : null;
+  } catch (e) {
+    consent = null;
+  }
+
+  // 2. Determine whether we need to block at all.
+  // Block unless consent exists with a timestamp AND all non-essential
+  // categories (marketing, analytics, functional) are granted.
+  var shouldBlock;
+  if (consent && consent.timestamp && consent.categories) {
+    shouldBlock = !(consent.categories.marketing && consent.categories.analytics && consent.categories.functional);
+  } else {
+    shouldBlock = true; // No valid consent = block everything (DSGVO opt-in)
+  }
+
+  if (!shouldBlock) return; // Consent fully granted — do nothing.
+
+  // 3a. Hardcoded iframe patterns (subset of EMBED_PATTERNS) grouped by category.
+  //     reCAPTCHA is intentionally excluded — it is essential-adjacent and must load.
+  var iframePatterns = {
+    marketing: [
+      'youtube.com/embed', 'youtube-nocookie.com/embed', 'player.vimeo.com',
+      'dailymotion.com/embed', 'facebook.com/plugins', 'platform.twitter.com',
+      'tiktok.com/embed', 'instagram.com/embed', 'linkedin.com/embed',
+      'pinterest.com/pin', 'spotify.com/embed', 'soundcloud.com/player',
+      'twitch.tv/embed', 'fast.wistia.net/embed/iframe', 'fast.wistia.com/embed/iframe'
+    ],
+    analytics: ['hotjar.com', 'mouseflow.com'],
+    functional: [
+      'maps.google.com', 'google.com/maps/embed', 'openstreetmap.org',
+      'calendly.com', 'typeform.com'
+    ]
+  };
+
+  // 3b. Hardcoded tracker script patterns (subset of DEFAULT_BLOCK_PATTERNS) by category.
+  var scriptPatterns = {
+    analytics: [
+      'google-analytics.com', 'googletagmanager.com', 'analytics.google.com',
+      'hotjar.com', 'clarity.ms', 'mouseflow.com', 'fullstory.com',
+      'mixpanel.com', 'amplitude.com', 'segment.com'
+    ],
+    marketing: [
+      'facebook.net', 'fbevents.js', 'doubleclick.net', 'googlesyndication.com',
+      'googleadservices.com', 'adservice.google', 'linkedin.com/insight',
+      'snap.licdn.com', 'ads.twitter.com', 'tiktok.com', 'pinterest.com',
+      'taboola.com', 'outbrain.com', 'criteo.com', 'bat.bing.com',
+      'wistia.com', 'wistia.net'
+    ],
+    functional: [
+      'intercom.io', 'crisp.chat', 'tawk.to', 'zendesk.com', 'drift.com',
+      'hubspot.com', 'hs-scripts.com'
+    ]
+  };
+
+  function getIframeCategory(src) {
+    if (!src) return null;
+    var s = src.toLowerCase();
+    for (var cat in iframePatterns) {
+      if (!Object.prototype.hasOwnProperty.call(iframePatterns, cat)) continue;
+      var list = iframePatterns[cat];
+      for (var i = 0; i < list.length; i++) {
+        if (s.indexOf(list[i]) !== -1) return cat;
+      }
+    }
+    return null;
+  }
+
+  function getScriptCategory(src) {
+    if (!src) return null;
+    var s = src.toLowerCase();
+    for (var cat in scriptPatterns) {
+      if (!Object.prototype.hasOwnProperty.call(scriptPatterns, cat)) continue;
+      var list = scriptPatterns[cat];
+      for (var i = 0; i < list.length; i++) {
+        if (s.indexOf(list[i]) !== -1) return cat;
+      }
+    }
+    return null;
+  }
+
+  // 4. Category consent check: essential always granted; others from localStorage.
+  function isCategoryGranted(category) {
+    if (category === 'essential') return true;
+    if (!consent || !consent.categories) return false;
+    return consent.categories[category] === true;
+  }
+
+  function blockIframeNode(iframe) {
+    if (!iframe || iframe.nodeName !== 'IFRAME') return;
+    if (iframe.hasAttribute('data-biscotti-original-src')) return; // already handled
+    var src = iframe.getAttribute('src') || '';
+    if (!src) return;
+    var category = getIframeCategory(src);
+    if (!category) return;
+    if (isCategoryGranted(category)) return;
+    // Strip src BEFORE the browser can finish the network request.
+    iframe.setAttribute('data-biscotti-original-src', src);
+    iframe.setAttribute('data-biscotti-category', category);
+    iframe.removeAttribute('src');
+  }
+
+  function blockScriptNode(script) {
+    if (!script || script.nodeName !== 'SCRIPT') return;
+    if (script.getAttribute('data-biscotti-blocked') === 'true') return; // already handled
+    var src = script.getAttribute('src') || '';
+    if (!src) return;
+    var category = getScriptCategory(src);
+    if (!category) return;
+    if (isCategoryGranted(category)) return;
+    var originalType = script.getAttribute('type') || 'text/javascript';
+    script.setAttribute('data-biscotti-original-type', originalType);
+    script.setAttribute('type', 'text/plain');
+    script.setAttribute('data-biscotti-blocked', 'true');
+    script.setAttribute('data-biscotti-category', category);
+  }
+
+  function processNode(node) {
+    if (!node || node.nodeType !== 1) return; // element nodes only
+    if (node.nodeName === 'IFRAME') {
+      blockIframeNode(node);
+    } else if (node.nodeName === 'SCRIPT') {
+      blockScriptNode(node);
+    }
+    // Process descendants that may have been inserted in a single mutation.
+    if (typeof node.querySelectorAll === 'function') {
+      var frames = node.querySelectorAll('iframe');
+      for (var i = 0; i < frames.length; i++) blockIframeNode(frames[i]);
+      var scripts = node.querySelectorAll('script');
+      for (var j = 0; j < scripts.length; j++) blockScriptNode(scripts[j]);
+    }
+  }
+
+  // 5. Start the MutationObserver immediately to catch nodes as they are parsed.
+  var observer = new MutationObserver(function (mutations) {
+    for (var m = 0; m < mutations.length; m++) {
+      var added = mutations[m].addedNodes;
+      for (var n = 0; n < added.length; n++) {
+        processNode(added[n]);
+      }
+    }
+  });
+  observer.observe(document.documentElement, { childList: true, subtree: true });
+
+  // 6. Sweep nodes already present at IIFE run time (may already be parsed).
+  try {
+    var existingFrames = document.querySelectorAll('iframe');
+    for (var fi = 0; fi < existingFrames.length; fi++) blockIframeNode(existingFrames[fi]);
+    var existingScripts = document.querySelectorAll('script');
+    for (var si = 0; si < existingScripts.length; si++) blockScriptNode(existingScripts[si]);
+  } catch (e) { /* documentElement may not be ready; observer will catch the rest */ }
+
+  // 7. Expose reference so BiscottiEngine can disconnect and take over.
+  window.__biscottiEarlyBlock = { observer: observer, active: true };
+})();
+
+// ==========================================================================
 // CONFIGURATION
 // ==========================================================================
 
 const VERSION = '1.0.0';
 const STORAGE_KEY = 'biscotti_consent';
+
+// Verified IAB GPP strings for the US sections Biscotti supports. These are the
+// canonical encodings produced by the official @iabgpp/cmpapi library — NOT a
+// hand-rolled mock — generated by scripts/gen-gpp-optout-strings.cjs and guarded
+// against drift by tests/unit/gpp-optout.test.js, which re-derives them from the
+// same library and fails if these literals ever diverge.
+//   usnat = section 7 (all US states except California)
+//   usca  = section 8 (California)
+// GPP_US_OPT_OUT      => consumer opted OUT of sale/share/targeted advertising
+//                        (SaleOptOut/SharingOptOut/TargetedAdvertisingOptOut = 1)
+// GPP_US_NO_OPT_OUT   => notice given, consumer did NOT opt out (those fields = 2)
+const GPP_US_OPT_OUT = { usnat: 'DBABLA~BVQVAAAAAACA.QA', usca: 'DBABBg~BUUAAACA.QA' };
+const GPP_US_NO_OPT_OUT = { usnat: 'DBABLA~BVQqAAAAAACA.QA', usca: 'DBABBg~BUoAAACA.QA' };
+
+// ==========================================================================
+// DISPLAY MODE RESOLVER (Compact Banner Mode)
+// Pure, DOM-free decision logic shared by createStyles() and show() /
+// _initAccessibility(). Isolating the branching here keeps the imperative
+// render code thin and makes the decision logic property-testable without a DOM.
+// ==========================================================================
+
+/**
+ * Resolve a banner theme into a normalized render decision.
+ * Pure: no DOM access, no side effects.
+ * @param {object} theme - the persisted banner theme (may be partial/legacy)
+ * @param {boolean} [tcfEnabled=false] - when true, compact is forced to modal:
+ *   the compact layout is NOT IAB-TCF-compliant, so under TCF the banner must
+ *   always render as the full modal regardless of the saved displayMode.
+ * @returns {{mode:string, maxWidthPx:number, compactSize:(string|null), corner:(string|null), overlay:boolean, ariaModal:boolean, focusTrap:boolean, role:string}}
+ */
+export function resolveDisplayConfig(theme = {}, tcfEnabled = false) {
+  const rawMode = theme.displayMode;
+  // Req 2.4, 8.4, 9.1: absent or unknown -> modal.
+  // TCF safety net: compact is not IAB-compliant -> force modal when TCF is on.
+  const mode = (rawMode === 'compact' && !tcfEnabled) ? 'compact' : 'modal';
+
+  if (mode === 'modal') {
+    return {
+      mode: 'modal',
+      maxWidthPx: 480,          // Req 3.4
+      overlay: true,            // Req 2.3, 9.2
+      ariaModal: true,          // Req 9.3
+      focusTrap: true,          // Req 9.4
+      role: 'dialog',
+      corner: null,             // position handled by existing logic
+      compactSize: null,
+    };
+  }
+
+  // compact branch
+  // Req 3.1/3.2/3.3: small=360, medium=420, absent/unknown -> 360
+  const compactSize = theme.compactSize === 'medium' ? 'medium' : 'small';
+  const maxWidthPx = compactSize === 'medium' ? 420 : 360;
+
+  // Req 4.1-4.4: corner resolution
+  const corner = resolveCompactCorner(theme.position);
+
+  return {
+    mode: 'compact',
+    maxWidthPx,
+    compactSize,
+    overlay: false,             // Req 2.1, 2.2
+    ariaModal: false,           // Req 2.5
+    focusTrap: false,           // Req 2.6
+    role: 'region',             // Req 6.3
+    corner,
+  };
+}
+
+/**
+ * Map a theme.position into a compact corner anchor.
+ * @param {string} position - the persisted theme.position value
+ * @returns {'bottom-left'|'bottom-right'|'bottom-center'|'top-center'}
+ */
+export function resolveCompactCorner(position) {
+  switch (position) {
+    case 'bottom-left':
+    case 'bottom-right':
+    case 'bottom-center':
+    case 'top-center':
+      return position;                 // Req 4.1
+    case 'bottom-bar':
+    case 'top-bar':
+      return 'bottom-center';          // Req 4.2
+    default:
+      return 'bottom-left';            // Req 4.3 (absent), Req 4.4 (unknown)
+  }
+}
 
   const COOKIE_NAME = 'biscotti_consent';
   const COOKIE_DAYS = 180; // 6 months default
@@ -81,6 +349,11 @@ const STORAGE_KEY = 'biscotti_consent';
     'criteo.com',
     'bing.com/bat',
     'bat.bing.com',
+    'belboon.com',
+    'lafamo.com',
+    'daisycon.io',
+    'wistia.com',
+    'wistia.net',
 
     // Functional (optional)
     'intercom.io',
@@ -105,7 +378,8 @@ const STORAGE_KEY = 'biscotti_consent';
       'facebook', 'fbevents', 'doubleclick', 'googlesyndication',
       'googleadservices', 'adservice.google', 'linkedin', 'licdn',
       'twitter', 'ads-twitter', 'tiktok', 'pinterest', 'pinimg',
-      'taboola', 'outbrain', 'criteo', 'bing.com/bat', 'bat.bing'
+      'taboola', 'outbrain', 'criteo', 'bing.com/bat', 'bat.bing',
+      'belboon', 'lafamo', 'daisycon', 'wistia'
     ],
     functional: [
       'intercom', 'crisp', 'tawk', 'zendesk', 'drift', 'hubspot',
@@ -549,7 +823,9 @@ const STORAGE_KEY = 'biscotti_consent';
       { pattern: 'pinterest.com/pin', name: 'Pinterest', icon: '📌' },
       { pattern: 'spotify.com/embed', name: 'Spotify', icon: '🎧' },
       { pattern: 'soundcloud.com/player', name: 'SoundCloud', icon: '🔊' },
-      { pattern: 'twitch.tv/embed', name: 'Twitch', icon: '🎮' }
+      { pattern: 'twitch.tv/embed', name: 'Twitch', icon: '🎮' },
+      { pattern: 'fast.wistia.net/embed/iframe', name: 'Wistia', icon: '🎬' },
+      { pattern: 'fast.wistia.com/embed/iframe', name: 'Wistia', icon: '🎬' }
     ],
     functional: [
       { pattern: 'maps.google.com', name: 'Google Maps', icon: '🗺️' },
@@ -595,6 +871,7 @@ const STORAGE_KEY = 'biscotti_consent';
       this.observer = null;
       this.placeholderStyles = this._createStyles();
       this.customEmbedPatterns = []; // { pattern, name, category, icon }
+      this.blockedWistia = []; // { el, placeholder, embedInfo, category } — Wistia web-component/legacy embeds
     }
 
     /**
@@ -760,7 +1037,16 @@ const STORAGE_KEY = 'biscotti_consent';
     _createPlaceholder(iframe, embedInfo, originalSrc) {
       const width = iframe.getAttribute('width') || iframe.style.width || '100%';
       const height = iframe.getAttribute('height') || iframe.style.height || '315px';
+      return this._renderPlaceholder(embedInfo, width, height,
+        (placeholder) => this._loadEmbed(iframe, placeholder, originalSrc, false),
+        (placeholder) => this._loadEmbed(iframe, placeholder, originalSrc, true, embedInfo.category));
+    }
 
+    /**
+     * Build a consent placeholder element (shared by iframe embeds and Wistia
+     * web-component embeds). onLoadOnce/onRemember receive the placeholder node.
+     */
+    _renderPlaceholder(embedInfo, width, height, onLoadOnce, onRemember) {
       const placeholder = document.createElement('div');
       placeholder.className = 'biscotti-placeholder';
       placeholder.style.width = typeof width === 'number' ? `${width}px` : width;
@@ -795,13 +1081,13 @@ const STORAGE_KEY = 'biscotti_consent';
 
       // Event listeners
       placeholder.querySelector('[data-action="load-once"]').addEventListener('click', () => {
-        this._loadEmbed(iframe, placeholder, originalSrc, false);
+        onLoadOnce(placeholder);
       });
 
       const checkbox = placeholder.querySelector('[data-action="remember"]');
       checkbox.addEventListener('change', (e) => {
         if (e.target.checked) {
-          this._loadEmbed(iframe, placeholder, originalSrc, true, embedInfo.category);
+          onRemember(placeholder);
         }
       });
 
@@ -833,6 +1119,125 @@ const STORAGE_KEY = 'biscotti_consent';
       this.blockedIframes = this.blockedIframes.filter(item => item.iframe !== iframe);
     }
 
+    // ------------------------------------------------------------------
+    // WISTIA EMBEDS
+    // Wistia's primary embed is a <wistia-player> web component (or legacy
+    // .wistia_embed / wistia_async_* divs) driven by fast.wistia.com scripts —
+    // NOT an <iframe>. The IframeBlockingEngine can't catch it, so we handle it
+    // here: the scripts are neutralised by the BlockingEngine (wistia patterns),
+    // and these elements get a consent placeholder until marketing is granted.
+    // ------------------------------------------------------------------
+    _wistiaSelector() {
+      return 'wistia-player, .wistia_embed, div[class*="wistia_async_"]';
+    }
+
+    _hasBlockedWistiaAncestor(el) {
+      let p = el.parentElement;
+      while (p) {
+        if (p.hasAttribute && p.hasAttribute('data-biscotti-wistia-blocked')) return true;
+        p = p.parentElement;
+      }
+      return false;
+    }
+
+    blockWistiaEmbeds(consentState) {
+      // Wistia is always a marketing-category service.
+      if (!consentState || consentState.isGranted('marketing')) return;
+      let els;
+      try {
+        els = document.querySelectorAll(this._wistiaSelector());
+      } catch (e) { return; }
+
+      els.forEach(el => {
+        if (el.hasAttribute('data-biscotti-wistia-blocked')) return;
+        if (this._hasBlockedWistiaAncestor(el)) return;
+
+        const embedInfo = { name: 'Wistia', icon: '🎬', category: 'marketing' };
+        el.setAttribute('data-biscotti-wistia-display', el.style.display || '');
+        el.setAttribute('data-biscotti-wistia-blocked', 'true');
+        el.setAttribute('data-biscotti-category', 'marketing');
+
+        const placeholder = this._createWistiaPlaceholder(el, embedInfo);
+        el.style.display = 'none';
+        if (el.parentNode) el.parentNode.insertBefore(placeholder, el);
+
+        this.blockedWistia.push({ el, placeholder, embedInfo, category: 'marketing' });
+      });
+    }
+
+    _createWistiaPlaceholder(targetEl, embedInfo) {
+      let width = (targetEl.getAttribute && targetEl.getAttribute('width')) || '100%';
+      let height = '315px';
+      try {
+        const rect = targetEl.getBoundingClientRect && targetEl.getBoundingClientRect();
+        if (rect && rect.width > 0) width = `${Math.round(rect.width)}px`;
+        if (rect && rect.height > 40) height = `${Math.round(rect.height)}px`;
+      } catch (e) { /* keep defaults */ }
+
+      return this._renderPlaceholder(embedInfo, width, height,
+        (placeholder) => this._loadWistiaOnce(targetEl, placeholder),
+        (placeholder) => this._rememberWistia(targetEl, placeholder, embedInfo.category));
+    }
+
+    _injectWistiaLoader(el) {
+      // Load Wistia's player runtime once; it upgrades all <wistia-player> elements.
+      if (!document.querySelector('script[data-biscotti-wistia-loader]')) {
+        const s = document.createElement('script');
+        s.src = 'https://fast.wistia.com/player.js';
+        s.async = true;
+        s.setAttribute('data-biscotti-wistia-loader', 'true');
+        document.head.appendChild(s);
+      }
+      // Load the media-specific config script when the id is known (web component).
+      const mediaId = el.getAttribute && el.getAttribute('media-id');
+      if (mediaId) {
+        const s2 = document.createElement('script');
+        s2.src = `https://fast.wistia.com/embed/${mediaId}.js`;
+        s2.async = true;
+        s2.setAttribute('type', 'module');
+        document.head.appendChild(s2);
+      }
+    }
+
+    _loadWistiaOnce(el, placeholder) {
+      // Allow Wistia through BOTH the pre-consent Shield and the engine's script
+      // blocker for THIS page load (one-time, NOT persisted) so the player runtime
+      // and its media requests actually load. Without this, the injected
+      // player.js/embed.js are immediately re-neutralised and nothing happens.
+      try {
+        window.__biscottiShieldAllow = window.__biscottiShieldAllow || [];
+        ['wistia.com', 'wistia.net'].forEach((d) => {
+          if (window.__biscottiShieldAllow.indexOf(d) === -1) window.__biscottiShieldAllow.push(d);
+        });
+      } catch (e) { /* ignore */ }
+      el.style.display = el.getAttribute('data-biscotti-wistia-display') || '';
+      el.removeAttribute('data-biscotti-wistia-blocked');
+      if (placeholder) placeholder.remove();
+      this._injectWistiaLoader(el);
+      this.blockedWistia = this.blockedWistia.filter(item => item.el !== el);
+    }
+
+    _rememberWistia(el, placeholder, category) {
+      this._loadWistiaOnce(el, placeholder);
+      if (category && window.Biscotti && window.Biscotti._instance) {
+        const instance = window.Biscotti._instance;
+        instance.consentState.categories[category] = true;
+        instance._saveConsent();
+        instance._applyConsent();
+      }
+    }
+
+    unblockWistia(category) {
+      if (!this.blockedWistia || !this.blockedWistia.length) return;
+      const toUnblock = this.blockedWistia.filter(item => item.category === category);
+      toUnblock.forEach(item => {
+        item.el.style.display = item.el.getAttribute('data-biscotti-wistia-display') || '';
+        item.el.removeAttribute('data-biscotti-wistia-blocked');
+        if (item.placeholder) item.placeholder.remove();
+      });
+      this.blockedWistia = this.blockedWistia.filter(item => item.category !== category);
+    }
+
     unblockCategory(category) {
       const toUnblock = this.blockedIframes.filter(item =>
         item.embedInfo.category === category
@@ -844,7 +1249,13 @@ const STORAGE_KEY = 'biscotti_consent';
         item.placeholder.remove();
       });
 
+      // Also restore any Wistia embeds gated on this category. The Wistia
+      // runtime scripts are re-executed separately by BlockingEngine.unblockScripts,
+      // which upgrades the now-revealed <wistia-player> elements.
+      this.unblockWistia(category);
+
       this.blockedIframes = this.blockedIframes.filter(item =>
+
         item.embedInfo.category !== category
       );
     }
@@ -864,6 +1275,13 @@ const STORAGE_KEY = 'biscotti_consent';
                 this.blockIframe(iframe, consentState);
               });
             }
+            // Wistia web-component / legacy embeds added dynamically.
+            if (node.nodeType === 1) {
+              const sel = this._wistiaSelector();
+              const isW = node.matches && node.matches(sel);
+              const hasW = node.querySelector && node.querySelector(sel);
+              if (isW || hasW) this.blockWistiaEmbeds(consentState);
+            }
           });
         });
       });
@@ -882,7 +1300,37 @@ const STORAGE_KEY = 'biscotti_consent';
     }
 
     blockExistingIframes(consentState) {
-      document.querySelectorAll('iframe:not([data-biscotti-blocked])').forEach(iframe => {
+      // Handle iframes that were pre-blocked by the early-blocking IIFE.
+      // These have data-biscotti-original-src but no placeholder/data-biscotti-blocked yet.
+      document.querySelectorAll('iframe[data-biscotti-original-src]:not([data-biscotti-blocked])').forEach(iframe => {
+        const src = iframe.getAttribute('data-biscotti-original-src') || '';
+        const embedInfo = this.getEmbedInfo(src);
+
+        // If consent is now granted (or pattern unknown), restore the original src.
+        if (!embedInfo || consentState.isGranted(embedInfo.category)) {
+          if (src && !iframe.getAttribute('src')) {
+            iframe.setAttribute('src', src);
+          }
+          iframe.removeAttribute('data-biscotti-original-src');
+          return;
+        }
+
+        // Still blocked — mark and build placeholder UI like a normally-blocked iframe.
+        iframe.setAttribute('data-biscotti-blocked', 'true');
+        iframe.setAttribute('data-biscotti-src', src);
+        iframe.setAttribute('data-biscotti-category', embedInfo.category);
+
+        const placeholder = this._createPlaceholder(iframe, embedInfo, src);
+        iframe.style.display = 'none';
+        if (iframe.parentNode) {
+          iframe.parentNode.insertBefore(placeholder, iframe);
+        }
+
+        this.blockedIframes.push({ iframe, placeholder, src, embedInfo });
+      });
+
+      // Original logic for iframes that were NOT pre-blocked by the IIFE.
+      document.querySelectorAll('iframe:not([data-biscotti-blocked]):not([data-biscotti-original-src])').forEach(iframe => {
         this.blockIframe(iframe, consentState);
       });
     }
@@ -1219,6 +1667,13 @@ const STORAGE_KEY = 'biscotti_consent';
       // Google Additional Consent (AC String) — Req 3.7
       this.acString = null;
       this.atpConsents = {};
+
+      // US sale/share opt-out (CCPA/CPRA, Texas TDPSA, etc.). doNotSell is the
+      // consumer's "Do Not Sell or Share" decision; gppString is the encoded IAB
+      // GPP US string that proves it. Persisted on the consent record so a sale
+      // opt-out is provable and not indistinguishable from a plain reject.
+      this.doNotSell = false;
+      this.gppString = null;
     }
 
     static fromJSON(json) {
@@ -1240,6 +1695,10 @@ const STORAGE_KEY = 'biscotti_consent';
         // Google Additional Consent (AC String) — Req 3.7
         state.acString = json.acString || null;
         state.atpConsents = json.atpConsents || {};
+
+        // US sale/share opt-out (see constructor).
+        state.doNotSell = json.doNotSell === true;
+        state.gppString = json.gppString || null;
       }
       return state;
     }
@@ -1257,7 +1716,9 @@ const STORAGE_KEY = 'biscotti_consent';
         tcfVendorLIs: this.tcfVendorLIs,
         tcfSpecialFeatures: this.tcfSpecialFeatures,
         acString: this.acString,
-        atpConsents: this.atpConsents
+        atpConsents: this.atpConsents,
+        doNotSell: this.doNotSell === true,
+        gppString: this.gppString || null
       };
     }
 
@@ -1480,6 +1941,37 @@ const STORAGE_KEY = 'biscotti_consent';
   };
 
   // ==========================================================================
+  // GTM TEMPLATE CALLBACK SUPPORT
+  // Enables GTM Sandboxed JS templates to receive consent updates
+  // (Sandboxed JS cannot listen to DOM CustomEvents)
+  // ==========================================================================
+
+  const GtmCallbackSupport = {
+    callbacks: [],
+
+    init() {
+      // Expose the registration function on window for GTM's callInWindow
+      window.__biscottiRegisterConsentCallback = (callback) => {
+        if (typeof callback === 'function') {
+          this.callbacks.push(callback);
+        }
+      };
+
+      // If GTM template already set a callback before we loaded, pick it up
+      if (typeof window.__biscottiGtmConsentCallback === 'function') {
+        this.callbacks.push(window.__biscottiGtmConsentCallback);
+      }
+    },
+
+    // Called from _emit('consent', ...) to notify GTM template
+    notifyCallbacks() {
+      this.callbacks.forEach(cb => {
+        try { cb(); } catch (e) { /* non-critical */ }
+      });
+    }
+  };
+
+  // ==========================================================================
   // GLOBAL PRIVACY CONTROL (GPC) - CCPA/CPRA COMPLIANCE
   // ==========================================================================
 
@@ -1552,6 +2044,15 @@ const STORAGE_KEY = 'biscotti_consent';
       };
       this.button.setAttribute('data-icon', icons[iconId] || icons['cookie']);
       this.button.innerHTML = '';
+    }
+
+    /**
+     * Set the floating button background color (overrides the default gradient).
+     * Uses !important to beat the stylesheet's !important background rule.
+     */
+    setColor(color) {
+      if (!this.button || !color) return;
+      this.button.style.setProperty('background', color, 'important');
     }
 
     // Language-aware label helper (reads page language dynamically)
@@ -1732,7 +2233,7 @@ const STORAGE_KEY = 'biscotti_consent';
             padding: 0 !important;
             margin: 0 !important;
             border-radius: 50% !important;
-            background: linear-gradient(135deg, #9B6B3C 0%, #8B5A2B 100%) !important;
+            background: var(--biscotti-fab-bg, linear-gradient(135deg, #9B6B3C 0%, #8B5A2B 100%)) !important;
             border: none !important;
             cursor: pointer;
             box-shadow: 0 4px 16px rgba(0,0,0,0.2);
@@ -1785,9 +2286,15 @@ const STORAGE_KEY = 'biscotti_consent';
       this.button = document.createElement('button');
       this.button.id = 'biscotti-settings-btn';
       this.button.setAttribute('aria-label', this._getLabel('openSettings'));
-      this.button.setAttribute('title', this._getLabel('openSettings'));
+      // No native `title` tooltip: the visible hover text is intentionally
+      // omitted. The label stays on aria-label for screen-reader users only.
       // Use theme.floatingButtonIcon if available
       const theme = this.config?.theme || this.config?.banner?.theme || {};
+      // Apply custom floating button background color if configured (falls back
+      // to the default gradient via the CSS var default).
+      if (theme.floatingButtonColor) {
+        this.button.style.setProperty('--biscotti-fab-bg', theme.floatingButtonColor);
+      }
       const floatIcon = theme.floatingButtonIcon || 'cookie';
       if (floatIcon === 'custom' && theme.customFloatingIcon) {
         this.button.innerHTML = `<img src="${theme.customFloatingIcon}" alt="" style="width:28px;height:28px;object-fit:contain;">`;
@@ -1796,14 +2303,18 @@ const STORAGE_KEY = 'biscotti_consent';
         const floatIcons = { 'cookie': '🍪', 'shield': '🛡️', 'settings': '⚙️', 'lock': '🔒' };
         this.button.setAttribute('data-icon', floatIcons[floatIcon] || '🍪');
       }
+      // Apply custom background color if configured (overrides the default gradient).
+      if (theme.floatingButtonColor) {
+        this.setColor(theme.floatingButtonColor);
+      }
       this.button.addEventListener('click', () => this.onClick());
 
-      const tooltip = document.createElement('div');
-      tooltip.id = 'biscotti-settings-btn-tooltip';
-      tooltip.textContent = this._getLabel('changeSettings');
-
+      // Visible hover tooltip intentionally removed (customer feedback): the
+      // floating button no longer shows any text on hover. Accessibility is
+      // preserved via the aria-label set above. The #biscotti-settings-btn-tooltip
+      // element is no longer created; the guarded references in destroy() and
+      // setGpcIndicator() simply become no-ops.
       document.body.appendChild(this.button);
-      document.body.appendChild(tooltip);
     }
 
     hide() {
@@ -1901,6 +2412,31 @@ const STORAGE_KEY = 'biscotti_consent';
       this._ariaManager = null;
       this._liveAnnouncer = null;
       this._reducedMotionHandler = new ReducedMotionHandler();
+
+      // Register configReady listener for progressive TCF content backfill
+      if (this.engine && typeof this.engine.on === 'function') {
+        this.engine.on('configReady', () => {
+          // Slow first-visit flash fix: a generic fallback banner may have been
+          // painted before the config arrived. Once config is ready, if the banner
+          // is currently visible but was rendered with a TCF-state that no longer
+          // matches the loaded config, do a FULL re-render so the initial layer
+          // switches generic <-> TCF in place (instead of staying stale until reload).
+          const cfgTcf = !!this.engine?.config?.tcfEnabled;
+          const bannerEl = document.getElementById('biscotti-banner');
+          const bannerVisible = bannerEl
+            && this.container === bannerEl
+            && bannerEl.classList.contains('visible');
+          if (bannerVisible
+              && this._renderedTcfEnabled !== undefined
+              && this._renderedTcfEnabled !== cfgTcf) {
+            // show() re-renders innerHTML via _renderBanner() with the now-correct
+            // tcfEnabled, swapping the initial layer and re-attaching listeners.
+            this.show();
+            return;
+          }
+          this._backfillTcfContent();
+        });
+      }
     }
 
     // Get translation with fallback - uses detected/configured language
@@ -5008,7 +5544,10 @@ const STORAGE_KEY = 'biscotti_consent';
 
     createStyles() {
       const styleId = 'biscotti-banner-styles';
-      if (document.getElementById(styleId)) return;
+      // Remove existing styles so they can be re-created with updated theme colors
+      // (fixes race condition where styles were injected with defaults before API loaded)
+      const existingStyle = document.getElementById(styleId);
+      if (existingStyle) existingStyle.remove();
 
       // Get theme from engine config (with fallbacks to original defaults)
       // Check both this.engine.config.theme and this.engine.config.banner.theme
@@ -5020,8 +5559,15 @@ const STORAGE_KEY = 'biscotti_consent';
       const borderRadius = theme.borderRadius != null ? theme.borderRadius : 16;
       const buttonStyle = theme.buttonStyle || 'rounded';
       const position = theme.position || 'bottom-center';
+      // Compact Banner Mode: resolve the normalized render decision once. Every
+      // box-geometry/position branch below reads from this decision so modal mode
+      // stays byte-for-byte identical while compact mode drives its own geometry.
+      const decision = resolveDisplayConfig(theme, this.engine?.config?.tcfEnabled);
+      // In compact mode the box anchors to decision.corner (bars collapse to
+      // bottom-center); in modal mode the raw theme.position drives positioning.
+      const effectivePosition = decision.mode === 'compact' ? decision.corner : position;
       
-      console.log('[Biscotti] Applying Banner UI styles with theme:', { primaryColor, backgroundColor, textColor, borderRadius, buttonStyle, position });
+      console.log('[Biscotti] Applying Banner UI styles with theme:', { primaryColor, backgroundColor, textColor, borderRadius, buttonStyle, position, displayMode: decision.mode });
       
       // Calculate derived colors or use theme provided ones
       const primaryDark = theme.primaryDark || (this.engine?._darkenColor ? this.engine._darkenColor(primaryColor, 10) : '#8B5A2B');
@@ -5031,19 +5577,19 @@ const STORAGE_KEY = 'biscotti_consent';
       // Compute position styles from theme.position
       let positionCSS = 'bottom: 20px; left: 50%; transform: translateX(-50%) translateY(100%);';
       let visibleTransform = 'transform: translateX(-50%) translateY(0);';
-      if (position === 'bottom-left') {
+      if (effectivePosition === 'bottom-left') {
         positionCSS = 'bottom: 20px; left: 20px; transform: translateY(100%);';
         visibleTransform = 'transform: translateY(0);';
-      } else if (position === 'bottom-right') {
+      } else if (effectivePosition === 'bottom-right') {
         positionCSS = 'bottom: 20px; right: 20px; transform: translateY(100%);';
         visibleTransform = 'transform: translateY(0);';
-      } else if (position === 'top-center') {
+      } else if (effectivePosition === 'top-center') {
         positionCSS = 'top: 20px; left: 50%; transform: translateX(-50%) translateY(-100%);';
         visibleTransform = 'transform: translateX(-50%) translateY(0);';
-      } else if (position === 'bottom-bar') {
+      } else if (effectivePosition === 'bottom-bar') {
         positionCSS = 'bottom: 0; left: 0; right: 0; transform: translateY(100%);';
         visibleTransform = 'transform: translateY(0);';
-      } else if (position === 'top-bar') {
+      } else if (effectivePosition === 'top-bar') {
         positionCSS = 'top: 0; left: 0; right: 0; transform: translateY(-100%);';
         visibleTransform = 'transform: translateY(0);';
       }
@@ -5052,6 +5598,28 @@ const STORAGE_KEY = 'biscotti_consent';
       let btnRadius = `${Math.max(borderRadius / 2, 4)}px`;
       if (buttonStyle === 'pill') btnRadius = '999px';
       else if (buttonStyle === 'square') btnRadius = '4px';
+
+      // Box geometry. In modal mode this preserves the existing
+      // position.includes('bar') behavior byte-for-byte. In compact mode the box
+      // width comes from decision.maxWidthPx (360 small / 420 medium) with corner
+      // geometry, and the bar full-width branch never applies (corner is never a bar).
+      const isCompact = decision.mode === 'compact';
+      const isBar = position.includes('bar');
+      const boxBorderRadius = isCompact
+        ? 'var(--biscotti-border-radius, 16px)'
+        : (isBar ? '0' : 'var(--biscotti-border-radius, 16px)');
+      const boxMaxWidth = isCompact
+        ? `${decision.maxWidthPx}px`
+        : (isBar ? '100%' : '480px');
+      const boxWidth = isCompact
+        ? 'calc(100% - 40px)'
+        : (isBar ? '100%' : 'calc(100% - 40px)');
+      const boxMaxHeight = isCompact
+        ? 'calc(100vh - 40px)'
+        : (isBar ? '50vh' : 'calc(100vh - 40px)');
+      const boxBoxSizingExtra = (!isCompact && isBar) ? 'box-sizing: border-box;' : '';
+      const innerPadding = isCompact ? '24px' : (isBar ? '16px 24px' : '24px');
+      const innerMaxHeight = boxMaxHeight;
 
       const style = document.createElement('style');
       style.id = styleId;
@@ -5073,22 +5641,24 @@ const STORAGE_KEY = 'biscotti_consent';
           z-index: 999999;
           opacity: 0;
           visibility: hidden;
+          pointer-events: none;
           transition: opacity 0.3s, visibility 0.3s;
         }
         #biscotti-banner-overlay.visible {
           opacity: 1;
           visibility: visible;
+          pointer-events: auto;
         }
         #biscotti-banner {
           position: fixed;
           ${positionCSS}
           background: linear-gradient(135deg, var(--biscotti-bg-color) 0%, var(--biscotti-bg-dark) 100%);
-          border-radius: ${position.includes('bar') ? '0' : 'var(--biscotti-border-radius, 16px)'};
+          border-radius: ${boxBorderRadius};
           box-shadow: 0 8px 32px rgba(0, 0, 0, 0.4);
           padding: 0;
-          max-width: ${position.includes('bar') ? '100%' : '480px'};
-          width: ${position.includes('bar') ? '100%' : 'calc(100% - 40px)'};
-          max-height: ${position.includes('bar') ? '50vh' : 'calc(100vh - 40px)'};
+          max-width: ${boxMaxWidth};
+          width: ${boxWidth};
+          max-height: ${boxMaxHeight};
           overflow: hidden;
           box-sizing: border-box;
           z-index: 1000000;
@@ -5096,18 +5666,36 @@ const STORAGE_KEY = 'biscotti_consent';
           color: var(--biscotti-text-color, #fff);
           font-size: var(--biscotti-font-size, 14px);
           opacity: 0;
-          transition: transform 0.4s cubic-bezier(0.34, 1.56, 0.64, 1), opacity 0.3s;
-          ${position.includes('bar') ? 'box-sizing: border-box;' : ''}
+          visibility: hidden;
+          pointer-events: none;
+          transition: transform 0.4s cubic-bezier(0.34, 1.56, 0.64, 1), opacity 0.3s, visibility 0.3s;
+          ${boxBoxSizingExtra}
         }
         #biscotti-banner > .biscotti-banner-inner {
-          padding: ${position.includes('bar') ? '16px 24px' : '24px'};
-          max-height: ${position.includes('bar') ? '50vh' : 'calc(100vh - 40px)'};
+          padding: ${innerPadding};
+          max-height: ${innerMaxHeight};
           overflow-y: auto;
           box-sizing: border-box;
         }
         #biscotti-banner.visible {
           ${visibleTransform}
           opacity: 1;
+          visibility: visible;
+          pointer-events: auto;
+        }
+        /* ANTI-FLASH REVEAL-GATE (self-enforcing).
+           Until <html data-biscotti-ready> is set — which happens only after the API
+           branding + theme are applied (or a bounded failsafe fires) — the banner and
+           its overlay stay invisible NO MATTER WHICH code path adds .visible (deferred
+           show, post-hydration recovery timers, SPA re-show, settings re-render, …).
+           This makes it structurally impossible to paint the default/Campcruisers
+           branding or the default color on a white-label site, instead of relying on
+           every future render path to remember to defer. */
+        html:not([data-biscotti-ready]) #biscotti-banner.visible,
+        html:not([data-biscotti-ready]) #biscotti-banner-overlay.visible {
+          opacity: 0 !important;
+          visibility: hidden !important;
+          pointer-events: none !important;
         }
         .biscotti-banner-header {
           display: flex;
@@ -5167,34 +5755,53 @@ const STORAGE_KEY = 'biscotti_consent';
           gap: 10px;
           flex-wrap: wrap;
         }
-        .biscotti-btn {
-          padding: 12px 20px;
-          border-radius: var(--biscotti-btn-radius, 8px);
-          font-size: 14px;
-          font-weight: 600;
+        #biscotti-banner button, #biscotti-banner .biscotti-btn {
+          all: initial;
+          box-sizing: border-box;
+          font-family: inherit;
+        }
+        #biscotti-banner .biscotti-btn {
+          padding: 12px 20px !important;
+          border-radius: var(--biscotti-btn-radius, 8px) !important;
+          font-size: 14px !important;
+          font-weight: 600 !important;
+          font-family: var(--biscotti-font-family, -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif) !important;
+          line-height: 1.4 !important;
+          /* Center label horizontally + vertically; long/post-accept labels wrap
+             cleanly and stay centered while the button height auto-grows
+             (banner-button-label-centering bugfix). */
+          display: flex !important;
+          align-items: center !important;
+          justify-content: center !important;
+          text-align: center !important;
           cursor: pointer;
           transition: transform 0.2s, box-shadow 0.2s;
-          border: none;
+          border: none !important;
           flex: 1;
           min-width: 120px;
+          text-transform: none !important;
+          letter-spacing: normal !important;
+          box-shadow: none !important;
+          color: inherit !important;
+          background: transparent !important;
         }
-        .biscotti-btn:hover {
+        #biscotti-banner .biscotti-btn:hover {
           transform: translateY(-2px);
         }
-        .biscotti-btn-primary {
-          background: linear-gradient(135deg, var(--biscotti-primary-color) 0%, var(--biscotti-primary-dark) 100%);
-          color: #fff;
+        #biscotti-banner .biscotti-btn-primary {
+          background: linear-gradient(135deg, var(--biscotti-primary-color) 0%, var(--biscotti-primary-dark) 100%) !important;
+          color: #fff !important;
         }
-        .biscotti-btn-primary:hover {
-          box-shadow: 0 4px 12px rgba(var(--biscotti-primary-rgb, 212, 165, 116), 0.4);
+        #biscotti-banner .biscotti-btn-primary:hover {
+          box-shadow: 0 4px 12px rgba(var(--biscotti-primary-rgb, 212, 165, 116), 0.4) !important;
         }
-        .biscotti-btn-secondary {
-          background: transparent;
-          color: var(--biscotti-text-color, #333);
-          border: 2px solid var(--biscotti-primary-color, #9B6B3C);
+        #biscotti-banner .biscotti-btn-secondary {
+          background: transparent !important;
+          color: var(--biscotti-text-color, #333) !important;
+          border: 2px solid var(--biscotti-primary-color, #9B6B3C) !important;
         }
-        .biscotti-btn-secondary:hover {
-          background: rgba(212, 165, 116, 0.1);
+        #biscotti-banner .biscotti-btn-secondary:hover {
+          background: rgba(212, 165, 116, 0.1) !important;
         }
         
         /* ===== ETHICAL UI MODE (DSA Compliance) ===== */
@@ -5613,6 +6220,32 @@ const STORAGE_KEY = 'biscotti_consent';
             flex: 1 1 100% !important;
           }
         }
+        ${isCompact ? `
+        /* Compact Banner Mode: emitted AFTER the existing mobile media-query blocks,
+           scoped to .biscotti-compact-mode, and using !important so these rules beat
+           the existing !important width rules on #biscotti-banner. */
+        @media (max-width: 480px) {
+          #biscotti-banner.biscotti-compact-mode {
+            max-width: calc(100vw - 32px) !important;
+            left: 16px !important;
+            right: 16px !important;
+          }
+          #biscotti-banner.biscotti-compact-mode .biscotti-banner-text {
+            font-size: 14px;
+          }
+          #biscotti-banner.biscotti-compact-mode .biscotti-btn {
+            min-height: 44px;
+            min-width: 44px;
+          }
+          #biscotti-banner.biscotti-compact-mode .biscotti-banner-buttons {
+            gap: 8px;
+          }
+        }
+        #biscotti-banner.biscotti-compact-mode :focus-visible {
+          outline: 3px solid var(--biscotti-primary-color);
+          outline-offset: 2px;
+        }
+        ` : ''}
       `;
       document.head.appendChild(style);
 
@@ -5646,6 +6279,12 @@ const STORAGE_KEY = 'biscotti_consent';
         }
       }
 
+      // Compute the display decision once from the same theme source createStyles uses,
+      // and store it so _initAccessibility() (called on both show paths) can read it.
+      const displayTheme = this.engine?.config?.theme || (this.engine?.config?.banner ? this.engine.config.banner.theme : {}) || {};
+      const decision = resolveDisplayConfig(displayTheme, this.engine?.config?.tcfEnabled);
+      this._displayDecision = decision;
+
       if (this.container) {
         // Re-render banner HTML to pick up state changes (e.g. Withdraw All button after Accept All)
         this._listenersAttached = false; // Reset so event listeners are re-attached
@@ -5653,8 +6292,12 @@ const STORAGE_KEY = 'biscotti_consent';
         this._renderConsentIdElement(); // Update consent ID element (inside banner container)
         this._attachEventListeners();
         this._injectTestBadge();
+        this.container.style.display = ''; // Reset display:none from hide()
         this.container.classList.add('visible');
-        document.getElementById('biscotti-banner-overlay')?.classList.add('visible');
+        // Compact mode keeps the overlay element inert (no .visible class); modal shows it.
+        if (decision.overlay === true) {
+          document.getElementById('biscotti-banner-overlay')?.classList.add('visible');
+        }
         // Show consent ID element
         const consentIdEl = this.container.querySelector('#biscotti-consent-id-standalone');
         if (consentIdEl) consentIdEl.style.display = 'block';
@@ -5678,8 +6321,13 @@ const STORAGE_KEY = 'biscotti_consent';
       // Banner container
       this.container = document.createElement('div');
       this.container.id = 'biscotti-banner';
-      this.container.setAttribute('role', 'dialog');
-      this.container.setAttribute('aria-modal', 'true');
+      this.container.setAttribute('role', decision.role);
+      this.container.setAttribute('aria-modal', String(decision.ariaModal));
+      // SEO: exclude the consent banner text from search-engine snippets.
+      // The banner renders on every page, so search crawlers would otherwise
+      // treat its text as duplicate content (e.g. Seobility false positives).
+      // data-nosnippet is a valid attribute on div/span/section per Google.
+      this.container.setAttribute('data-nosnippet', '');
       this.container.setAttribute('aria-labelledby', 'biscotti-title');
       this.container.setAttribute('aria-describedby', 'biscotti-description');
 
@@ -5704,10 +6352,20 @@ const STORAGE_KEY = 'biscotti_consent';
         this.container.classList.add('biscotti-tcf-mode');
       }
       
-      // Bar mode: horizontal layout
-      const bannerPosition = this.engine?.config?.theme?.position || 'bottom-center';
-      if (bannerPosition.includes('bar')) {
+      // Bar mode: horizontal layout.
+      // Layout (bar) vs displayMode precedence (task 3.2): compact wins. When the
+      // resolved decision mode is 'compact', do NOT add biscotti-bar-mode — compact
+      // corner geometry (decision.corner + decision.maxWidthPx from createStyles)
+      // takes precedence and bar width/geometry is ignored. biscotti-bar-mode is
+      // only applied when the decision resolves to modal mode.
+      const bannerLayout = this.engine?.config?.theme?.layout || 'box';
+      if (bannerLayout === 'bar' && decision.mode === 'modal') {
         this.container.classList.add('biscotti-bar-mode');
+      }
+
+      // Compact mode: apply the compact CSS scope hook (task 3.2 governs bar-vs-compact precedence)
+      if (decision.mode === 'compact') {
+        this.container.classList.add('biscotti-compact-mode');
       }
       
       this.container.innerHTML = this._renderBanner();
@@ -5723,7 +6381,10 @@ const STORAGE_KEY = 'biscotti_consent';
 
       // Show with animation
       requestAnimationFrame(() => {
-        overlay.classList.add('visible');
+        // Compact mode keeps the overlay element inert (no .visible class); modal shows it.
+        if (decision.overlay === true) {
+          overlay.classList.add('visible');
+        }
         this.container.classList.add('visible');
       });
 
@@ -5739,9 +6400,19 @@ const STORAGE_KEY = 'biscotti_consent';
     _initAccessibility() {
       if (!this.container) return;
 
+      // Read the display decision computed in show(); fall back to resolving it from the
+      // same theme source if unset (defensive — both show paths set this._displayDecision).
+      const decision = this._displayDecision || resolveDisplayConfig(
+        this.engine?.config?.theme || (this.engine?.config?.banner ? this.engine.config.banner.theme : {}) || {},
+        this.engine?.config?.tcfEnabled
+      );
+
       // AriaManager: manage sibling hiding and toggle semantics
       this._ariaManager = new AriaManager(this.container);
-      this._ariaManager.hideSiblings();
+      // Modal-only: compact mode keeps the rest of the page interactive, so siblings stay visible.
+      if (decision.mode === 'modal') {
+        this._ariaManager.hideSiblings();
+      }
 
       // Set language and direction attributes via AriaManager
       const isRtl = A11Y_RTL_LANGS.includes(this.language);
@@ -5777,20 +6448,29 @@ const STORAGE_KEY = 'biscotti_consent';
         this._liveAnnouncer = new LiveRegionAnnouncer();
       }
 
+      // Compact mode: announce the banner on show via the guarded wrapper so assistive
+      // tech is notified without a focus trap or modal semantics.
+      if (decision.mode === 'compact') {
+        this.announceStatus(this.t('banner.title'));
+      }
+
       // ReducedMotionHandler: suppress animations if user prefers
       this._reducedMotionHandler.watch(this.container);
 
       // Inject TargetSizeEnforcer CSS
       this._injectTargetSizeStyles();
 
-      // FocusTrapManager: trap focus within the banner dialog
-      this._focusTrap = new FocusTrapManager(this.container, {
-        onEscape: () => {
-          this.engine.acceptEssential();
-          this.hide();
-        }
-      });
-      this._focusTrap.activate();
+      // FocusTrapManager: trap focus within the banner dialog (modal-only).
+      // Compact mode does not trap focus — Tab/Shift+Tab flow into and out of the page.
+      if (decision.focusTrap === true) {
+        this._focusTrap = new FocusTrapManager(this.container, {
+          onEscape: () => {
+            this.engine.acceptEssential();
+            this.hide();
+          }
+        });
+        this._focusTrap.activate();
+      }
     }
 
     /**
@@ -5964,7 +6644,12 @@ const STORAGE_KEY = 'biscotti_consent';
       const timeStr = now.toLocaleTimeString(this.language || 'en', { hour: '2-digit', minute: '2-digit', hour12: false });
       const tzAbbr = now.toLocaleTimeString(this.language || 'en', { timeZoneName: 'short' }).split(' ').pop();
       const apiBase = this.engine?.config?.apiEndpoint?.replace('/api/v1', '') || 'https://app.biscotti-cmp.com';
-      const lookupUrl = `${apiBase}/consent/lookup?id=${encodeURIComponent(consentId)}&lang=${this.language || 'en'}`;
+      // Use agency CNAME domain for lookup link if available (white-label support)
+      const bannerBranding = this.engine?.config?.banner?.branding;
+      const lookupBase = bannerBranding?.lookupDomain
+        ? `https://${bannerBranding.lookupDomain}`
+        : apiBase;
+      const lookupUrl = `${lookupBase}/consent/lookup?id=${encodeURIComponent(consentId)}&lang=${this.language || 'en'}`;
 
       // CMP Storage Disclosure — Layer 1 (IAB TCF Policy Appendix B, C(d)(VII))
       const cmpCookieName = typeof COOKIE_NAME !== 'undefined' ? COOKIE_NAME : 'biscotti_consent';
@@ -6020,7 +6705,21 @@ const STORAGE_KEY = 'biscotti_consent';
     hide() {
       if (this.container) {
         this.container.classList.remove('visible');
-        document.getElementById('biscotti-banner-overlay')?.classList.remove('visible');
+        const overlay = document.getElementById('biscotti-banner-overlay');
+        if (overlay) {
+          overlay.classList.remove('visible');
+          // Immediately disable pointer events so overlay cannot block interaction during fade-out
+          overlay.style.pointerEvents = 'none';
+          // Remove overlay from DOM after transition completes to prevent any lingering interaction
+          setTimeout(() => {
+            if (overlay && !overlay.classList.contains('visible')) {
+              overlay.remove();
+            }
+          }, 350);
+        }
+        // Force display:none on banner container to guarantee it's hidden
+        // regardless of host page CSS interference (e.g. marketing site specificity conflicts)
+        this.container.style.display = 'none';
         // Hide consent ID element when banner is hidden
         const consentIdEl = this.container.querySelector('#biscotti-consent-id-standalone');
         if (consentIdEl) consentIdEl.style.display = 'none';
@@ -6076,6 +6775,12 @@ const STORAGE_KEY = 'biscotti_consent';
     }
 
     _renderBanner() {
+      // Track the TCF-state this render reflects, so configReady can detect when an
+      // already-painted banner (e.g. a generic fallback shown on a slow first visit
+      // before config arrived) no longer matches the loaded config and must be
+      // fully re-rendered to swap the initial layer (generic <p> <-> TCF disclosure).
+      this._renderedTcfEnabled = !!this.engine?.config?.tcfEnabled;
+
       // Get Consent ID to display (visitorToken is used as unique consent identifier)
       const consentId = this.engine._getVisitorToken ? this.engine._getVisitorToken() : 
                         (CrossDomainAPI.visitorToken || localStorage.getItem('biscotti_visitor_token') || 'N/A');
@@ -6115,8 +6820,12 @@ const STORAGE_KEY = 'biscotti_consent';
 
       // Legal links (Datenschutzerklärung / Impressum) — localized for all 39 languages
       const legalLinksHtml = (() => {
-        const privacyUrl = this.engine?.config?.privacyUrl;
-        const imprintUrl = this.engine?.config?.imprintUrl;
+        // Resolve language-specific URLs from allLocalizedTexts (source of truth for i18n URLs)
+        // Falls back to top-level config URLs if no localized version exists
+        const allTexts = this.engine?.config?.banner?.allLocalizedTexts;
+        const langTexts = allTexts ? (allTexts[this.language] || {}) : {};
+        const privacyUrl = langTexts.privacyUrl || this.engine?.config?.privacyUrl;
+        const imprintUrl = langTexts.imprintUrl || this.engine?.config?.imprintUrl;
         if (!privacyUrl && !imprintUrl) return '';
         // Impressum label localized per language
         const imprintLabels = { de: 'Impressum', en: 'Legal Notice', fr: 'Mentions légales', es: 'Aviso legal', it: 'Note legali', nl: 'Colofon', pl: 'Nota prawna', pt: 'Aviso legal', da: 'Juridisk meddelelse', ar: 'إشعار قانوني', bg: 'Правна информация', bs: 'Pravna napomena', ca: 'Avís legal', cs: 'Právní upozornění', el: 'Νομική σημείωση', eu: 'Lege-oharra', fi: 'Oikeudellinen huomautus', gl: 'Aviso legal', he: 'הודעה משפטית', hi: 'कानूनी सूचना', hr: 'Pravna napomena', hu: 'Jogi közlemény', id: 'Pemberitahuan hukum', ja: '法的通知', lt: 'Teisinė informacija', mr: 'कायदेशीर सूचना', nb: 'Juridisk merknad', ro: 'Notă juridică', ru: 'Правовая информация', sk: 'Právne upozornenie', sl: 'Pravno obvestilo', sr: 'Правно обавештење', sv: 'Juridisk information', th: 'ประกาศทางกฎหมาย', tr: 'Yasal bildirim', uk: 'Правова інформація', vi: 'Thông báo pháp lý', zh: '法律声明', 'zh-TW': '法律聲明' };
@@ -6365,6 +7074,15 @@ const STORAGE_KEY = 'biscotti_consent';
         }
       }
       
+      // Anti-flash: until the API config has loaded we do NOT know the plan or the
+      // white-label branding. Render an EMPTY branding slot rather than the default
+      // "Made by Campcruisers" — otherwise a white-label site flashes competitor
+      // branding before its own logo arrives (and the reveal-gate failsafe could
+      // surface exactly that frame). Once configLoaded is true this falls through to
+      // the correct plan-based branding below.
+      if (!this.engine?.configLoaded) {
+        return '';
+      }
       return `
         <div class="biscotti-branding">
           Biscotti-CMP. Made by <a href="https://www.campcruisers.com" target="_blank" rel="noopener">Campcruisers</a>
@@ -7057,11 +7775,19 @@ const STORAGE_KEY = 'biscotti_consent';
     }
 
     _attachEventListeners() {
-      // Prevent duplicate listeners - only attach once to container
-      if (this._listenersAttached) return;
+      // Delegated listeners are bound to the persistent container NODE and MUST be
+      // attached exactly once per node. innerHTML re-renders keep the same container
+      // node, so re-running this method must NOT stack duplicate delegated listeners:
+      // a duplicate set fires `change` twice per click, flipping a toggle back to its
+      // original state. That previously made the consent toggles in the "Other Partners"
+      // tab impossible to switch on (off → on → off in a single click).
+      // The element-level listeners further below target freshly-rendered child nodes
+      // and are intentionally (re)bound on every call.
+      const delegatedAlreadyBound = this.container._biscottiDelegatedBound === true;
+      this.container._biscottiDelegatedBound = true;
       this._listenersAttached = true;
-      
-      this.container.addEventListener('click', (e) => {
+
+      if (!delegatedAlreadyBound) this.container.addEventListener('click', (e) => {
         const actionEl = e.target.closest('[data-action]');
         const action = actionEl ? actionEl.dataset.action : null;
         if (!action) return;
@@ -7222,9 +7948,10 @@ const STORAGE_KEY = 'biscotti_consent';
 
       // ============================================================
       // TCF Tab switching + vendor search + toggle events
-      // Uses event delegation so it works even after re-renders
+      // Uses event delegation so it works even after re-renders.
+      // Bound once per container node (see delegatedAlreadyBound guard above).
       // ============================================================
-      this.container.addEventListener('click', (e) => {
+      if (!delegatedAlreadyBound) this.container.addEventListener('click', (e) => {
         const tab = e.target.closest('.biscotti-tcf-tab');
         if (tab) {
           const tabName = tab.dataset.tcfTab;
@@ -7247,7 +7974,7 @@ const STORAGE_KEY = 'biscotti_consent';
       });
 
       // Vendor search (delegated via MutationObserver to catch dynamically added search inputs)
-      this.container.addEventListener('input', (e) => {
+      if (!delegatedAlreadyBound) this.container.addEventListener('input', (e) => {
         if (e.target.id === 'tcf-vendor-search') {
           const q = e.target.value.toLowerCase();
           this.container.querySelectorAll('#tcf-vendor-list .biscotti-provider-item').forEach(item => {
@@ -7257,8 +7984,23 @@ const STORAGE_KEY = 'biscotti_consent';
         }
       });
 
+      // Click handler for checkbox-based toggles (TCF, non-IAB, service toggles).
+      // These toggles use a hidden <input type="checkbox"> inside a <div class="biscotti-toggle">.
+      // Clicking the visible slider (span) does NOT natively toggle the checkbox because it's not a <label>.
+      // We use CAPTURE phase because the inline onclick="event.stopPropagation()" on the toggle div
+      // prevents the event from bubbling up to the container in the normal bubble phase.
+      if (!delegatedAlreadyBound) this.container.addEventListener('click', (e) => {
+        const toggle = e.target.closest('.biscotti-toggle:not([role="switch"])');
+        if (!toggle) return;
+        const cb = toggle.querySelector('input[type="checkbox"]');
+        if (!cb || cb.disabled) return;
+        if (e.target === cb) return;
+        cb.checked = !cb.checked;
+        cb.dispatchEvent(new Event('change', { bubbles: true }));
+      }, true);
+
       // TCF toggle changes (delegated)
-      this.container.addEventListener('change', (e) => {
+      if (!delegatedAlreadyBound) this.container.addEventListener('change', (e) => {
         const target = e.target;
         if (target.dataset.tcfPurposeConsent) {
           if (!this.tcfPurposeConsents) this.tcfPurposeConsents = {};
@@ -7494,6 +8236,10 @@ const STORAGE_KEY = 'biscotti_consent';
       } else {
         this.settingsOpen = !this.settingsOpen;
       }
+      // Null guard: if panel doesn't exist yet (e.g. GVL not loaded), don't throw
+      if (!panel) {
+        return;
+      }
       panel.classList.toggle('open', this.settingsOpen);
 
       // Update aria-expanded on settings toggle link
@@ -7501,6 +8247,37 @@ const STORAGE_KEY = 'biscotti_consent';
       if (settingsLink) {
         settingsLink.setAttribute('aria-expanded', String(this.settingsOpen));
       }
+    }
+
+    /**
+     * Backfill TCF content into an already-open settings panel.
+     * Called when GVL data arrives after the settings panel was opened.
+     * Progressive enhancement: re-renders categories with TCF tabs if panel is open and TCF section is empty.
+     */
+    _backfillTcfContent() {
+      if (!this.settingsOpen) return;
+      const panel = document.getElementById('biscotti-settings');
+      if (!panel) return;
+      // Check if TCF content is already present
+      const hasTcfContent = panel.querySelector('[data-tcf-tab]');
+      if (hasTcfContent) return;
+      // Re-render categories with now-available TCF data
+      const categoriesHtml = this._renderCategories();
+      const saveRow = panel.querySelector('.biscotti-save-row');
+      if (saveRow) {
+        // Replace everything before the save row
+        const saveRowHtml = saveRow.outerHTML;
+        panel.innerHTML = categoriesHtml + saveRowHtml;
+      } else {
+        panel.innerHTML = categoriesHtml + `<div class="biscotti-save-row">
+            <button class="biscotti-btn biscotti-btn-primary" style="width:100%" data-action="save">
+              ${this.t('banner.save')}
+            </button>
+          </div>`;
+      }
+      // Re-attach event listeners since we replaced innerHTML
+      this._listenersAttached = false;
+      this._attachEventListeners();
     }
 
     _saveSelection() {
@@ -7603,6 +8380,17 @@ const STORAGE_KEY = 'biscotti_consent';
     shouldBlock(src, content) {
       if (!src && !content) return false;
 
+      // Honor the runtime per-page allowlist used by placeholder "Load once"
+      // actions (e.g. Wistia): scripts for a deliberately user-loaded embed must
+      // not be re-neutralised by this observer. Mirrors the Shield's allowlist.
+      try {
+        const allowOnce = (typeof window !== 'undefined') && window.__biscottiShieldAllow;
+        if (src && Array.isArray(allowOnce)) {
+          const s = src.toLowerCase();
+          if (allowOnce.some(d => d && s.indexOf(d) !== -1)) return false;
+        }
+      } catch (e) { /* ignore */ }
+
       const textToCheck = (src || '') + (content || '');
       const textLower = textToCheck.toLowerCase();
 
@@ -7704,7 +8492,17 @@ const STORAGE_KEY = 'biscotti_consent';
       );
 
       toUnblock.forEach(item => {
-        this.reloadScript(item.element, item.originalType);
+        // Fault isolation: a single tracker whose inline code throws when it
+        // executes (e.g. reassigning the Shield-frozen XMLHttpRequest.prototype.open)
+        // must NOT abort the whole unblock pass. Without this guard the throw
+        // propagates out of forEach and every tag ordered AFTER the offender
+        // silently never reloads — observed as the Meta Pixel never firing on
+        // Shield + pre-blocked (type="text/plain") sites even after Accept-All.
+        try {
+          this.reloadScript(item.element, item.originalType);
+        } catch (e) {
+          try { console.warn('[Biscotti] reloadScript failed for a tag, continuing with the rest:', e && e.message); } catch (_) {}
+        }
       });
 
       // Remove unblocked from list
@@ -7725,7 +8523,13 @@ const STORAGE_KEY = 'biscotti_consent';
       });
 
       toUnblock.forEach(item => {
-        this.reloadScript(item.element, item.originalType);
+        // Fault isolation (see unblockScripts): never let one throwing tag abort
+        // the rest of the provider-aware unblock pass.
+        try {
+          this.reloadScript(item.element, item.originalType);
+        } catch (e) {
+          try { console.warn('[Biscotti] reloadScript failed for a tag, continuing with the rest:', e && e.message); } catch (_) {}
+        }
       });
 
       // Remove unblocked from list
@@ -7800,8 +8604,54 @@ const STORAGE_KEY = 'biscotti_consent';
 
     // Block existing scripts in DOM
     blockExistingScripts() {
+      // Integrate scripts that were pre-blocked by the early-blocking IIFE.
+      // The IIFE set type="text/plain", data-biscotti-blocked="true",
+      // data-biscotti-category and data-biscotti-original-type. They are skipped by
+      // the queries below (which exclude data-biscotti-blocked), so register them
+      // here for proper unblocking when consent is later granted.
+      document.querySelectorAll('script[data-biscotti-blocked="true"]').forEach(script => {
+        if (this.blockedScripts.some(item => item.element === script)) return; // avoid duplicates
+        const src = script.getAttribute('src') || '';
+        const category = script.getAttribute('data-biscotti-category') || this.getCategoryForScript(src, '');
+        const originalType = script.getAttribute('data-biscotti-original-type') || 'text/javascript';
+        this.blockedScripts.push({
+          element: script,
+          src: src,
+          category: category,
+          providerId: null,
+          originalType: originalType
+        });
+      });
+
       const scripts = document.querySelectorAll('script:not([data-biscotti-blocked])');
       scripts.forEach(script => this.blockScript(script));
+
+      // Secondary query: register manually pre-blocked scripts
+      // These are scripts where the user/integration already set type="text/plain"
+      // and added data-biscotti-category to indicate which consent category controls them.
+      // We do NOT call blockScript() on these (they're already type="text/plain"),
+      // but we register them in blockedScripts so they get unblocked after consent.
+      const preBlocked = document.querySelectorAll(
+        'script[type="text/plain"][data-biscotti-category]:not([data-biscotti-blocked])'
+      );
+      preBlocked.forEach(script => {
+        const category = script.getAttribute('data-biscotti-category');
+        const src = script.getAttribute('src') || '';
+
+        // Mark as processed to prevent re-processing
+        script.setAttribute('data-biscotti-blocked', 'true');
+
+        // Register in blockedScripts with text/javascript as the restore type
+        // (the user set type="text/plain" to prevent execution; after consent we
+        // restore to text/javascript so the browser executes it)
+        this.blockedScripts.push({
+          element: script,
+          src: src,
+          category: category,
+          providerId: null,
+          originalType: 'text/javascript'
+        });
+      });
     }
   }
 
@@ -7828,6 +8678,38 @@ const STORAGE_KEY = 'biscotti_consent';
         consentModeAdvanced: config.consentModeAdvanced === true,
       };
 
+      // First-paint optimization (banner-flash fix): seed tcfEnabled from the
+      // LAST SERVER RESPONSE cached in localStorage, so the very first banner
+      // paint already uses the correct layout (IAB vs. generic) instead of
+      // flashing the non-TCF fallback before the async config arrives — and so
+      // the graceful-degradation (.catch) path renders the IAB banner on a
+      // failed/slow config instead of the generic one.
+      // This trusts OUR OWN server's prior answer (not the WP-plugin config),
+      // is bounded by a 30-day TTL, and is always overridden by the fresh
+      // server value once _loadConfigFromAPI resolves.
+      try {
+        const _cfgKey = 'biscotti_cfg_' + (this.config.websiteId || (typeof window !== 'undefined' ? window.location.hostname : ''));
+        const _cachedRaw = (typeof localStorage !== 'undefined') ? localStorage.getItem(_cfgKey) : null;
+        if (_cachedRaw) {
+          const _cached = JSON.parse(_cachedRaw);
+          const _fresh = _cached && _cached.ts && (Date.now() - _cached.ts) < 30 * 24 * 60 * 60 * 1000;
+          if (_fresh && typeof _cached.tcfEnabled === 'boolean') {
+            this.config.tcfEnabled = _cached.tcfEnabled;
+            this._tcfEnabledSeededFromCache = true;
+          }
+          // Seed the banner primary color from the last server response so the very
+          // first paint uses the correct color (anti recolor-flash). The authoritative
+          // value from _applyTheme overrides this once /config resolves.
+          if (_fresh && _cached.primaryColor && typeof _cached.primaryColor === 'string'
+              && typeof document !== 'undefined' && document.documentElement) {
+            try {
+              document.documentElement.style.setProperty('--biscotti-primary-color', _cached.primaryColor);
+              document.documentElement.style.setProperty('--biscotti-primary', _cached.primaryColor);
+            } catch (e) { /* ignore */ }
+          }
+        }
+      } catch (e) { /* cache read is best-effort; ignore */ }
+
       this.consentState = new ConsentState();
       
       this.tcfApi = null;
@@ -7835,9 +8717,9 @@ const STORAGE_KEY = 'biscotti_consent';
       
       this.blockingEngine = new BlockingEngine(this.config.blockPatterns);
       this.iframeBlockingEngine = new IframeBlockingEngine();
+      this.eventListeners = {};
       this.floatingButton = new FloatingSettingsButton(() => this.showBanner(), this.config);
       this.bannerUI = new BannerUI(this);
-      this.eventListeners = {};
       this.initialized = false;
       this.gpcApplied = false;
 
@@ -8203,6 +9085,18 @@ const STORAGE_KEY = 'biscotti_consent';
           if (data.tcfEnabled !== undefined) {
             this.config.tcfEnabled = data.tcfEnabled;
             this._log('TCF enabled override from server:', data.tcfEnabled);
+            // Persist the authoritative server value for the first-paint
+            // optimization on subsequent loads (see constructor cache-seed).
+            try {
+              const _cfgKey = 'biscotti_cfg_' + (this.config.websiteId || window.location.hostname);
+              // Also cache the resolved primary color so the FIRST paint on the next
+              // visit uses the correct banner color (prevents the default-brown ->
+              // brand-color recolor when /config is slow). The logo is intentionally
+              // NOT cached (data-URI logos are too large for localStorage).
+              const _pc = (data.banner && data.banner.branding && data.banner.branding.primaryColor)
+                || (data.banner && data.banner.theme && data.banner.theme.primaryColor) || null;
+              localStorage.setItem(_cfgKey, JSON.stringify({ tcfEnabled: this.config.tcfEnabled, primaryColor: _pc, ts: Date.now() }));
+            } catch (e) { /* cache write is best-effort; ignore */ }
           }
           
           // If TCF is enabled, also fetch the official GVL in parallel
@@ -8228,31 +9122,28 @@ const STORAGE_KEY = 'biscotti_consent';
                 const allGvlVendors = Object.values(gvl.vendors || {});
                 const websiteServices = this.config.services || data.services || [];
                 
-                // Build set of active GVL vendor IDs from website services
+                // Build set of active GVL vendor IDs from website services.
+                //
+                // IAB TCF 2.3 — SINGLE SOURCE OF TRUTH: a vendor is only disclosed/
+                // consented when the server has an AUTHORITATIVE, deterministic mapping
+                // (Service → ServiceModule.gvlVendorId). We do NOT fuzzy-match service
+                // names against GVL vendor names: that heuristic both over-declared and
+                // mis-declared vendors (e.g. "Microsoft Clarity", which is not in the GVL,
+                // matched GVL #1126 "Microsoft Advertising" on the first word). A non-
+                // deterministic, unauditable vendor set in the disclosedVendors segment of
+                // the TC string is an IAB certification Critical Fail, and it made the
+                // partner tabs disagree with the first-layer disclosure text.
+                //
+                // The authoritative gvlVendorId is also validated against the loaded GVL,
+                // so a stale/invalid id is never disclosed.
                 this.config.activeVendorIds = new Set();
                 const gvlVendorMap = gvl.vendors || {};
-                
+
                 for (const svc of websiteServices) {
-                  // Method A: Explicit gvlVendorId mapping (most reliable)
-                  if (svc.gvlVendorId) {
-                    this.config.activeVendorIds.add(parseInt(svc.gvlVendorId));
-                    continue;
-                  }
-                  // Method B: Name-based matching against GVL vendor names
-                  const svcName = (svc.name || '').toLowerCase().trim();
-                  if (!svcName || svcName.length < 3) continue;
-                  
-                  for (const [vid, v] of Object.entries(gvlVendorMap)) {
-                    if (!v.name) continue;
-                    const gvlName = v.name.toLowerCase();
-                    // Match if service name contains vendor name or vice versa
-                    // e.g. "Google Analytics" matches GVL vendor "Google Advertising Products"
-                    if (gvlName.includes(svcName) || svcName.includes(gvlName) ||
-                        // Also match on first significant word (e.g. "Hotjar" → "Hotjar Ltd")
-                        (svcName.split(/\s+/)[0].length >= 4 && gvlName.startsWith(svcName.split(/\s+/)[0]))) {
-                      this.config.activeVendorIds.add(parseInt(vid));
-                      break;
-                    }
+                  if (svc.gvlVendorId == null) continue;
+                  const vid = parseInt(svc.gvlVendorId, 10);
+                  if (Number.isInteger(vid) && gvlVendorMap[vid]) {
+                    this.config.activeVendorIds.add(vid);
                   }
                 }
                 
@@ -8318,6 +9209,14 @@ const STORAGE_KEY = 'biscotti_consent';
               this.blockingEngine.addCustomPatterns(customServices);
               this.iframeBlockingEngine.addCustomPatterns(customServices);
               this._log('Custom service patterns registered:', customServices.length, 'services');
+
+              // Re-sweep DOM after custom pattern registration to catch scripts
+              // that were already in the DOM when blockExistingScripts() ran during _init().
+              // This is idempotent: blockExistingScripts uses script:not([data-biscotti-blocked])
+              // so already-blocked scripts are skipped automatically.
+              this.blockingEngine.blockExistingScripts();
+              this.iframeBlockingEngine.blockExistingIframes(this.consentState);
+              this._log('Re-sweeping DOM after custom pattern registration:', customServices.length, 'services');
             }
 
             // Store all custom services (including those without blocking patterns) for embed-code handler
@@ -8384,10 +9283,26 @@ const STORAGE_KEY = 'biscotti_consent';
             this.config.categories = data.categories;
           }
           
+          // ── Operator jurisdiction is the SOURCE OF TRUTH for the consent model ──
+          // Resolved server-side from the website's targetRegion (the operator's own
+          // jurisdiction), NOT the visitor's GeoIP. A Texas seller follows Texas law
+          // (opt-out) for every visitor; an EU seller follows GDPR (opt-in) for every
+          // visitor. Wired HERE — after the TCF-GVL decision above, which relies on
+          // this.jurisdiction still being null — so the banner buttons
+          // (_renderConsentButtons) and the consent behaviour below reflect the
+          // operator's resolved model instead of defaulting to OPT_IN / GeoIP.
+          if (data.jurisdiction && data.jurisdiction.consentModel) {
+            this.jurisdiction = data.jurisdiction;
+          }
+
+          // Jurisdiction consent models that do NOT require prior consent: processing
+          // is allowed until the visitor opts out / acknowledges (US opt-out, notice,
+          // and no-requirement regimes). Everything else requires prior opt-in.
+          const NO_PRIOR_CONSENT_MODELS = ['OPT_OUT', 'NOTICE', 'NO_REQUIREMENT'];
+
           // Store compliance information
           if (data.compliance) {
             this.config.compliance = data.compliance;
-            this.config.consentMode = data.compliance.consentModel === 'opt_out' ? 'opt-out' : 'opt-in';
             this.config.legalBasis = data.legalBasis || 'consent';
             
             // Align frontend UI with regional backend compliance
@@ -8401,9 +9316,11 @@ const STORAGE_KEY = 'biscotti_consent';
               }
             }
             
-            // Determine if GPP is needed based on US frameworks or backend features
+            // Determine if GPP is needed: operator US jurisdiction (any US_* state or
+            // generic US) OR a GeoIP-detected US framework / backend gpp_support.
             const usFrameworks = ['ccpa', 'vcdpa', 'cpa', 'ctdpa', 'ucpa', 'tdpsa', 'ocpa', 'mcdpa', 'fdbr', 'tipa', 'dpdpa', 'icdpa', 'njdpa', 'nhdpl', 'kcdpa', 'ndpa', 'modpa', 'mcdpa_mn'];
-            const isUSState = (data.compliance.frameworks && data.compliance.frameworks.some(f => usFrameworks.includes(f))) || (data.compliance.features && data.compliance.features.includes('gpp_support'));
+            const operatorIsUS = typeof this.jurisdiction?.code === 'string' && this.jurisdiction.code.toUpperCase().startsWith('US');
+            const isUSState = operatorIsUS || (data.compliance.frameworks && data.compliance.frameworks.some(f => usFrameworks.includes(f))) || (data.compliance.features && data.compliance.features.includes('gpp_support'));
             
             // Auto-resolve gppEnabled if not explicitly configured
             if (this.config.gppEnabled === null) {
@@ -8414,20 +9331,31 @@ const STORAGE_KEY = 'biscotti_consent';
                 this.gppApi.update('DBABMA~', 'hidden', []);
               }
             }
-            
-            this._log('Compliance model loaded:', this.config.compliance.consentModel, 'Legal Basis:', this.config.legalBasis, 'GPP Enabled:', this.config.gppEnabled);
+          }
 
-            // OPT-OUT LOGIC: If we are in opt-out mode and user hasn't made a choice,
-            // we should pre-grant all categories and apply them immediately.
-            if (this.config.consentMode === 'opt-out' && !this.consentState.hasUserChoice()) {
-              this._log('Opt-out model detected: auto-granting consent until user opts out');
-              this.consentState.categories.functional = true;
-              this.consentState.categories.analytics = true;
-              this.consentState.categories.marketing = true;
-              // Do NOT set timestamp so it remains !hasUserChoice()
-              // Unblock immediately based on the granted state
-              this._applyConsent();
-            }
+          // ── Resolve effective consent MODE (opt-in vs opt-out behaviour) ──
+          // Operator jurisdiction first; GeoIP compliance only as a fallback when the
+          // server resolved no jurisdiction for this site.
+          const _operatorModel = this.jurisdiction?.consentModel || null;
+          if (_operatorModel) {
+            this.config.consentMode = NO_PRIOR_CONSENT_MODELS.includes(_operatorModel) ? 'opt-out' : 'opt-in';
+          } else if (data.compliance) {
+            this.config.consentMode = data.compliance.consentModel === 'opt_out' ? 'opt-out' : 'opt-in';
+          }
+          this._log('Consent model resolved:', this.config.consentMode,
+            '(operator jurisdiction:', _operatorModel || 'none',
+            ', GeoIP compliance:', this.config.compliance?.consentModel || 'none', ')');
+
+          // OPT-OUT / NOTICE: pre-grant all categories until the user opts out and
+          // unblock immediately (no prior consent required for this jurisdiction).
+          if (this.config.consentMode === 'opt-out' && !this.consentState.hasUserChoice()) {
+            this._log('Opt-out/notice model: auto-granting consent until user opts out');
+            this.consentState.categories.functional = true;
+            this.consentState.categories.analytics = true;
+            this.consentState.categories.marketing = true;
+            // Do NOT set timestamp so it remains !hasUserChoice()
+            // Unblock immediately based on the granted state
+            this._applyConsent();
           }
           if (data.tcfPurposes) {
             this.config.tcfPurposes = data.tcfPurposes;
@@ -8538,6 +9466,12 @@ const STORAGE_KEY = 'biscotti_consent';
               this.config.showFloatingButton = data.banner.theme.showFloatingButton;
             }
             this._applyTheme();
+          }
+          
+          // Merge banner.branding from API into config (WhiteLabel data)
+          if (data.banner?.branding) {
+            if (!this.config.banner) this.config.banner = {};
+            this.config.banner.branding = { ...(this.config.banner.branding || {}), ...data.banner.branding };
           }
           
           this._log('Config loaded from API:', data);
@@ -8681,6 +9615,23 @@ const STORAGE_KEY = 'biscotti_consent';
       // Flag to defer banner showing until API config loads
       this._deferredShowBanner = false;
 
+      // ANTI-FLASH FAILSAFE: the reveal-gate CSS keeps the banner invisible until
+      // data-biscotti-ready is set (normally once API branding+theme are applied in
+      // the _loadConfigFromAPI success/error handlers below). If /config is slow or
+      // never resolves, release the gate after a bounded delay so the consent banner
+      // ALWAYS appears (legal requirement). At that point branding is still unknown,
+      // so _renderBranding renders an empty slot — never the default Campcruisers
+      // brand on a white-label site.
+      try { setTimeout(() => this._markBannerReady(), 1500); } catch (e) { /* no-op */ }
+
+      // Shopify Customer Privacy API — register + default-deny as EARLY as possible.
+      // This is the ONLY supported lever to gate Shopify-MANAGED tracking surfaces
+      // (Web Pixels sandbox worker / server-side Customer Events), which the
+      // page-context Shield structurally cannot reach. Runs for the manual
+      // storefront snippet (which does NOT set config.platform) — we detect
+      // Shopify via window.Shopify, not a config flag.
+      this._registerShopifyCustomerPrivacy();
+
       // === Backward Compatibility: Config Normalization (Req 8.1-8.5) ===
       // Old WP plugin versions (≤ v2.9.5) may pass stale config values.
       // Normalize all new fields with safe defaults so no code path fails.
@@ -8703,7 +9654,16 @@ const STORAGE_KEY = 'biscotti_consent';
       if (this.config.gppEnabled !== false) {
         this._initGPP();
       }
-      
+
+      // Shopify Customer Privacy: registration is handled via
+      // _registerShopifyCustomerPrivacy() above (line ~8879). The legacy
+      // _initShopifyCustomerPrivacy() bridge is intentionally NOT called
+      // anymore — it duplicated registration AND attached a biscotti:consent
+      // listener that re-wrote setTrackingConsent on every event, racing with
+      // the direct write inside _applyConsent / _applyConsentWithProviders.
+      // Single write path: _syncShopifyConsentAndMaybeReload() (called from
+      // _applyConsent, _applyConsentWithProviders, and revokeConsent).
+
       // Load configuration from API (services, banner settings, etc.)
       // This runs asynchronously - banner will be shown AFTER config loads
       this._loadConfigFromAPI().then(() => {
@@ -8739,12 +9699,20 @@ const STORAGE_KEY = 'biscotti_consent';
 
         this.configLoaded = true;
         this._emit('configReady', this.config);
+        // Branding + theme are now applied from the API — release the reveal-gate so
+        // the banner fades in already correctly branded/colored (no flash).
+        this._markBannerReady();
         
         // Update floating button icon now that API config (with theme) is available
         // The button was created before the API fetch completed, so the icon defaulted to cookie
         const loadedTheme = this.config?.banner?.theme || this.config?.theme || {};
         if (loadedTheme.floatingButtonIcon && this.floatingButton) {
           this.floatingButton.setIcon(loadedTheme.floatingButtonIcon);
+        }
+        // Apply custom floating button background color from API theme (button may
+        // have been created with the default gradient before the API responded).
+        if (loadedTheme.floatingButtonColor && this.floatingButton) {
+          this.floatingButton.setColor(loadedTheme.floatingButtonColor);
         }
 
         // TCF 2.3: Ensure CmpApi is updated with GVL data after config loads.
@@ -8755,14 +9723,55 @@ const STORAGE_KEY = 'biscotti_consent';
         if (this.tcfApi && this.tcfApi.updateWithGVL && this.config.rawGvlJson) {
           this.tcfApi.updateWithGVL(this.config.rawGvlJson, this.config.activeVendorIds);
         }
+
+        // Cross-device consent sync (Enterprise feature)
+        this._userId = this._resolveUserId();
+        this._crossDeviceEnabled = true;
+        if (this._userId) {
+            this._crossDeviceSync().then(() => {
+                // After sync, check if we now have consent (banner may not be needed)
+                if (this.consentState.hasUserChoice() && this.bannerUI?.container) {
+                    this.bannerUI.hide();
+                }
+            });
+        }
         
         // After API loads, show banner if it was deferred
         if (this._deferredShowBanner && !this.consentState.hasUserChoice()) {
-          this.showBanner();
+          // Delay banner show to allow SPA frameworks (React, Next.js, Vue) to complete
+          // hydration first. Without this delay, the framework removes our banner
+          // during hydration because it detects a DOM mismatch.
+          setTimeout(() => {
+            if (!this.consentState.hasUserChoice() && !document.getElementById('biscotti-banner')) {
+              this.showBanner();
+            }
+          }, 300);
+          
+          // POST-HYDRATION RECOVERY: React/Next.js/Vue SSR frameworks may remove
+          // our banner during hydration (they detect DOM mismatch and re-render).
+          // Check after hydration completes (typically <1s) and re-show if removed.
+          const hydrationRecovery = () => {
+            if (!this.consentState.hasUserChoice() && !document.getElementById('biscotti-banner')) {
+              this._log('Post-hydration recovery: banner was removed by framework, re-showing');
+              if (this.bannerUI) {
+                this.bannerUI.container = null;
+                this.bannerUI._listenersAttached = false;
+              }
+              this.showBanner();
+            }
+          };
+          // Check at 500ms, 1500ms, 3000ms to cover various framework hydration timings
+          setTimeout(hydrationRecovery, 500);
+          setTimeout(hydrationRecovery, 1500);
+          setTimeout(hydrationRecovery, 3000);
         }
       }).catch(() => {
         this.configLoaded = true;
         this._emit('configReady', this.config);
+        // Config failed: release the gate so the banner STILL appears (compliance).
+        // configLoaded is now true but there is no branding data, so _renderBranding
+        // returns an empty slot — a white-label site never shows Campcruisers here.
+        this._markBannerReady();
         
         // Even on error, show banner if needed (graceful degradation)
         if (this._deferredShowBanner && !this.consentState.hasUserChoice()) {
@@ -8780,6 +9789,10 @@ const STORAGE_KEY = 'biscotti_consent';
 
       // Initialize cross-frame consent tunneling
       CrossFrameConsent.init();
+
+      // Initialize GTM template callback support
+      // (allows GTM Sandboxed JS templates to receive consent updates)
+      GtmCallbackSupport.init();
 
       // Check for Global Privacy Control (GPC) / Do Not Track
       if (GlobalPrivacyControl.isEnabled()) {
@@ -8818,6 +9831,14 @@ const STORAGE_KEY = 'biscotti_consent';
         this.blockingEngine.startObserving();
         this.iframeBlockingEngine.startObserving(this.consentState);
 
+        // Engine now owns the observers — disconnect the early-blocking IIFE observer
+        // so we don't run two observer sets in parallel. Must happen BEFORE the
+        // blockExisting* calls so they take over the pre-blocked elements cleanly.
+        if (window.__biscottiEarlyBlock && window.__biscottiEarlyBlock.active) {
+          window.__biscottiEarlyBlock.observer.disconnect();
+          window.__biscottiEarlyBlock.active = false;
+        }
+
         // _initTCF and _initGPP already called at the top of _init()
 
         // Block any scripts/iframes already in DOM
@@ -8826,8 +9847,18 @@ const STORAGE_KEY = 'biscotti_consent';
             if (!this.consentState.hasUserChoice()) {
               this.blockingEngine.blockExistingScripts();
               this.iframeBlockingEngine.blockExistingIframes(this.consentState);
+              this.iframeBlockingEngine.blockWistiaEmbeds(this.consentState);
               // Defer banner showing until API config loads
               this._deferredShowBanner = true;
+            } else {
+              // A prior consent choice exists. Register pre-blocked scripts AND
+              // block embeds that still lack consent so placeholders appear for
+              // rejected categories (e.g. marketing). block* methods no-op for
+              // granted categories; _applyConsent then unblocks the granted ones.
+              this.blockingEngine.blockExistingScripts();
+              this.iframeBlockingEngine.blockExistingIframes(this.consentState);
+              this.iframeBlockingEngine.blockWistiaEmbeds(this.consentState);
+              this._applyConsent();
             }
           });
         } else {
@@ -8835,8 +9866,18 @@ const STORAGE_KEY = 'biscotti_consent';
           if (!this.consentState.hasUserChoice()) {
             this.blockingEngine.blockExistingScripts();
             this.iframeBlockingEngine.blockExistingIframes(this.consentState);
+            this.iframeBlockingEngine.blockWistiaEmbeds(this.consentState);
             // Defer banner showing until API config loads
             this._deferredShowBanner = true;
+          } else {
+            // A prior consent choice exists. Register pre-blocked scripts AND
+            // block embeds that still lack consent so placeholders appear for
+            // rejected categories (e.g. marketing). block* methods no-op for
+            // granted categories; _applyConsent then unblocks the granted ones.
+            this.blockingEngine.blockExistingScripts();
+            this.iframeBlockingEngine.blockExistingIframes(this.consentState);
+            this.iframeBlockingEngine.blockWistiaEmbeds(this.consentState);
+            this._applyConsent();
           }
         }
       } else if (this.config.consentModeAdvanced) {
@@ -8866,9 +9907,137 @@ const STORAGE_KEY = 'biscotti_consent';
         this._retryFailedSyncs();
       }, 2000);
 
+      // ================================================================
+      // SPA NAVIGATION LIFECYCLE LISTENER
+      // Detects client-side navigations (Next.js, React Router, Vue Router, etc.)
+      // and re-shows banner/floating button if they were removed from DOM.
+      // ================================================================
+      this._initSpaNavigationListener();
+
       this.initialized = true;
       this._log('Initialized', this.config);
       this._log('GPC applied:', this.gpcApplied);
+    }
+
+    /**
+     * SPA Navigation Listener
+     * Monkey-patches history.pushState/replaceState and listens to popstate
+     * to detect client-side navigations. On navigation, checks if banner/floating
+     * button were removed from DOM and re-attaches them.
+     * Also uses a MutationObserver as fallback for frameworks that remove DOM
+     * elements without triggering pushState (e.g. React hydration, Vue transitions).
+     */
+    _initSpaNavigationListener() {
+      let lastUrl = window.location.href;
+      const self = this;
+
+      const onNavigation = () => {
+        const currentUrl = window.location.href;
+        if (currentUrl === lastUrl) return;
+        lastUrl = currentUrl;
+
+        // Debounce: SPAs may fire multiple pushState calls in quick succession
+        clearTimeout(self._spaNavDebounce);
+        self._spaNavDebounce = setTimeout(() => {
+          self._handleSpaNavigation();
+        }, 50);
+      };
+
+      // 1. Monkey-patch history.pushState
+      const origPushState = history.pushState;
+      history.pushState = function() {
+        origPushState.apply(this, arguments);
+        onNavigation();
+      };
+
+      // 2. Monkey-patch history.replaceState
+      const origReplaceState = history.replaceState;
+      history.replaceState = function() {
+        origReplaceState.apply(this, arguments);
+        onNavigation();
+      };
+
+      // 3. Listen to popstate (browser back/forward)
+      window.addEventListener('popstate', onNavigation);
+
+      // 4. MutationObserver fallback: detect when banner/floating button
+      //    are removed from DOM by the SPA framework (React hydration, etc.)
+      this._spaObserver = new MutationObserver((mutations) => {
+        for (const mutation of mutations) {
+          for (const removed of mutation.removedNodes) {
+            if (removed.nodeType !== 1) continue;
+            if (removed.id === 'biscotti-banner' || removed.id === 'biscotti-banner-overlay' ||
+                removed.id === 'biscotti-floating-btn' ||
+                (removed.querySelector && (removed.querySelector('#biscotti-banner') || removed.querySelector('#biscotti-floating-btn')))) {
+              // Banner or floating button was removed — schedule re-attach
+              // Do NOT clearTimeout — allow multiple recovery attempts
+              // (React may remove the banner multiple times during hydration)
+              if (!self._spaReattachScheduled) {
+                self._spaReattachScheduled = true;
+                setTimeout(() => {
+                  self._spaReattachScheduled = false;
+                  self._handleSpaNavigation();
+                }, 800);
+              }
+              return;
+            }
+          }
+        }
+      });
+      this._spaObserver.observe(document.documentElement, { childList: true, subtree: true });
+
+      // 5. Periodic DOM check (ultimate fallback for frameworks that defeat
+      //    both pushState interception and MutationObserver, e.g. React concurrent mode)
+      this._spaPollingInterval = setInterval(() => {
+        const bannerNeeded = !self.consentState.hasUserChoice();
+        const bannerPresent = !!document.getElementById('biscotti-banner');
+        const floatingNeeded = self.consentState.hasUserChoice() && self.config.showFloatingButton !== false;
+        const floatingPresent = !!document.getElementById('biscotti-floating-btn');
+
+        if (bannerNeeded && !bannerPresent) {
+          self._handleSpaNavigation();
+        } else if (floatingNeeded && !floatingPresent) {
+          self._handleSpaNavigation();
+        }
+      }, 2000);
+    }
+
+    /**
+     * Handle SPA navigation: re-attach banner/floating button if removed from DOM.
+     * Also re-detects language from the new URL/page.
+     */
+    _handleSpaNavigation() {
+      this._log('SPA navigation detected:', window.location.pathname);
+
+      const bannerInDom = document.getElementById('biscotti-banner');
+      const overlayInDom = document.getElementById('biscotti-banner-overlay');
+      const floatingInDom = document.getElementById('biscotti-floating-btn');
+
+      // If banner container reference exists but is detached from DOM or invalid, reset it
+      if (this.bannerUI && this.bannerUI.container) {
+        if (!document.body.contains(this.bannerUI.container) || this.bannerUI.container.id !== 'biscotti-banner') {
+          this.bannerUI.container = null;
+          this.bannerUI._listenersAttached = false;
+        }
+      }
+
+      // Re-show banner or floating button depending on consent state
+      if (!this.consentState.hasUserChoice()) {
+        // No consent yet — show banner
+        if (!bannerInDom) {
+          this.showBanner();
+        }
+      } else {
+        // User already consented — just ensure floating button is present
+        if (!floatingInDom && this.floatingButton && this.config.showFloatingButton !== false) {
+          this.floatingButton.show();
+        }
+      }
+
+      // Clean up orphaned overlay
+      if (!bannerInDom && overlayInDom) {
+        overlayInDom.remove();
+      }
     }
 
     /**
@@ -9022,6 +10191,18 @@ const STORAGE_KEY = 'biscotti_consent';
       }
     }
 
+    /**
+     * Anti-flash: release the reveal-gate by marking the banner ready. Until this
+     * runs, the CSS rule html:not([data-biscotti-ready]) #biscotti-banner.visible
+     * keeps the banner invisible, so it never paints with default/Campcruisers
+     * branding or the default color. Idempotent. Called from the post-config success
+     * path, the config-failure path, AND a bounded failsafe timer (so the banner
+     * ALWAYS appears even if /config hangs — legal requirement).
+     */
+    _markBannerReady() {
+      try { document.documentElement.setAttribute('data-biscotti-ready', '1'); } catch (e) { /* SSR/no-DOM */ }
+    }
+
     _applyTheme() {
       // Apply theme colors from config (local or from API)
       const theme = this.config.theme || {};
@@ -9057,6 +10238,23 @@ const STORAGE_KEY = 'biscotti_consent';
         document.documentElement.style.setProperty('--biscotti-text-color', textColor);
         // Also set lighter variant for secondary text
         document.documentElement.style.setProperty('--biscotti-text-muted', this._adjustOpacity(textColor, 0.7));
+      }
+
+      // Apply accent color from theme (not just from branding)
+      const accentColor = theme.accentColor;
+      if (accentColor) {
+        document.documentElement.style.setProperty('--biscotti-accent', accentColor);
+      }
+
+      // Apply borderRadius and buttonStyle from theme
+      const borderRadius = theme.borderRadius;
+      if (borderRadius != null) {
+        document.documentElement.style.setProperty('--biscotti-border-radius', borderRadius + 'px');
+        const buttonStyle = theme.buttonStyle || 'rounded';
+        let btnRadius = `${Math.max(borderRadius / 2, 4)}px`;
+        if (buttonStyle === 'pill') btnRadius = '999px';
+        else if (buttonStyle === 'square') btnRadius = '4px';
+        document.documentElement.style.setProperty('--biscotti-btn-radius', btnRadius);
       }
 
       // Apply font configuration from theme (fontConfig takes precedence over legacy fontFamily)
@@ -9102,10 +10300,12 @@ const STORAGE_KEY = 'biscotti_consent';
         document.documentElement.style.setProperty('--biscotti-font-size', fontSize + 'px');
       }
 
-      // White-label branding color overrides (take precedence over theme colors)
+      // White-label branding color overrides (ONLY if theme has no explicit colors set)
       const branding = this.config.banner?.branding;
       if (branding) {
-        if (branding.primaryColor) {
+        // Only apply branding primaryColor if the theme didn't set an explicit primary color
+        const themePrimary = theme.primaryColor || theme.buttonBg || theme.acceptBg;
+        if (branding.primaryColor && !themePrimary) {
           document.documentElement.style.setProperty('--biscotti-primary', branding.primaryColor);
           document.documentElement.style.setProperty('--biscotti-primary-color', branding.primaryColor);
           document.documentElement.style.setProperty('--biscotti-primary-hover', this._darkenColor(branding.primaryColor, 10));
@@ -9212,6 +10412,16 @@ const STORAGE_KEY = 'biscotti_consent';
       });
     }
 
+    // NOTE: The legacy `_initShopifyCustomerPrivacy()` method (no-op stub) and
+    // its previous implementation `_initShopifyCustomerPrivacy_LEGACY_DISABLED()`
+    // have been permanently removed (TASK 1 audit). Their former behaviour —
+    // attaching a `biscotti:consent` window listener that re-wrote
+    // setTrackingConsent on every event — produced duplicate async writes
+    // that raced with the direct writes in _applyConsent / _applyConsentWithProviders.
+    // The single Shopify write path is now `_syncShopifyConsentAndMaybeReload()`,
+    // invoked exclusively from _applyConsent, _applyConsentWithProviders,
+    // revokeConsent, and (deferred) from the Shopify CPA loadFeatures callback.
+
     _loadConsent() {
       // Try localStorage first, then cookie
       let data = Storage.getLocal(STORAGE_KEY);
@@ -9232,7 +10442,136 @@ const STORAGE_KEY = 'biscotti_consent';
       }
     }
 
+    _resolveUserId() {
+      // Priority 1: data-user-id attribute on script tag
+      const scriptTag = document.querySelector('script[data-website-id][data-user-id]')
+          || document.querySelector('script[src*="biscotti"][data-user-id]');
+      const attrValue = scriptTag?.getAttribute('data-user-id');
+
+      // Priority 2: window.BiscottiConfig.userId
+      const configValue = window.BiscottiConfig?.userId;
+
+      const userId = attrValue || configValue || null;
+      if (!userId) return null;
+
+      // Validate SHA-256 format: exactly 64 hex characters
+      if (!/^[a-f0-9]{64}$/i.test(userId)) {
+          console.warn('[Biscotti] Invalid userId: must be a SHA-256 hex string (64 chars). Falling back to localStorage-only.');
+          return null;
+      }
+
+      return userId;
+    }
+
+    async _crossDeviceSync() {
+      if (!this._userId) return;
+
+      const apiBase = this.config.apiEndpoint;
+      const websiteId = this.config.websiteId;
+      if (!apiBase || !websiteId) return;
+
+      try {
+          const controller = new AbortController();
+          const timeout = setTimeout(() => controller.abort(), 500);
+
+          const res = await fetch(
+              `${apiBase}/consent/cross-device?userId=${encodeURIComponent(this._userId)}&websiteId=${encodeURIComponent(websiteId)}`,
+              { method: 'GET', credentials: 'omit', signal: controller.signal }
+          );
+          clearTimeout(timeout);
+
+          if (res.status === 403) {
+              this._crossDeviceEnabled = false;
+              return;
+          }
+
+          if (res.status === 404 || !res.ok) {
+              if (this.consentState.hasUserChoice()) {
+                  this._pushConsentToServer();
+              }
+              return;
+          }
+
+          const data = await res.json();
+          if (!data.found) return;
+
+          const serverTimestamp = new Date(data.timestamp).getTime();
+          const localData = Storage.getLocal(STORAGE_KEY);
+          const localTimestamp = localData?.timestamp ? new Date(localData.timestamp).getTime() : 0;
+
+          if (serverTimestamp > localTimestamp) {
+              this.consentState = ConsentState.fromJSON(data.consent);
+              Storage.setLocal(STORAGE_KEY, { ...data.consent, timestamp: data.timestamp });
+              Storage.setCookie(COOKIE_NAME, JSON.stringify(data.consent), this.config.cookieDays);
+              this._log('Cross-device: applied server consent (newer)');
+          } else if (localTimestamp > serverTimestamp) {
+              this._pushConsentToServer();
+              this._log('Cross-device: pushed local consent to server (newer)');
+          }
+      } catch (err) {
+          if (err.name === 'AbortError') {
+              this._log('Cross-device sync timeout (>500ms), using localStorage');
+          } else {
+              this._log('Cross-device sync failed, using localStorage:', err.message);
+          }
+      }
+    }
+
+    _pushConsentToServer() {
+      if (!this._userId || !this._crossDeviceEnabled) return;
+
+      const apiBase = this.config.apiEndpoint;
+      const websiteId = this.config.websiteId;
+      if (!apiBase || !websiteId) return;
+
+      const payload = {
+          userId: this._userId,
+          websiteId: websiteId,
+          consent: this.consentState.toJSON(),
+          tcString: this.consentState.tcfString || null,
+          timestamp: new Date().toISOString()
+      };
+
+      const doPost = () => fetch(`${apiBase}/consent/cross-device`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify(payload),
+          credentials: 'omit'
+      });
+
+      doPost().then(res => {
+          if (!res.ok) throw new Error(`HTTP ${res.status}`);
+          this._log('Cross-device consent synced');
+      }).catch(() => {
+          setTimeout(() => {
+              doPost().catch(err => {
+                  console.error('[Biscotti] Cross-device sync failed after retry:', err.message);
+              });
+          }, 2000);
+      });
+    }
+
     _saveConsent() {
+      // Keep the US sale/share opt-out signal correct and jurisdiction-scoped at
+      // every save. This is the single choke point feeding BOTH localStorage and
+      // the backend consent POST, so syncing here guarantees the stored record is
+      // consistent. doNotSell + the IAB GPP string are US-only concepts (CCPA/CPRA
+      // and other US state privacy laws). Sync doNotSell to the CURRENT marketing
+      // decision so a positive consent action (Accept) clears a prior opt-out
+      // instead of persisting a stale flag/GPP string; in non-US jurisdictions
+      // null both so a GDPR record never carries a US GPP string. optOutSale()
+      // already sets marketing=false + doNotSell=true before calling here, so the
+      // US branch is consistent with it; GPC auto-reject likewise yields
+      // doNotSell=true on US sites. _updateGPP() refreshes gppString to match.
+      var _jcode = (this.jurisdiction && this.jurisdiction.code ? String(this.jurisdiction.code) : '').toUpperCase();
+      if (_jcode.indexOf('US') === 0) {
+        this.consentState.doNotSell = this.consentState.categories.marketing !== true;
+        this._updateGPP();
+      } else {
+        this.consentState.doNotSell = false;
+        this.consentState.gppString = null;
+      }
+
       const data = this.consentState.toJSON();
 
       // Add bot detection flag
@@ -9249,6 +10588,9 @@ const STORAGE_KEY = 'biscotti_consent';
         this._syncConsentToBackend(data);
       }
 
+      // Cross-device sync (if userId present)
+      this._pushConsentToServer();
+
       this._log('Saved consent:', data, 'isBot:', data.isBot);
     }
 
@@ -9259,6 +10601,8 @@ const STORAGE_KEY = 'biscotti_consent';
         consent: consentData.categories,
         tcfString: consentData.tcfString || null,
         acString: consentData.acString || null,
+        doNotSell: consentData.doNotSell === true,
+        gppString: consentData.gppString || null,
         visitorToken: this._getVisitorToken()
       };
 
@@ -9697,26 +11041,26 @@ const STORAGE_KEY = 'biscotti_consent';
            return;
         }
 
-        const consentModel = this.config.compliance?.consentModel || this.config.consentMode;
-        
-        let usNatString = 'BAAAAAA'; // Default Empty string (base64url)
-        
-        // Very basic mock USNat base64 encoding (in production, use standard bitfield encoding)
-        // MSPA National Opt-Out 
-        if (consentModel === 'opt-out' && Object.keys(this.consentState.categories).length > 0) {
-          const granted = Object.values(this.consentState.categories).some(v => v);
-          usNatString = granted ? 'BqAAAAA' : 'B1AAAAA'; // Opt-out mock
-        } else if (consentModel === 'opt-in') {
-          const granted = Object.values(this.consentState.categories).some(v => v);
-          usNatString = granted ? 'BgAAAAA' : 'BAAAAAA'; // Opt-in mock 
-        }
+        // Pick the applicable US GPP section from the operator jurisdiction:
+        // California uses USCA (section 8); every other US state uses USNat
+        // (section 7). The strings are the verified IAB GPP encodings in
+        // GPP_US_OPT_OUT / GPP_US_NO_OPT_OUT (generated by
+        // scripts/gen-gpp-optout-strings.cjs via @iabgpp/cmpapi, drift-guarded
+        // by tests/unit/gpp-optout.test.js) — no hand-rolled mock.
+        const jcode = (this.jurisdiction?.code || '').toUpperCase();
+        const section = jcode === 'US_CA' ? 'usca' : 'usnat';
+        const sectionId = section === 'usca' ? 8 : 7;
 
-        const gppStr = `DBABMA~${usNatString}`;
-        
+        // doNotSell is set by optOutSale(); when true the consumer opted out of
+        // sale/share/targeted advertising, otherwise they were shown notice and
+        // did not opt out.
+        const optedOut = this.consentState.doNotSell === true;
+        const gppStr = optedOut ? GPP_US_OPT_OUT[section] : GPP_US_NO_OPT_OUT[section];
+
         this.consentState.gppString = gppStr;
-        this.gppApi.update(gppStr, 'hidden');
-        
-        this._log('GPP String updated', gppStr);
+        this.gppApi.update(gppStr, 'hidden', [sectionId]);
+
+        this._log('GPP String updated', gppStr, '(section ' + sectionId + ', ' + (optedOut ? 'opt-out' : 'no-opt-out') + ')');
       } catch (e) {
         console.error('[Biscotti] Error generating GPP string:', e);
       }
@@ -10066,6 +11410,109 @@ const STORAGE_KEY = 'biscotti_consent';
       return `2~${consentedPart}~dv.${disclosedPart}`;
     }
 
+    /**
+     * SINGLE SOURCE OF TRUTH for writing consent to Shopify Customer Privacy API.
+     *
+     * Replaces three previously-competing write paths:
+     *   1. Inline block inside _applyConsent (had own reload logic)
+     *   2. Inline block inside _applyConsentWithProviders (had own reload logic)
+     *   3. window.addEventListener('biscotti:consent', applyToShopify) bridge
+     *      installed by the (now-disabled) _initShopifyCustomerPrivacy()
+     *
+     * Each consent action used to fire setTrackingConsent THREE times:
+     * once from the direct write, then twice more from the event bridge
+     * (because _emit dispatches the CustomEvent on BOTH document AND window,
+     * and the bridge listened on window with bubbling). The competing async
+     * callbacks created exactly the toggle bug observed on Shopify storefronts:
+     * 1st accept → soft-reload OK; revoke + reload → marketing=no OK;
+     * 2nd accept → reload happens, but Shopify Web Pixel sandbox re-initialises
+     * before the late callbacks settle, so the Pixel stays dead.
+     *
+     * Now the only Shopify write happens here, called from:
+     *   - _applyConsent
+     *   - _applyConsentWithProviders
+     *   - revokeConsent
+     *
+     * No reload: setTrackingConsent makes Shopify fire 'visitorConsentCollected'
+     * and re-evaluate Web Pixel permissions in real time, so pixels pick up the
+     * new consent without a page reload. (A prior version reloaded on a marketing
+     * transition to re-init the Web Pixel sandbox; that tore down in-page
+     * third-party widgets such as the Doran Shoppable Videos player, so it was
+     * removed.)
+     * @returns {boolean} true if marketing consent changed in this write, false
+     *                    otherwise. Informational only — callers do not branch
+     *                    on it.
+     */
+    _syncShopifyConsentAndMaybeReload(reason = 'update') {
+      try {
+        // Variant A architecture: when biscotti-sfy.js is loaded, it owns the
+        // sole Shopify CPA write path (biscotti:consent listener with
+        // reload-on-marketing-transition). The engine emits the consent event
+        // which sfy hears; nothing for us to do here.
+        if (typeof window !== 'undefined' && window.__biscottiSfyLoaded) return false;
+
+        const cp = window.Shopify && window.Shopify.customerPrivacy;
+
+        // CRITICAL: On very fast first-time accepts, Shopify's Customer Privacy
+        // API may not be registered yet even though the user already clicked.
+        // In that case we must NOT silently drop the write. Instead we defer it
+        // until loadFeatures() finishes, then flush and reload from the callback.
+        if (!cp || typeof cp.setTrackingConsent !== 'function') {
+          this._pendingShopifyConsentSync = !!(
+            this.consentState &&
+            typeof this.consentState.hasUserChoice === 'function' &&
+            this.consentState.hasUserChoice()
+          );
+          try { this._log('Shopify CPA not ready — deferring consent sync', reason); } catch (e) {}
+          return false;
+        }
+
+        // API is ready now; clear any deferred marker.
+        this._pendingShopifyConsentSync = false;
+
+        let prevMarketing = false;
+        try {
+          if (typeof cp.marketingAllowed === 'function') {
+            prevMarketing = !!cp.marketingAllowed();
+          } else if (typeof cp.currentVisitorConsent === 'function') {
+            const current = cp.currentVisitorConsent();
+            prevMarketing = !!(current && current.marketing === 'yes');
+          }
+        } catch (e) { /* ignore */ }
+
+        const payload = this._buildShopifyTrackingConsentPayload();
+        const newMarketing = !!payload.marketing;
+        const marketingChanged = prevMarketing !== newMarketing;
+        const self = this;
+
+        cp.setTrackingConsent(payload, function (result) {
+          // NO PAGE RELOAD. setTrackingConsent makes Shopify fire its
+          // 'visitorConsentCollected' event, and the Web Pixel Manager
+          // re-evaluates pixel permissions off it in real time — marketing
+          // pixels (Meta/Facebook via Parkour, etc.) pick up the new state
+          // without a reload. A previous version reloaded on a marketing
+          // yes<->no transition to re-init the Web Pixel sandbox, but a
+          // full-page reload tears down in-page third-party widgets that had
+          // already initialised before the visitor clicked Accept — e.g. the
+          // Doran "Shoppable Videos" player collapsed into a broken placeholder
+          // right after Accept-all. The reload is unnecessary and is removed.
+          if (result && result.error) {
+            try { self._log && self._log('Shopify CPA write error:', result.error, 'reason:', reason); } catch (e) {}
+            return;
+          }
+          if (marketingChanged) {
+            try { self._log && self._log('Shopify CPA: marketing changed (' + prevMarketing + ' → ' + newMarketing + '), pixels re-evaluated via visitorConsentCollected (no reload)'); } catch (e) {}
+          }
+        });
+
+        this._log('Shopify Customer Privacy API updated:', payload, 'reason:', reason);
+        return marketingChanged;
+      } catch (e) {
+        // Not on Shopify, or API threw — silently ignore.
+        return false;
+      }
+    }
+
     _applyConsent() {
       // Update Google Consent Mode
       if (this.config.googleConsentMode) {
@@ -10110,6 +11557,12 @@ const STORAGE_KEY = 'biscotti_consent';
 
       // Broadcast consent update to all iframes (cross-frame solution)
       CrossFrameConsent.broadcast(this.consentState);
+
+      // Shopify Customer Privacy API — single write path. The helper writes the
+      // new consent to Shopify, which propagates it to Web Pixels natively via
+      // the visitorConsentCollected event (no page reload). The DOM unblocking
+      // above always runs first.
+      this._syncShopifyConsentAndMaybeReload('applyConsent');
 
       this._log('Applied consent for categories:', grantedCategories);
     }
@@ -10160,7 +11613,185 @@ const STORAGE_KEY = 'biscotti_consent';
       // Broadcast consent update to all iframes
       CrossFrameConsent.broadcast(this.consentState);
 
+      // Shopify Customer Privacy API — single write path (see _applyConsent).
+      this._syncShopifyConsentAndMaybeReload('applyConsentWithProviders');
+
       this._log('Applied consent with providers:', this.consentState.getProviderStates());
+    }
+
+    /**
+     * Register Shopify's Customer Privacy API and set a default-deny tracking
+     * consent state on load when the visitor has not yet decided.
+     *
+     * Why: On Shopify, marketing/analytics pixels (Meta etc.) are increasingly
+     * delivered through Shopify-MANAGED surfaces — Web Pixels running in a
+     * sandboxed worker/iframe and the server-side Customer Events pipeline. The
+     * page-context Shield cannot reach those. The only supported gate is
+     * Shopify.customerPrivacy, which must be registered via loadFeatures and
+     * given a deny state BEFORE the visitor decides.
+     *
+     * Detection: the manual storefront snippet sets only websiteId + apiUrl
+     * (no platform flag), so we detect Shopify via window.Shopify and gate the
+     * whole method on loadFeatures being available. Non-Shopify pages no-op.
+     *
+     * Idempotent (one-shot flag). Default-deny only — never auto-grants. If a
+     * prior decision already exists (Biscotti stored consent or a non-empty
+     * Shopify consent), we re-apply / leave it, never overwrite with deny;
+     * the post-consent path in _applyConsent owns subsequent updates.
+     */
+    _registerShopifyCustomerPrivacy() {
+      try {
+        // Variant A architecture: when the dedicated biscotti-sfy.js storefront
+        // bridge is present (it sets window.__biscottiSfyLoaded = true synchronously
+        // in <head>), it owns the entire Shopify Customer Privacy lifecycle —
+        // registration, default-deny / re-apply on load, and the post-click
+        // setTrackingConsent + reload-on-marketing-transition flow via its own
+        // biscotti:consent listener. The engine MUST NOT compete with it.
+        if (typeof window !== 'undefined' && window.__biscottiSfyLoaded) return;
+
+        if (window.__biscottiShopifyRegistered) return;
+        // Claim the slot SYNCHRONOUSLY so multiple engine instances / repeated
+        // _init calls can only register once — even when loadFeatures is not yet
+        // available and the bounded wait below has to defer.
+        window.__biscottiShopifyRegistered = true;
+
+        var attempts = 0;
+        var MAX_ATTEMPTS = 50; // ~5s at 100ms
+        var self = this;
+
+        var run = function () {
+          // Poll specifically for loadFeatures — Shopify may attach
+          // window.Shopify before loadFeatures becomes available.
+          if (window.Shopify && typeof window.Shopify.loadFeatures === 'function') {
+            try {
+              window.Shopify.loadFeatures(
+                [{ name: 'consent-tracking-api', version: '0.1' }],
+                function (error) {
+                  if (error) return; // registration failed — leave Shopify defaults
+
+                  // If the visitor clicked before Shopify CPA finished loading,
+                  // flush that deferred write NOW via the centralized helper so
+                  // the consent reaches Shopify, which then propagates it to
+                  // Web Pixels via the visitorConsentCollected event.
+                  // The `_pendingShopifyConsentSync` flag is set INSIDE
+                  // _syncShopifyConsentAndMaybeReload() only when a real user
+                  // click already happened but Shopify CPA wasn't ready yet.
+                  // Trusting the flag alone (no second hasUserChoice() check)
+                  // closes the edge case where a stale storage read could fall
+                  // through into _applyShopifyDefaultOrExisting() and cause a
+                  // duplicate write in the same tick.
+                  if (self._pendingShopifyConsentSync) {
+                    self._pendingShopifyConsentSync = false;
+                    try { self._log('Shopify CPA became ready — flushing deferred consent sync'); } catch (e) {}
+                    self._syncShopifyConsentAndMaybeReload('deferredPostRegister');
+                    return;
+                  }
+
+                  self._applyShopifyDefaultOrExisting();
+                }
+              );
+            } catch (e) { /* ignore */ }
+            return;
+          }
+          if (++attempts >= MAX_ATTEMPTS) return; // not Shopify / never appeared — no-op
+          setTimeout(run, 100);
+        };
+
+        run();
+      } catch (e) { /* never throw from init */ }
+    }
+
+    /**
+     * Inside the loadFeatures callback: decide default-deny vs. re-apply an
+     * existing decision. Reads our OWN biscotti_consent (localStorage, then
+     * cookie fallback) and normalizes BOTH stored shapes — nested main-widget
+     * (booleans under .categories) and flat fallback-banner (top-level booleans).
+     */
+    _applyShopifyDefaultOrExisting() {
+      try {
+        // Variant A architecture: when biscotti-sfy.js is loaded, it has
+        // already performed the load-time default-deny / re-apply step inside
+        // its own onApiReady. Doing it again here would produce a duplicate
+        // setTrackingConsent write in the same page-load tick.
+        if (typeof window !== 'undefined' && window.__biscottiSfyLoaded) return;
+
+        var cp = window.Shopify && window.Shopify.customerPrivacy;
+        if (!cp || typeof cp.setTrackingConsent !== 'function') return;
+
+        var stored = Storage.getLocal(STORAGE_KEY);
+        if (!stored) {
+          var cookieRaw = Storage.getCookie(COOKIE_NAME);
+          if (cookieRaw) {
+            try { stored = JSON.parse(cookieRaw); } catch (e) { stored = null; }
+          }
+        }
+        // timestamp exists in BOTH the nested and flat shapes
+        var hasBiscottiDecision = !!(stored && stored.timestamp);
+
+        var current = null;
+        try {
+          if (typeof cp.currentVisitorConsent === 'function') current = cp.currentVisitorConsent();
+        } catch (e) { current = null; }
+        var hasShopifyDecision = false;
+        if (current && typeof current === 'object') {
+          hasShopifyDecision = ['marketing', 'analytics', 'preferences', 'sale_of_data']
+            .some(function (k) { return current[k] === 'yes' || current[k] === 'no'; });
+        }
+
+        // CRITICAL: per Shopify Customer Privacy API spec, setTrackingConsent
+        // must NEVER be called automatically without an actual user click.
+        // Auto-writing on page load (even with deny) corrupts the Web Pixels
+        // sandbox initialisation: pixel apps see "marketing: no" before they
+        // load and skip injecting fbevents.js entirely; later acceptance does
+        // not re-init them. We only re-apply an existing Biscotti decision
+        // (which DID originate from a real click).
+        if (hasBiscottiDecision) {
+          var cats = (stored && stored.categories && typeof stored.categories === 'object')
+            ? stored.categories : stored;
+          cp.setTrackingConsent(
+            this._buildShopifyTrackingConsentPayload(cats),
+            function () {}
+          );
+          this._log('Shopify Customer Privacy: re-applied stored decision on load');
+        }
+        // else: no Biscotti decision yet -- leave Shopify defaults untouched
+        // (region-aware: deny in EU, allow-with-opt-out in CCPA jurisdictions).
+      } catch (e) { /* never throw */ }
+    }
+
+    /**
+     * Build the Shopify Customer Privacy setTrackingConsent payload from a
+     * categories object. Single source of truth for the category->Shopify
+     * mapping; used by both the load-time re-apply and the post-click sync.
+     */
+    _buildShopifyTrackingConsentPayload(sourceCategories) {
+      var cats = sourceCategories || (this.consentState && this.consentState.categories) || {};
+      var marketing = !!cats.marketing;
+      var payload = {
+        analytics: !!cats.analytics,
+        marketing: marketing,
+        preferences: !!cats.functional
+      };
+      // sale_of_data is REGION-AWARE. In non-data-sale regions (e.g. GDPR),
+      // Shopify derives thirdPartyMarketingAllowed() — the gate for third-party
+      // pixels like Meta/Facebook, TikTok — from sale_of_data, NOT from
+      // marketingAllowed(). Pinning it false silently blocks every third-party
+      // pixel post-accept (measured live on a DEBE GDPR shop). So we set it to
+      // follow the marketing category there. In US-state data-sale regions
+      // (saleOfDataRegion() === true) sale_of_data is a legal opt-OUT that
+      // Shopify requires to be customer-initiated (GPC honored automatically),
+      // so we OMIT the key and never auto-opt-in.
+      var inDataSaleRegion = true;
+      try {
+        var cp = (typeof window !== 'undefined') && window.Shopify && window.Shopify.customerPrivacy;
+        if (cp && typeof cp.saleOfDataRegion === 'function') {
+          inDataSaleRegion = cp.saleOfDataRegion() === true;
+        }
+      } catch (e) { /* default to the safe no-auto-opt-in branch */ }
+      if (!inDataSaleRegion) {
+        payload.sale_of_data = marketing;
+      }
+      return payload;
     }
 
     _emit(event, data) {
@@ -10182,6 +11813,12 @@ const STORAGE_KEY = 'biscotti_consent';
       } catch (e) {
         // IE11 fallback
         this._log('CustomEvent dispatch failed:', e);
+      }
+
+      // Notify GTM template callbacks for consent events
+      // (GTM Sandboxed JS cannot listen to DOM events, so we invoke registered callbacks directly)
+      if (event === 'consent') {
+        GtmCallbackSupport.notifyCallbacks();
       }
     }
 
@@ -10312,6 +11949,14 @@ const STORAGE_KEY = 'biscotti_consent';
 
       // Clear tracking cookies
       this._clearTrackingCookies();
+
+      // Shopify Customer Privacy API — single write path. Symmetric with
+      // _applyConsent: revoke must propagate immediately to Shopify so pixels
+      // (Parkour/Meta, etc.) see marketing=no right away via Shopify's
+      // visitorConsentCollected event. Previously revoke skipped this and
+      // Shopify CP kept marketing=yes from the prior accept, breaking the
+      // toggle behaviour. No page reload is required.
+      this._syncShopifyConsentAndMaybeReload('revokeConsent');
 
       this._emit('consent', { type: 'revoke', state: this.consentState.toJSON() });
       this._log('Revoked consent (all consent bits zeroed)');
@@ -10545,6 +12190,11 @@ const STORAGE_KEY = 'biscotti_consent';
 
       // Set "do not sell" flag
       this.consentState.doNotSell = true;
+
+      // Emit the verified IAB GPP US opt-out signal (real @iabgpp encoding, not a
+      // mock) for the applicable section, so downstream vendors that honor the
+      // __gpp CMP API see the sale/share/targeted-advertising opt-out.
+      this._updateGPP();
 
       this._saveConsent();
 

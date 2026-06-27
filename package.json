@@ -1,6 +1,6 @@
 {
   "name": "biscotti-cmp-client",
-  "version": "3.9.3",
+  "version": "4.3.0",
   "description": "Biscotti CMP — Consent Management Platform client-side engine (source code for biscotti.min.js)",
   "main": "biscotti.js",
   "scripts": {
@@ -16,7 +16,7 @@
   "license": "GPL-2.0-or-later",
   "repository": {
     "type": "git",
-    "url": "https://github.com/nicemedia/biscotti-cmp-client.git"
+    "url": "https://github.com/dbosch-a11y/biscotti-cmp-client.git"
   },
   "author": "Campcruisers GmbH <info@biscotti-cmp.com>",
   "homepage": "https://biscotti-cmp.com"
