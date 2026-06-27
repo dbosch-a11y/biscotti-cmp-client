@@ -10,7 +10,7 @@ This repository contains the unminified source code for `biscotti.min.js`, the c
 - IAB TCF 2.3 compliance (Transparency & Consent Framework)
 - Google Consent Mode v2 integration
 - Script blocking until consent is granted
-- Multi-language support (39 languages)
+- Multi-language support (40 languages)
 
 ## Building
 
