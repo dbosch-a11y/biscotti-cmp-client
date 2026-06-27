@@ -38,3 +38,23 @@ npm run build:engine
 cp src/client/biscotti.min.js src/wordpress/biscotti-cmp/assets/js/biscotti.min.js
 cp src/client/biscotti.js src/wordpress/biscotti-cmp/assets/js/biscotti.js
 ```
+
+## Keeping this public repo in sync (REQUIRED on every release)
+
+WordPress.org Guideline 4 requires the published source to match the shipped
+`biscotti.min.js`. On **every** plugin release that ships a new engine build,
+update this repository too — otherwise the source linked from the plugin
+`readme.txt` will be stale and the WordPress.org review can reject it.
+
+```bash
+# From this repo's working copy:
+cp <monorepo>/src/client/biscotti.js ./biscotti.js
+# Set "version" in package.json to the plugin Stable tag, then:
+git add biscotti.js package.json && git commit -m "Sync engine source to plugin vX.Y.Z" && git push
+```
+
+Verify the published source matches the shipped source byte-for-byte:
+
+```bash
+git hash-object biscotti.js   # must equal the blob sha of the shipped src/client/biscotti.js
+```
